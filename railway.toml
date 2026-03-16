@@ -1,0 +1,17 @@
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "caissify-explorer --bind 0.0.0.0:$PORT --db /data --cors"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 5
+
+[[services]]
+name = "explorer"
+
+[services.healthcheck]
+path = "/monitor"
+interval = 30
+timeout = 10
+retries = 3

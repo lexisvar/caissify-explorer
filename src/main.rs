@@ -46,14 +46,14 @@ use tokio::{
 
 use crate::{
     api::{
-        Error, ExplorerGame, ExplorerGameWithUciMove, ExplorerMove, ExplorerResponse,
+        CaissifyQuery, Error, ExplorerGame, ExplorerGameWithUciMove, ExplorerMove, ExplorerResponse,
         HistoryWanted, LichessQuery, MastersQuery, NdJson, PlayPosition, PlayerLimits, PlayerQuery,
         PlayerQueryFilter, WithSource,
     },
     db::{CacheHint, Database, DbOpt, LichessDatabase},
     indexer::{
-        LichessGameImport, LichessImporter, MastersImporter, PlayerIndexerOpt, PlayerIndexerStub,
-        QueueFull, Ticket,
+        CaissifyImporter, LichessGameImport, LichessImporter, MastersImporter, PlayerIndexerOpt,
+        PlayerIndexerStub, QueueFull, Ticket,
     },
     lila::{Lila, LilaOpt},
     metrics::Metrics,
@@ -83,6 +83,9 @@ struct Opt {
     /// Maximum number of cached responses for /lichess.
     #[arg(long, default_value = "40000")]
     lichess_cache: u64,
+    /// Maximum number of cached responses for /caissify.
+    #[arg(long, default_value = "40000")]
+    caissify_cache: u64,
     #[command(flatten)]
     db: DbOpt,
     #[command(flatten)]
@@ -100,9 +103,11 @@ struct AppState {
     db: Arc<Database>,
     lichess_cache: ExplorerCache<LichessQuery>,
     masters_cache: ExplorerCache<MastersQuery>,
+    caissify_cache: ExplorerCache<CaissifyQuery>,
     metrics: &'static Metrics,
     lichess_importer: LichessImporter,
     masters_importer: MastersImporter,
+    caissify_importer: CaissifyImporter,
     player_indexer: PlayerIndexerStub,
     semaphore: &'static Semaphore,
 }
@@ -148,9 +153,12 @@ async fn serve() {
         .route("/compact", post(compact))
         .route("/import/masters", put(masters_import))
         .route("/import/lichess", put(lichess_import))
+        .route("/import/caissify", put(caissify_import))
         .route("/import/openings", post(openings_import))
         .route("/masters/pgn/{id}", get(masters_pgn))
         .route("/masters", get(masters))
+        .route("/caissify/pgn/{id}", get(caissify_pgn))
+        .route("/caissify", get(caissify))
         .route("/lichess", get(lichess))
         .route("/lichess/history", get(lichess_history)) // bc
         .route("/player", get(player))
@@ -170,9 +178,15 @@ async fn serve() {
                 .time_to_live(Duration::from_secs(60 * 60 * 4))
                 .time_to_idle(Duration::from_secs(60 * 10))
                 .build(),
+            caissify_cache: Cache::builder()
+                .max_capacity(opt.caissify_cache)
+                .time_to_live(Duration::from_secs(60 * 60 * 4))
+                .time_to_idle(Duration::from_secs(60 * 10))
+                .build(),
             metrics: Box::leak(Box::default()),
             lichess_importer: LichessImporter::new(Arc::clone(&db)),
             masters_importer: MastersImporter::new(Arc::clone(&db)),
+            caissify_importer: CaissifyImporter::new(Arc::clone(&db)),
             player_indexer,
             db,
             semaphore: Box::leak(Box::new(Semaphore::new(128))),
@@ -226,8 +240,8 @@ async fn periodic_blacklist_update(blacklist: &'static RwLock<HashSet<UserId>>, 
         {
             Ok(Ok(users)) => users,
             Ok(Err(err)) => {
-                log::error!("blacklist request failed: {err}");
-                sleep(Duration::from_secs(5)).await;
+                log::warn!("blacklist request failed (no valid bearer token?): {err}");
+                sleep(Duration::from_secs(60 * 173)).await;
                 continue;
             }
             Err(timed_out) => {
@@ -357,6 +371,7 @@ fn tokio_metrics_to_influx_string() -> String {
 async fn monitor(
     State(lichess_cache): State<ExplorerCache<LichessQuery>>,
     State(masters_cache): State<ExplorerCache<MastersQuery>>,
+    State(caissify_cache): State<ExplorerCache<CaissifyQuery>>,
     State(metrics): State<&'static Metrics>,
     State(player_indexer): State<PlayerIndexerStub>,
     State(blacklist): State<&'static RwLock<HashSet<UserId>>>,
@@ -370,6 +385,7 @@ async fn monitor(
                 // Cache entries
                 format!("lichess_cache={}u", lichess_cache.entry_count()),
                 format!("masters_cache={}u", masters_cache.entry_count()),
+                format!("caissify_cache={}u", caissify_cache.entry_count()),
                 // Request metrics
                 metrics.to_influx_string(),
                 // Block cache
@@ -385,6 +401,10 @@ async fn monitor(
                 db.masters()
                     .estimate_metrics()
                     .expect("masters metrics")
+                    .to_influx_string(),
+                db.caissify()
+                    .estimate_metrics()
+                    .expect("caissify metrics")
                     .to_influx_string(),
                 db.lichess()
                     .estimate_metrics()
@@ -410,6 +430,7 @@ async fn openings_import(
     State(openings): State<&'static RwLock<Openings>>,
     State(lichess_cache): State<ExplorerCache<LichessQuery>>,
     State(masters_cache): State<ExplorerCache<MastersQuery>>,
+    State(caissify_cache): State<ExplorerCache<CaissifyQuery>>,
 ) -> Result<(), Error> {
     let new_openings = Openings::download().await?;
     log::info!("loaded {} opening names", new_openings.len());
@@ -417,6 +438,7 @@ async fn openings_import(
     let mut write_lock = openings.write().expect("write openings");
     lichess_cache.invalidate_all();
     masters_cache.invalidate_all();
+    caissify_cache.invalidate_all();
     *write_lock = new_openings;
     Ok(())
 }
@@ -684,6 +706,114 @@ async fn masters(
                         masters_db
                             .games(entry.top_games.iter().map(|(_, id)| *id))
                             .expect("get masters games")
+                            .into_iter()
+                            .zip(entry.top_games.into_iter())
+                            .filter_map(|(info, (uci, id))| {
+                                info.map(|info| ExplorerGameWithUciMove {
+                                    uci,
+                                    row: ExplorerGame::from_masters(id, info),
+                                })
+                            })
+                            .collect(),
+                    ),
+                    opening,
+                    recent_games: None,
+                    queue_position: None,
+                    history: None,
+                }));
+
+                metrics.inc_masters(started_at.elapsed(), source, ply(&pos));
+                response
+            })
+            .await
+        })
+        .await
+}
+
+#[axum::debug_handler(state = AppState)]
+async fn caissify_import(
+    State(importer): State<CaissifyImporter>,
+    State(semaphore): State<&'static Semaphore>,
+    Json(body): Json<MastersGameWithId>,
+) -> Result<(), Error> {
+    spawn_blocking(semaphore, move || importer.import(body)).await
+}
+
+#[axum::debug_handler(state = AppState)]
+async fn caissify_pgn(
+    Path(MastersGameId(id)): Path<MastersGameId>,
+    State(db): State<Arc<Database>>,
+    State(semaphore): State<&'static Semaphore>,
+) -> Result<MastersGame, StatusCode> {
+    spawn_blocking(semaphore, move || {
+        match db.caissify().game(id).expect("get caissify game") {
+            Some(game) => Ok(game),
+            None => Err(StatusCode::NOT_FOUND),
+        }
+    })
+    .await
+}
+
+#[axum::debug_handler(state = AppState)]
+async fn caissify(
+    State(openings): State<&'static RwLock<Openings>>,
+    State(db): State<Arc<Database>>,
+    State(caissify_cache): State<ExplorerCache<CaissifyQuery>>,
+    State(metrics): State<&'static Metrics>,
+    State(semaphore): State<&'static Semaphore>,
+    Query(WithSource { query, source }): Query<WithSource<CaissifyQuery>>,
+) -> Result<Json<ExplorerResponse>, Error> {
+    caissify_cache
+        .get_with(query.clone(), async move {
+            spawn_blocking(semaphore, move || {
+                let started_at = Instant::now();
+                let openings = openings.read().expect("read openings");
+                let PlayPosition { pos, opening } = query.play.position(&openings)?;
+
+                let key = KeyBuilder::caissify()
+                    .with_zobrist(pos.variant(), pos.zobrist_hash(EnPassantMode::Legal));
+                let cache_hint = CacheHint::from_ply(ply(&pos));
+                let caissify_db = db.caissify();
+                let entry = caissify_db
+                    .read(key, query.since, query.until, cache_hint)
+                    .expect("get caissify")
+                    .prepare(&query.limits);
+
+                let response = Ok(Json(ExplorerResponse {
+                    total: entry.total,
+                    moves: entry
+                        .moves
+                        .into_iter()
+                        .map(|p| {
+                            let mut pos_after = pos.clone();
+                            let san = p.uci.to_move(&pos).map_or(
+                                SanPlus {
+                                    san: San::Null,
+                                    suffix: None,
+                                },
+                                |m| SanPlus::from_move_and_play_unchecked(&mut pos_after, m),
+                            );
+                            ExplorerMove {
+                                san,
+                                uci: p.uci,
+                                average_rating: p.average_rating,
+                                average_opponent_rating: p.average_opponent_rating,
+                                performance: p.performance,
+                                stats: p.stats,
+                                game: p.game.and_then(|id| {
+                                    caissify_db
+                                        .game(id)
+                                        .expect("get caissify game")
+                                        .map(|info| ExplorerGame::from_masters(id, info))
+                                }),
+                                opening: openings.classify_exact(&pos_after).cloned(),
+                            }
+                        })
+                        .collect(),
+                    top_games: Some(
+                        caissify_db
+                            .games(entry.top_games.iter().map(|(_, id)| *id))
+                            .expect("get caissify games")
                             .into_iter()
                             .zip(entry.top_games.into_iter())
                             .filter_map(|(info, (uci, id))| {

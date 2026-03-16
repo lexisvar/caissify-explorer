@@ -1,0 +1,720 @@
+# CONTEXT.md — caissify-explorer
+
+Comprehensive developer reference for the **caissify-explorer** service.
+Based on the upstream [lila-openingexplorer](https://github.com/lichess-org/lila-openingexplorer) project, adapted for the Caissify platform.
+
+---
+
+## Table of Contents
+
+1. [Project Overview](#1-project-overview)
+2. [Tech Stack](#2-tech-stack)
+3. [Repository Structure](#3-repository-structure)
+4. [Environment Setup](#4-environment-setup)
+5. [Running with Docker](#5-running-with-docker)
+6. [Building & Running Locally](#6-building--running-locally)
+7. [HTTP API Reference](#7-http-api-reference)
+8. [Importing Games](#8-importing-games)
+9. [Database Architecture](#9-database-architecture)
+10. [Configuration Reference (CLI)](#10-configuration-reference-cli)
+11. [Monitoring & Metrics](#11-monitoring--metrics)
+12. [Railway Deployment](#12-railway-deployment)
+13. [Development Workflows](#13-development-workflows)
+14. [Architecture Deep-Dive](#14-architecture-deep-dive)
+
+---
+
+## 1. Project Overview
+
+`caissify-explorer` is a high-performance chess **opening explorer** HTTP server. It stores and queries billions of chess positions from three separate data sources:
+
+| Source | Description |
+|---|---|
+| **Masters** | Top-level OTB games (avg rating ≥ 2200) |
+| **Lichess** | Full Lichess.org rated game database |
+| **Player** | Per-player opening statistics indexed on-demand |
+
+Key capabilities:
+- Handles **trillions of positions** using [RocksDB](https://rocksdb.org/) as the embedded storage engine.
+- Streams player game history from Lichess in real time via the Lichess API.
+- Serves opening names from the [chess-openings](https://github.com/lichess-org/chess-openings) dataset.
+- Supports all major Lichess variants (Chess, Crazyhouse, ThreeCheck, KingOfTheHill, etc.).
+
+---
+
+## 2. Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Language | Rust (edition 2024) |
+| HTTP framework | [Axum 0.8](https://docs.rs/axum) |
+| Async runtime | Tokio 1 (full) |
+| Database | [RocksDB 0.24](https://rocksdb.org/) (embedded) |
+| Chess logic | [shakmaty 0.30](https://docs.rs/shakmaty/) |
+| In-memory cache | [moka 0.12](https://docs.rs/moka/) (async LRU/TinyLFU) |
+| Serialization | serde + serde_json + serde_with |
+| HTTP client | reqwest 0.12 (streaming) |
+| Memory allocator | tikv-jemallocator (matches RocksDB's jemalloc) |
+| CLI parsing | clap 4 (derive + env) |
+| Containerization | Docker (multi-stage build) |
+| Deployment | Railway |
+
+---
+
+## 3. Repository Structure
+
+```
+caissify-explorer/
+├── src/
+│   ├── main.rs             # Server entry point; all HTTP route handlers; AppState
+│   ├── lib.rs              # Module declarations
+│   ├── db.rs               # RocksDB wrapper (Database, column families, merge ops)
+│   ├── lila.rs             # Lichess API HTTP client (game streaming, mod blacklist)
+│   ├── metrics.rs          # AtomicU64 metrics in InfluxDB line-protocol format
+│   ├── opening.rs          # Downloads and classifies opening names from TSV files
+│   ├── util.rs             # ByColorDef, sort_by_key_and_truncate, DedupStreamExt
+│   ├── zobrist.rs          # StableZobrist128 — stable Zobrist hashing across versions
+│   ├── api/
+│   │   ├── mod.rs          # Re-exports
+│   │   ├── error.rs        # Error enum with axum IntoResponse (400/500/503)
+│   │   ├── nd_json.rs      # NDJSON streaming response with keepalive
+│   │   ├── query.rs        # Query parameter structs (MastersQuery, LichessQuery, etc.)
+│   │   └── response.rs     # Response structs (ExplorerResponse, ExplorerMove, etc.)
+│   ├── model/
+│   │   ├── mod.rs          # Re-exports
+│   │   ├── date.rs         # LaxDate, Month (u16 = year*12+month-1), Year
+│   │   ├── game_id.rs      # GameId (base-62, 8 chars, stored as 6-byte LE u64)
+│   │   ├── history.rs      # History, HistoryBuilder, HistorySegment
+│   │   ├── key.rs          # KeyBuilder, KeyPrefix (12 bytes), Key (14 bytes)
+│   │   ├── lichess.rs      # LichessEntry, RatingGroup, PreparedResponse
+│   │   ├── lichess_game.rs # LichessGame binary format, GamePlayer
+│   │   ├── masters.rs      # MastersEntry, MastersGame, PGN generation
+│   │   ├── mode.rs         # Mode (Rated/Casual), ByMode<T>
+│   │   ├── player.rs       # PlayerEntry, PlayerStatus, IndexRun
+│   │   ├── speed.rs        # Speed enum (UltraBullet..Correspondence), BySpeed<T>
+│   │   ├── stats.rs        # Stats (white/draws/black/rating_sum), FIDE performance
+│   │   ├── uci.rs          # RawUciMove (packed u16 UCI move)
+│   │   ├── uint.rs         # Variable-length LEB128 integer encoding
+│   │   └── user.rs         # UserName (original case), UserId (lowercase)
+│   └── indexer/
+│       ├── mod.rs          # Re-exports
+│       ├── lichess.rs      # LichessGameImport, LichessImporter (PUT /import/lichess)
+│       ├── masters.rs      # MastersImporter (PUT /import/masters)
+│       ├── player.rs       # PlayerIndexerActor, PlayerIndexerStub
+│       └── player_queue.rs # Queue<T>, Ticket, QueueFull
+├── import-pgn/
+│   ├── Cargo.toml          # Separate workspace crate for bulk PGN import
+│   └── src/bin/
+│       └── import-lichess.rs   # Reads .pgn / .pgn.bz2 / .pgn.zst, POSTs batches
+├── benches/                # iai benchmarks
+├── tests/                  # Integration tests
+├── Dockerfile              # Multi-stage build (builder → debian-slim)
+├── docker-compose.yml      # Single-service compose for local development
+├── railway.toml            # Railway deployment configuration
+├── .env                    # Build-time jemalloc tuning (must be sourced before build)
+├── rustfmt.toml            # Rust formatting settings
+└── Cargo.toml              # Workspace root + main crate
+```
+
+---
+
+## 4. Environment Setup
+
+### Required build-time variables
+
+The `.env` file tunes jemalloc — **must be sourced before building**:
+
+```bash
+set -a && source .env && set +a
+```
+
+Contents of `.env`:
+
+```env
+JEMALLOC_SYS_WITH_MALLOC_CONF=abort_conf:true,background_thread:true,metadata_thp:auto,dirty_decay_ms:30000,muzzy_decay_ms:30000
+```
+
+### Optional runtime variables
+
+| Variable | Description |
+|---|---|
+| `EXPLORER_LOG` | Log filter (e.g. `info`, `caissify_explorer=debug`) |
+| `EXPLORER_LOG_STYLE` | Log style (`always` / `auto` / `never`) |
+| `EXPLORER_BEARER` | Lichess API token (required for player indexer) |
+
+### Prerequisites
+
+- Rust stable (≥ 1.85) — install via [rustup](https://rustup.rs/)
+- `libclang-dev` (for RocksDB's bindgen)
+- `liburing-dev` (for io-uring on Linux)
+
+```bash
+# Ubuntu / Debian
+sudo apt-get install clang libclang-dev liburing-dev
+
+# macOS (io-uring is Linux-only; build without it)
+# Edit Cargo.toml: remove "io-uring" from rocksdb features
+```
+
+---
+
+## 5. Running with Docker
+
+### Start the server
+
+```bash
+docker compose up -d
+```
+
+This builds the image if needed and starts the explorer on port `9002`.
+
+### Build the image manually
+
+```bash
+docker build -t caissify-explorer .
+```
+
+### Run without compose
+
+```bash
+docker run -d \
+  -p 9002:9002 \
+  -v explorer-db:/data \
+  -e EXPLORER_LOG=info \
+  -e EXPLORER_BEARER=<your-lichess-token> \
+  caissify-explorer \
+  --bind 0.0.0.0:9002 \
+  --db /data \
+  --cors \
+  --db-cache 4294967296
+```
+
+### Adjust DB cache for local dev
+
+Edit `docker-compose.yml` and change `--db-cache` to a smaller value (e.g. `536870912` = 512 MB). Default is 4 GB.
+
+### Increase file descriptor limit
+
+RocksDB opens many SST files. On Linux hosts:
+
+```bash
+ulimit -n 131072
+```
+
+---
+
+## 6. Building & Running Locally
+
+```bash
+# Source build-time env vars first
+set -a && source .env && set +a
+
+# Debug build (fast compile, slower runtime)
+cargo run -- --db _db --cors
+
+# Release build (required for production performance)
+cargo run --release -- \
+  --db /data \
+  --bind 0.0.0.0:9002 \
+  --cors \
+  --db-compaction-readahead \
+  --db-cache 4294967296
+
+# View all options
+cargo run --release -- --help
+```
+
+---
+
+## 7. HTTP API Reference
+
+Base URL: `http://localhost:9002`
+
+> ⚠️ **Security**: In production, expose only `/masters`, `/lichess`, and `/player` via your reverse proxy. Lock down all `/import/*`, `/compact`, and `/monitor` endpoints.
+
+---
+
+### `GET /masters`
+
+Query master games (OTB games with average rating ≥ 2200).
+
+**Query Parameters:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `fen` | string | start pos | FEN of the position |
+| `play` | string | — | Comma-separated UCI moves to play from FEN |
+| `variant` | string | `chess` | Variant name |
+| `since` | year int | 1952 | Filter games since this year |
+| `until` | year int | 3000 | Filter games until this year |
+| `moves` | int | 12 | Max number of moves to return |
+| `topGames` | int | 15 | Max top games to return |
+
+**Response:**
+
+```json
+{
+  "white": 120, "draws": 80, "black": 60,
+  "moves": [
+    {
+      "uci": "e2e4", "san": "e4",
+      "white": 100, "draws": 70, "black": 50,
+      "averageRating": 2650,
+      "game": { "id": "AbCd1234", "winner": "white", "speed": "classical", ... }
+    }
+  ],
+  "topGames": [ ... ],
+  "opening": { "eco": "B20", "name": "Sicilian Defense" }
+}
+```
+
+---
+
+### `GET /lichess`
+
+Query Lichess games database.
+
+**Query Parameters:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `fen` | string | start pos | FEN of the position |
+| `play` | string | — | UCI moves |
+| `variant` | string | `chess` | Variant |
+| `speeds` | csv | all | Filter by speed(s): `ultraBullet,bullet,blitz,rapid,classical,correspondence` |
+| `ratings` | csv | all | Filter by rating group(s): `1000,1200,1400,1600,1800,2000,2200,2500` |
+| `since` | `YYYY-MM` | — | Filter since this month |
+| `until` | `YYYY-MM` | — | Filter until this month |
+| `moves` | int | 12 | Max moves |
+| `topGames` | int | 4 | Max top games |
+| `recentGames` | int | 4 | Max recent games |
+| `history` | bool | false | Include per-month history |
+
+---
+
+### `GET /lichess/history`
+
+Returns per-month game history for a position (Lichess games only).
+
+Same query parameters as `/lichess` without `moves`/`topGames`/`recentGames`.
+
+---
+
+### `GET /player`
+
+Per-player opening statistics. Streams NDJSON — first line is the result, subsequent lines are keepalive newlines or queue position updates.
+
+**Query Parameters:**
+
+| Param | Type | Required | Description |
+|---|---|---|---|
+| `player` | string | ✅ | Lichess username |
+| `color` | `white`/`black` | ✅ | Player's color |
+| `fen` | string | — | FEN |
+| `play` | string | — | UCI moves |
+| `variant` | string | — | Variant |
+| `speeds` | csv | — | Speed filter |
+| `modes` | csv | — | `rated`, `casual` |
+| `moves` | int | — | Max moves (default 12) |
+| `recentGames` | int | — | Max recent games |
+
+**Streaming Response:** NDJSON — each line is a JSON object. The explorer streams keepalive `\n` bytes every 8 seconds while indexing is in progress, then sends the result.
+
+---
+
+### `GET /masters/pgn/:id`
+
+Returns the full PGN of a master game by its 8-character base-62 ID.
+
+```bash
+curl http://localhost:9002/masters/pgn/AbCd1234
+```
+
+---
+
+### `PUT /import/masters`
+
+Import a single master game as PGN (multipart/form-data with field `pgn`).
+
+```bash
+curl -X PUT http://localhost:9002/import/masters \
+  -F pgn=@game.pgn
+```
+
+Validates: avg rating ≥ 2200, no future dates, no duplicate games.
+
+---
+
+### `PUT /import/lichess`
+
+Import a batch of Lichess games as JSON array. Used by `import-pgn`.
+
+```bash
+curl -X PUT http://localhost:9002/import/lichess \
+  -H "Content-Type: application/json" \
+  -d '[{"id":"AbCd1234","variant":"chess",...}]'
+```
+
+---
+
+### `POST /import/openings`
+
+Re-download and refresh opening names from the chess-openings dataset.
+
+```bash
+curl -X POST http://localhost:9002/import/openings
+```
+
+---
+
+### `GET /monitor`
+
+Returns metrics in **InfluxDB line protocol** format.
+
+```bash
+curl http://localhost:9002/monitor
+```
+
+Example output:
+```
+opening_explorer block_index_miss=2271815u,block_index_hit=44204637u,...,lichess=121970833029u
+```
+
+---
+
+### `GET /monitor/db/:prop`
+
+Query a RocksDB DB-level property.
+
+```bash
+curl http://localhost:9002/monitor/db/rocksdb.estimate-num-keys
+```
+
+---
+
+### `GET /monitor/cf/:cf/:prop`
+
+Query a RocksDB column-family property.
+
+```bash
+curl http://localhost:9002/monitor/cf/lichess/rocksdb.stats
+curl http://localhost:9002/monitor/cf/masters/rocksdb.estimate-live-data-size
+```
+
+Column families: `masters`, `masters_game`, `lichess`, `lichess_game`, `player`, `player_status`
+
+---
+
+### `POST /compact`
+
+Trigger a manual RocksDB compaction (slow — only run during maintenance windows).
+
+```bash
+curl -X POST http://localhost:9002/compact
+```
+
+---
+
+## 8. Importing Games
+
+### Bulk import of Lichess database dumps
+
+1. Download PGN dumps from https://database.lichess.org/
+   - Files come as `.pgn.zst` (Zstandard) or `.pgn.bz2`
+
+2. Run the importer (from the `import-pgn` workspace crate):
+
+```bash
+cd import-pgn
+
+# Build the importer
+cargo build --release
+
+# Import directly from compressed files
+cargo run --release -- \
+  --endpoint http://localhost:9002 \
+  --batch-size 200 \
+  *.pgn.zst
+
+# Avoid peak hours (UTC hour numbers)
+cargo run --release -- \
+  --avoid-utc-hour 18 --avoid-utc-hour 19 --avoid-utc-hour 20 \
+  *.pgn.zst
+```
+
+The importer:
+- Reads `.pgn`, `.pgn.bz2`, or `.pgn.zst` files
+- Batches games and POSTs them to `PUT /import/lichess`
+- Shows a progress bar with per-file ETA and speed
+
+### Import a single master game
+
+```bash
+curl -X PUT http://localhost:9002/import/masters \
+  -F pgn=@grandmaster_game.pgn
+```
+
+---
+
+## 9. Database Architecture
+
+### Storage Engine
+
+[RocksDB](https://rocksdb.org/) in **column family** mode with merge operators for lock-free concurrent writes.
+
+### Column Families
+
+| CF | Key | Value | Purpose |
+|---|---|---|---|
+| `masters` | `KeyPrefix(12) + Month(2)` | `MastersEntry` (merged) | Per-position master game stats + top games |
+| `masters_game` | `GameId(6)` | `MastersGame` | Full game record for PGN generation |
+| `lichess` | `KeyPrefix(12) + Month(2)` | `LichessEntry` (merged) | Per-position Lichess stats broken down by speed + rating group |
+| `lichess_game` | `GameId(6)` | `LichessGame` (merged) | Game metadata (outcome, speed, players, indexed flags) |
+| `player` | `KeyPrefix(12) + Month(2)` | `PlayerEntry` (merged) | Per-player-per-position stats |
+| `player_status` | `UserId(bytes)` | `PlayerStatus` | Indexing progress and cooldown per player |
+
+### Key Encoding
+
+Keys are 14 bytes: `[12-byte KeyPrefix][2-byte Month LE]`
+
+- **`masters` / `lichess`**: `KeyPrefix = XOR(Zobrist128[..12], variant_mask[..12])`
+- **`player`**: `KeyPrefix = XOR(SHA1(color+username)[..12], Zobrist128[..12], variant_mask[..12])`
+- **`Month`**: `year * 12 + (month - 1)` encoded as 2-byte LE
+
+Column families `masters`, `lichess`, and `player` use **RocksDB prefix iteration** with prefix length 12 to efficiently scan all months for a position.
+
+### Merge Operators
+
+All stats are accumulated using RocksDB's **merge operator** — individual game writes are small deltas that get merged into the base value lazily during compaction. This avoids read-modify-write cycles on hot paths.
+
+### RocksDB Configuration Highlights
+
+| Setting | Value | Reason |
+|---|---|---|
+| Block size | 64 KB | Large sequential reads |
+| Compression | LZ4 (L0-L6), ZSTD (bottommost) | Space + CPU balance |
+| Direct I/O | Enabled | Bypass OS page cache (jemalloc manages its own) |
+| Filter | Ribbon (hybrid) | Bloom alternative, less memory |
+| Cache | 4 GB default | Index + filter + data blocks |
+| Rate limit | 10 MB/s | Throttle compaction I/O |
+
+### Zobrist Hashing
+
+Uses a **custom `StableZobrist128`** (not shakmaty's built-in) to guarantee the same hash across library updates. The hash is XORed with a per-variant constant so positions from different variants never collide.
+
+---
+
+## 10. Configuration Reference (CLI)
+
+Run `caissify-explorer --help` for the full list.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--bind` | `127.0.0.1:9002` | TCP bind address |
+| `--cors` | off | Enable CORS (adds `Access-Control-Allow-Origin: *`) |
+| `--masters-cache` | 40000 | LRU cache size for masters queries |
+| `--lichess-cache` | 40000 | LRU cache size for Lichess queries |
+| `--db` | `_db` | RocksDB data directory path |
+| `--db-compaction-readahead` | off | Enable readahead during compaction (HDD benefit) |
+| `--db-cache` | 4 GB | RocksDB block cache size in bytes |
+| `--db-rate-limit` | 10 MB/s | Compaction I/O rate limit in bytes/sec |
+| `--lila` | `https://lichess.org` | Lichess base URL (for player indexer) |
+| `--bearer` | — | Lichess API token (env: `EXPLORER_BEARER`) |
+| `--indexers` | 8 | Number of parallel player indexer tasks |
+
+---
+
+## 11. Monitoring & Metrics
+
+### Prometheus / InfluxDB metrics
+
+`GET /monitor` returns **InfluxDB line protocol**. Key fields:
+
+| Metric | Description |
+|---|---|
+| `block_index_miss/hit` | RocksDB block cache index misses/hits |
+| `block_filter_miss/hit` | Bloom/Ribbon filter misses/hits |
+| `block_data_miss/hit` | Data block cache misses/hits |
+| `indexing` | Number of players currently being indexed |
+| `lichess_cache` / `masters_cache` | In-memory LRU cache occupancy |
+| `lichess_miss` / `masters_miss` | Cache misses per source |
+| `masters` / `lichess` / `player` | Number of keys in each CF |
+| `player_status` | Number of indexed players |
+
+### RocksDB introspection
+
+```bash
+# Compaction stats for lichess column family
+curl http://localhost:9002/monitor/cf/lichess/rocksdb.stats
+
+# Estimated DB size
+curl http://localhost:9002/monitor/db/rocksdb.estimate-live-data-size
+
+# Pending compaction bytes
+curl http://localhost:9002/monitor/cf/lichess/rocksdb.estimate-pending-compaction-bytes
+```
+
+---
+
+## 12. Railway Deployment
+
+### Setup
+
+1. Push this repo to GitHub.
+
+2. Create a new Railway project and connect the GitHub repo.
+
+3. Set environment variables in Railway:
+
+   ```
+   EXPLORER_BEARER=<your-lichess-api-token>
+   EXPLORER_LOG=info
+   JEMALLOC_SYS_WITH_MALLOC_CONF=abort_conf:true,background_thread:true,metadata_thp:auto,dirty_decay_ms:30000,muzzy_decay_ms:30000
+   ```
+
+4. Add a **Railway Volume** mounted at `/data` for persistent RocksDB storage.
+
+5. Railway will use `railway.toml` and the `Dockerfile` automatically.
+
+6. The start command from `railway.toml` uses `$PORT` (Railway-injected):
+   ```
+   caissify-explorer --bind 0.0.0.0:$PORT --db /data --cors
+   ```
+
+### Important Railway notes
+
+- The **db-cache** defaults to 4 GB — reduce it to fit your Railway plan's RAM:
+  Add `--db-cache 536870912` (512 MB) to the start command in `railway.toml`.
+- The Dockerfile build may take 5–15 minutes on first deploy due to RocksDB compilation.
+- Use Railway's **health check** at `/monitor` (configured in `railway.toml`).
+- Administrative endpoints (`/import/*`, `/compact`, `/monitor`) are accessible from within Railway's private network; use Railway's [Private Networking](https://docs.railway.app/reference/private-networking) to isolate them.
+
+### Scaling considerations
+
+| Resource | Recommendation |
+|---|---|
+| RAM | ≥ 8 GB for `--db-cache 4294967296` |
+| Disk | SSD strongly preferred; RAID10 for production |
+| CPU | Multi-core benefits compaction and concurrent queries |
+| File descriptors | Set `ulimit -n 131072` (handled automatically in Docker) |
+
+---
+
+## 13. Development Workflows
+
+### Run tests
+
+```bash
+cargo test
+```
+
+### Run benchmarks (iai)
+
+```bash
+cargo bench
+```
+
+### Format code
+
+```bash
+cargo fmt
+```
+
+### Lint
+
+```bash
+cargo clippy
+```
+
+### Check compilation without running
+
+```bash
+set -a && source .env && set +a
+cargo check
+```
+
+### Watch mode (auto-recompile on file change)
+
+```bash
+# Install cargo-watch if not present
+cargo install cargo-watch
+
+cargo watch -x "run -- --db _db --cors"
+```
+
+### Test a specific endpoint locally
+
+```bash
+# Check the start position
+curl "http://localhost:9002/masters?moves=10"
+curl "http://localhost:9002/lichess?speeds=blitz,rapid&ratings=2000,2200"
+curl "http://localhost:9002/player?player=DrNykterstein&color=white"
+
+# Check metrics
+curl http://localhost:9002/monitor
+
+# Trigger opening names refresh
+curl -X POST http://localhost:9002/import/openings
+```
+
+### Debug logging
+
+```bash
+EXPLORER_LOG=caissify_explorer=debug cargo run -- --db _db
+```
+
+---
+
+## 14. Architecture Deep-Dive
+
+### Request lifecycle (e.g. `GET /lichess`)
+
+1. Axum routes to the handler in `main.rs`
+2. Query params parsed into `LichessQuery` (includes FEN + UCI play + filters)
+3. Positions are replayed from FEN using shakmaty
+4. Final position Zobrist hash computed via `StableZobrist128`
+5. `KeyBuilder::lichess().with_zobrist(variant, zobrist)` produces the 12-byte prefix
+6. RocksDB prefix scan collects all monthly entries for that position
+7. Entries filtered by speeds/ratings/date range
+8. Result sorted; top games and recent games selected via `partial_sort`
+9. Opening name looked up from in-memory `Openings` map (keyed by `Zobrist64`)
+10. JSON response serialized via serde and returned
+
+### Cache strategy
+
+Queries first check an in-memory **moka** LRU/TinyLFU cache (default 40k entries each for masters and lichess). The cache key is the full query (position + filters). Player queries are **not cached** due to their mutating nature.
+
+A **cache hint** is applied for deep positions (ply ≥ 25): probabilistic bypass fills the cache at 1–5% rate, preventing cache pollution from rarely-repeated deep positions.
+
+### Player indexer
+
+The player indexer runs as a **background actor pool** (`--indexers 8` by default):
+
+1. `POST /player?player=alice&color=white` arrives
+2. `PlayerIndexerStub::index_player()` checks cooldown (2 min between runs, 24h revisit)
+3. A `Ticket` is issued via `Queue<UserId>` (capacity 2000)
+4. One of the 8 `PlayerIndexerActor` tasks picks up the job
+5. Streams games from Lichess API (`GET /api/games/user/{player}`) via NDJSON
+6. Each game is processed up to ply 50, deduplicating positions via `IntMap<Zobrist128, UciMove>`
+7. A single atomic RocksDB batch per game commits the position stats + game metadata
+8. Progress saved to `player_status` CF every 1024 games
+9. The HTTP response streams keepalive `\n` bytes until indexing completes
+
+### Binary encoding
+
+All data is custom binary-encoded (no protobuf/msgpack) for maximum compactness:
+
+- **Integers**: LEB128 variable-length (`read_uint`/`write_uint` in `model/uint.rs`)
+- **GameId**: 6-byte LE u64 (base-62 display, decoded from 8-char string)
+- **RawUciMove**: 16-bit packed (6 bits from-square, 6 bits to-square, 4 bits promotion/role)
+- **Stats single-game optimization**: compact 2-byte header vs. full varint encoding
+- **LichessGame**: flat byte sequence (outcome + speed + mode + flags + month + 2× player)
+
+### Background tasks
+
+Two periodic goroutines run in the background alongside the main server:
+
+| Task | Interval | Action |
+|---|---|---|
+| `periodic_openings_import` | ~167 minutes | Re-fetches TSV files from chess-openings repo |
+| `periodic_blacklist_update` | ~173 minutes | Fetches mod-marked accounts from Lichess API; skips their games |

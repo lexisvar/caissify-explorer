@@ -1,0 +1,25 @@
+services:
+  explorer:
+    build: .
+    image: caissify-explorer:latest
+    restart: "no"
+    ports:
+      - "9002:9002"
+    volumes:
+      - explorer-db:/data
+    environment:
+      EXPLORER_LOG: "info"
+      JEMALLOC_SYS_WITH_MALLOC_CONF: "abort_conf:true,background_thread:true,metadata_thp:auto,dirty_decay_ms:30000,muzzy_decode_ms:30000"
+      # Optional: EXPLORER_BEARER=<lichess-api-token>
+    command:
+      - --bind
+      - "0.0.0.0:9002"
+      - --db
+      - /data
+      - --cors
+      - --db-cache
+      - "536870912"  # 512 MB (reduce for local dev; default is 4 GB)
+
+volumes:
+  explorer-db:
+    driver: local

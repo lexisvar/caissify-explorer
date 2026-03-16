@@ -14,6 +14,8 @@ use crate::{
         MastersGame, Month, PlayerEntry, PlayerStatus, PreparedResponse, UserId, Year,
     },
 };
+// Re-export so callers don't need to import from model
+pub use crate::model::{MastersEntry as CaissifyEntry, MastersGame as CaissifyGame};
 
 #[derive(Parser)]
 pub struct DbOpt {
@@ -233,6 +235,21 @@ impl Database {
                     cache: &cache,
                 }
                 .descriptor(),
+                // CaissifyDB — custom game database
+                Column {
+                    name: "caissify",
+                    prefix: Some(KeyPrefix::SIZE),
+                    merge: Some(("caissify_merge", caissify_merge)),
+                    cache: &cache,
+                }
+                .descriptor(),
+                Column {
+                    name: "caissify_game",
+                    prefix: None,
+                    merge: None,
+                    cache: &cache,
+                }
+                .descriptor(),
             ],
         )?;
 
@@ -253,6 +270,7 @@ impl Database {
     pub fn compact(&self) {
         self.lichess().compact();
         self.masters().compact();
+        self.caissify().compact();
         log::info!("finished manual compaction");
     }
 
@@ -281,6 +299,17 @@ impl Database {
                 .inner
                 .cf_handle("player_status")
                 .expect("cf player_status"),
+        }
+    }
+
+    pub fn caissify(&self) -> CaissifyDatabase<'_> {
+        CaissifyDatabase {
+            inner: &self.inner,
+            cf_caissify: self.inner.cf_handle("caissify").expect("cf caissify"),
+            cf_caissify_game: self
+                .inner
+                .cf_handle("caissify_game")
+                .expect("cf caissify_game"),
         }
     }
 }
@@ -425,6 +454,151 @@ impl MastersBatch<'_> {
         self.db.inner.write(self.batch)
     }
 }
+
+// ─── CaissifyDB ───────────────────────────────────────────────────────────────
+
+pub struct CaissifyDatabase<'a> {
+    inner: &'a DB,
+    cf_caissify: &'a ColumnFamily,
+    cf_caissify_game: &'a ColumnFamily,
+}
+
+pub struct CaissifyMetrics {
+    num_caissify: u64,
+    num_caissify_game: u64,
+}
+
+impl CaissifyMetrics {
+    pub fn to_influx_string(&self) -> String {
+        [
+            format!("caissify={}u", self.num_caissify),
+            format!("caissify_game={}u", self.num_caissify_game),
+        ]
+        .join(",")
+    }
+}
+
+impl CaissifyDatabase<'_> {
+    pub fn compact(&self) {
+        log::info!("running manual compaction for caissify ...");
+        compact_column(self.inner, self.cf_caissify);
+        log::info!("running manual compaction for caissify_game ...");
+        compact_column(self.inner, self.cf_caissify_game);
+    }
+
+    pub fn estimate_metrics(&self) -> Result<CaissifyMetrics, rocksdb::Error> {
+        Ok(CaissifyMetrics {
+            num_caissify: self
+                .inner
+                .property_int_value_cf(self.cf_caissify, ESTIMATE_NUM_KEYS)?
+                .unwrap_or(0),
+            num_caissify_game: self
+                .inner
+                .property_int_value_cf(self.cf_caissify_game, ESTIMATE_NUM_KEYS)?
+                .unwrap_or(0),
+        })
+    }
+
+    pub fn has_game(&self, id: GameId) -> Result<bool, rocksdb::Error> {
+        self.inner
+            .get_pinned_cf(self.cf_caissify_game, id.to_bytes())
+            .map(|maybe_entry| maybe_entry.is_some())
+    }
+
+    pub fn game(&self, id: GameId) -> Result<Option<MastersGame>, rocksdb::Error> {
+        Ok(self
+            .inner
+            .get_pinned_cf(self.cf_caissify_game, id.to_bytes())?
+            .map(|buf| serde_json::from_slice(&buf).expect("deserialize caissify game")))
+    }
+
+    pub fn games<I: IntoIterator<Item = GameId>>(
+        &self,
+        ids: I,
+    ) -> Result<Vec<Option<MastersGame>>, rocksdb::Error> {
+        self.inner
+            .batched_multi_get_cf(
+                self.cf_caissify_game,
+                &ids.into_iter().map(|id| id.to_bytes()).collect::<Vec<_>>(),
+                false,
+            )
+            .into_iter()
+            .map(|maybe_buf_or_err| {
+                maybe_buf_or_err.map(|maybe_buf| {
+                    maybe_buf
+                        .map(|buf| serde_json::from_slice(&buf).expect("deserialize caissify game"))
+                })
+            })
+            .collect()
+    }
+
+    pub fn has(&self, key: Key) -> Result<bool, rocksdb::Error> {
+        self.inner
+            .get_pinned_cf(self.cf_caissify, key.into_bytes())
+            .map(|maybe_entry| maybe_entry.is_some())
+    }
+
+    pub fn read(
+        &self,
+        key: KeyPrefix,
+        since: Year,
+        until: Year,
+        cache_hint: CacheHint,
+    ) -> Result<MastersEntry, rocksdb::Error> {
+        let mut entry = MastersEntry::default();
+
+        let mut opt = ReadOptions::default();
+        opt.fill_cache(cache_hint.should_fill_cache());
+        opt.set_prefix_same_as_start(true);
+        opt.set_iterate_lower_bound(key.with_year(since).into_bytes());
+        opt.set_iterate_upper_bound(key.with_year(until.add_years_saturating(1)).into_bytes());
+
+        let mut iter = self.inner.raw_iterator_cf_opt(self.cf_caissify, opt);
+        iter.seek_to_first();
+
+        while let Some(mut value) = iter.value() {
+            entry.extend_from_reader(&mut value);
+            iter.next();
+        }
+
+        iter.status().map(|_| entry)
+    }
+
+    pub fn batch(&self) -> CaissifyBatch<'_> {
+        CaissifyBatch {
+            db: self,
+            batch: WriteBatch::default(),
+        }
+    }
+}
+
+pub struct CaissifyBatch<'a> {
+    db: &'a CaissifyDatabase<'a>,
+    batch: WriteBatch,
+}
+
+impl CaissifyBatch<'_> {
+    pub fn merge(&mut self, key: Key, entry: MastersEntry) {
+        let mut buf = Vec::with_capacity(MastersEntry::SIZE_HINT);
+        entry.write(&mut buf);
+        self.batch
+            .merge_cf(self.db.cf_caissify, key.into_bytes(), buf);
+    }
+
+    pub fn put_game(&mut self, id: GameId, game: &MastersGame) {
+        self.batch.put_cf(
+            self.db.cf_caissify_game,
+            id.to_bytes(),
+            serde_json::to_vec(game).expect("serialize caissify game"),
+        );
+    }
+
+    pub fn commit(self) -> Result<(), rocksdb::Error> {
+        self.db.inner.write(self.batch)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 pub struct LichessDatabase<'a> {
     inner: &'a DB,
@@ -704,6 +878,20 @@ fn player_merge(_key: &[u8], existing: Option<&[u8]>, operands: &MergeOperands) 
 }
 
 fn masters_merge(
+    _key: &[u8],
+    existing: Option<&[u8]>,
+    operands: &MergeOperands,
+) -> Option<Vec<u8>> {
+    let mut entry = MastersEntry::default();
+    for mut op in existing.into_iter().chain(operands.into_iter()) {
+        entry.extend_from_reader(&mut op);
+    }
+    let mut buf = Vec::new();
+    entry.write(&mut buf);
+    Some(buf)
+}
+
+fn caissify_merge(
     _key: &[u8],
     existing: Option<&[u8]>,
     operands: &MergeOperands,

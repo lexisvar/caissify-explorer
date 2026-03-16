@@ -33,6 +33,10 @@ impl KeyBuilder {
         KeyBuilder { base: 0 }
     }
 
+    pub fn caissify() -> KeyBuilder {
+        KeyBuilder { base: 0 }
+    }
+
     pub fn with_zobrist(&self, variant: Variant, zobrist: StableZobrist128) -> KeyPrefix {
         // Zobrist hashes are the opposite of cryptographically secure. An
         // attacker could efficiently construct a position such that a record

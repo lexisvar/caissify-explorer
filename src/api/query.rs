@@ -47,6 +47,22 @@ pub struct MastersQuery {
     pub limits: Limits,
 }
 
+/// Same structure as MastersQuery — no minimum rating restriction.
+#[serde_as]
+#[derive(Deserialize, Clone, Debug, Eq, PartialEq, Hash)]
+pub struct CaissifyQuery {
+    #[serde(flatten)]
+    pub play: Play,
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "Year::min_value")]
+    pub since: Year,
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "Year::max_value")]
+    pub until: Year,
+    #[serde(flatten)]
+    pub limits: Limits,
+}
+
 #[derive(Deserialize, Clone, Debug, Hash, Eq, PartialEq)]
 pub struct LichessQuery {
     #[serde(flatten)]

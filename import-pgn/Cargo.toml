@@ -18,3 +18,4 @@ indicatif = "0.18"
 zstd = "0.13"
 time = "0.3"
 shakmaty = "0.30"
+sha1 = { version = "0.10", features = ["std"] }

@@ -1,8 +1,10 @@
+mod caissify;
 mod lichess;
 mod masters;
 mod player;
 mod player_queue;
 
+pub use caissify::CaissifyImporter;
 pub use lichess::{LichessGameImport, LichessImporter};
 pub use masters::MastersImporter;
 pub use player::{PlayerIndexerOpt, PlayerIndexerStub};
