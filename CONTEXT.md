@@ -33,6 +33,7 @@ Based on the upstream [lila-openingexplorer](https://github.com/lichess-org/lila
 | **Masters** | Top-level OTB games (avg rating ≥ 2200) |
 | **Lichess** | Full Lichess.org rated game database |
 | **Player** | Per-player opening statistics indexed on-demand |
+| **Caissify** | Custom OTB game database (e.g. OMOTB) — no rating floor, all games accepted |
 
 Key capabilities:
 - Handles **trillions of positions** using [RocksDB](https://rocksdb.org/) as the embedded storage engine.
@@ -98,6 +99,7 @@ caissify-explorer/
 │   │   └── user.rs         # UserName (original case), UserId (lowercase)
 │   └── indexer/
 │       ├── mod.rs          # Re-exports
+│       ├── caissify.rs     # CaissifyImporter (PUT /import/caissify) — no rating floor
 │       ├── lichess.rs      # LichessGameImport, LichessImporter (PUT /import/lichess)
 │       ├── masters.rs      # MastersImporter (PUT /import/masters)
 │       ├── player.rs       # PlayerIndexerActor, PlayerIndexerStub
@@ -105,7 +107,8 @@ caissify-explorer/
 ├── import-pgn/
 │   ├── Cargo.toml          # Separate workspace crate for bulk PGN import
 │   └── src/bin/
-│       └── import-lichess.rs   # Reads .pgn / .pgn.bz2 / .pgn.zst, POSTs batches
+│       ├── import-caissify.rs  # Reads .pgn / .pgn.bz2 / .pgn.zst, POSTs batches to /import/caissify
+│       └── import-lichess.rs   # Reads .pgn / .pgn.bz2 / .pgn.zst, POSTs batches to /import/lichess
 ├── benches/                # iai benchmarks
 ├── tests/                  # Integration tests
 ├── Dockerfile              # Multi-stage build (builder → debian-slim)
@@ -230,7 +233,7 @@ cargo run --release -- --help
 
 Base URL: `http://localhost:9002`
 
-> ⚠️ **Security**: In production, expose only `/masters`, `/lichess`, and `/player` via your reverse proxy. Lock down all `/import/*`, `/compact`, and `/monitor` endpoints.
+> ⚠️ **Security**: In production, expose only `/masters`, `/lichess`, `/caissify`, and `/player` via your reverse proxy. Lock down all `/import/*`, `/compact`, and `/monitor` endpoints.
 
 ---
 
@@ -345,6 +348,49 @@ Validates: avg rating ≥ 2200, no future dates, no duplicate games.
 
 ---
 
+### `GET /caissify`
+
+Query the Caissify custom game database (e.g. OMOTB). Accepts all games regardless of rating.
+
+**Query Parameters:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `fen` | string | start pos | FEN of the position |
+| `play` | string | — | Comma-separated UCI moves to play from FEN |
+| `variant` | string | `chess` | Variant name |
+| `since` | year int | 1952 | Filter games since this year |
+| `until` | year int | 3000 | Filter games until this year |
+| `moves` | int | 12 | Max number of moves to return |
+| `topGames` | int | 15 | Max top games to return |
+
+Response format is identical to `/masters`.
+
+---
+
+### `GET /caissify/pgn/:id`
+
+Returns the full PGN of a Caissify game by its 8-character base-62 ID.
+
+```bash
+curl http://localhost:9002/caissify/pgn/AbCd1234
+```
+
+---
+
+### `PUT /import/caissify`
+
+Import a single game into the Caissify database as PGN (multipart/form-data with field `pgn`).
+
+```bash
+curl -X PUT http://localhost:9002/import/caissify \
+  -F pgn=@game.pgn
+```
+
+Validates: no future dates, no duplicate games. **No rating floor** — all games are accepted.
+
+---
+
 ### `PUT /import/lichess`
 
 Import a batch of Lichess games as JSON array. Used by `import-pgn`.
@@ -401,7 +447,7 @@ curl http://localhost:9002/monitor/cf/lichess/rocksdb.stats
 curl http://localhost:9002/monitor/cf/masters/rocksdb.estimate-live-data-size
 ```
 
-Column families: `masters`, `masters_game`, `lichess`, `lichess_game`, `player`, `player_status`
+Column families: `masters`, `masters_game`, `lichess`, `lichess_game`, `player`, `player_status`, `caissify`, `caissify_game`
 
 ---
 
@@ -431,13 +477,13 @@ cd import-pgn
 cargo build --release
 
 # Import directly from compressed files
-cargo run --release -- \
+cargo run --release --bin import-lichess -- \
   --endpoint http://localhost:9002 \
   --batch-size 200 \
   *.pgn.zst
 
 # Avoid peak hours (UTC hour numbers)
-cargo run --release -- \
+cargo run --release --bin import-lichess -- \
   --avoid-utc-hour 18 --avoid-utc-hour 19 --avoid-utc-hour 20 \
   *.pgn.zst
 ```
@@ -452,6 +498,43 @@ The importer:
 ```bash
 curl -X PUT http://localhost:9002/import/masters \
   -F pgn=@grandmaster_game.pgn
+```
+
+### Bulk import of Caissify (e.g. OMOTB) games via Docker
+
+The recommended way is to use the `importer` Docker Compose service, which handles the download and import in one step without needing a local Rust toolchain.
+
+1. Capture the Sync.com URL and Cookie from your browser HAR (see `PGN_IMPORT_SYNCCOM.md`).
+
+2. Make sure the explorer is running:
+
+```bash
+docker compose up -d
+```
+
+3. Start the importer service, passing the URL and cookie as env vars:
+
+```bash
+PGN_URL="https://m224.sync.com/u/OMOTB202602PGN.pgn?cachekey=...&datakey=...&access_token=..." \
+PGN_COOKIE="sync_auth=...; signature=..." \
+docker compose --profile import up importer
+```
+
+The `import-entrypoint.sh` script will:
+- Download the PGN to the persistent `pgn-data` Docker volume (skipped if already present)
+- Validate the file is not an HTML error page (expired URL/cookie)
+- Wait for the explorer service to be ready
+- Stream all games to `PUT /import/caissify` via `import-caissify`
+
+If the download is interrupted, re-run the same command — the file will resume from scratch (Sync.com does not support range resumption for all URLs). If the import itself is interrupted, re-run it — the server deduplicates by GameId so no games will be double-counted.
+
+> ⚠️ Sync.com URLs expire in ~1 hour. The 9.64 GB file downloads fast on a good connection but capture a fresh HAR if you get a `< 100 KB` file error.
+
+### Import a single Caissify game
+
+```bash
+curl -X PUT http://localhost:9002/import/caissify \
+  -F pgn=@game.pgn
 ```
 
 ---
@@ -472,16 +555,18 @@ curl -X PUT http://localhost:9002/import/masters \
 | `lichess_game` | `GameId(6)` | `LichessGame` (merged) | Game metadata (outcome, speed, players, indexed flags) |
 | `player` | `KeyPrefix(12) + Month(2)` | `PlayerEntry` (merged) | Per-player-per-position stats |
 | `player_status` | `UserId(bytes)` | `PlayerStatus` | Indexing progress and cooldown per player |
+| `caissify` | `KeyPrefix(12) + Month(2)` | `MastersEntry` (merged) | Per-position Caissify game stats + top games (no rating floor) |
+| `caissify_game` | `GameId(6)` | `MastersGame` | Full game record for PGN generation |
 
 ### Key Encoding
 
 Keys are 14 bytes: `[12-byte KeyPrefix][2-byte Month LE]`
 
-- **`masters` / `lichess`**: `KeyPrefix = XOR(Zobrist128[..12], variant_mask[..12])`
+- **`masters` / `lichess` / `caissify`**: `KeyPrefix = XOR(Zobrist128[..12], variant_mask[..12])`
 - **`player`**: `KeyPrefix = XOR(SHA1(color+username)[..12], Zobrist128[..12], variant_mask[..12])`
 - **`Month`**: `year * 12 + (month - 1)` encoded as 2-byte LE
 
-Column families `masters`, `lichess`, and `player` use **RocksDB prefix iteration** with prefix length 12 to efficiently scan all months for a position.
+Column families `masters`, `lichess`, `caissify`, and `player` use **RocksDB prefix iteration** with prefix length 12 to efficiently scan all months for a position.
 
 ### Merge Operators
 
@@ -514,6 +599,7 @@ Run `caissify-explorer --help` for the full list.
 | `--cors` | off | Enable CORS (adds `Access-Control-Allow-Origin: *`) |
 | `--masters-cache` | 40000 | LRU cache size for masters queries |
 | `--lichess-cache` | 40000 | LRU cache size for Lichess queries |
+| `--caissify-cache` | 40000 | LRU cache size for Caissify queries |
 | `--db` | `_db` | RocksDB data directory path |
 | `--db-compaction-readahead` | off | Enable readahead during compaction (HDD benefit) |
 | `--db-cache` | 4 GB | RocksDB block cache size in bytes |
@@ -536,10 +622,11 @@ Run `caissify-explorer --help` for the full list.
 | `block_filter_miss/hit` | Bloom/Ribbon filter misses/hits |
 | `block_data_miss/hit` | Data block cache misses/hits |
 | `indexing` | Number of players currently being indexed |
-| `lichess_cache` / `masters_cache` | In-memory LRU cache occupancy |
-| `lichess_miss` / `masters_miss` | Cache misses per source |
-| `masters` / `lichess` / `player` | Number of keys in each CF |
+| `lichess_cache` / `masters_cache` / `caissify_cache` | In-memory LRU cache occupancy |
+| `lichess_miss` / `masters_miss` / `caissify_miss` | Cache misses per source |
+| `masters` / `lichess` / `player` / `caissify` | Number of keys in each CF |
 | `player_status` | Number of indexed players |
+| `caissify_game` | Number of games in the Caissify CF |
 
 ### RocksDB introspection
 
@@ -648,6 +735,7 @@ cargo watch -x "run -- --db _db --cors"
 # Check the start position
 curl "http://localhost:9002/masters?moves=10"
 curl "http://localhost:9002/lichess?speeds=blitz,rapid&ratings=2000,2200"
+curl "http://localhost:9002/caissify?moves=10"
 curl "http://localhost:9002/player?player=DrNykterstein&color=white"
 
 # Check metrics

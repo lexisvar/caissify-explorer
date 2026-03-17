@@ -15,7 +15,7 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use pgn_reader::{KnownOutcome, RawTag, Reader, SanPlus, Visitor};
 use serde::Serialize;
 use sha1::{Digest, Sha1};
-use shakmaty::{Chess, Color, Position, fen::Fen};
+use shakmaty::{Chess, CastlingMode, Color, Position, fen::Fen};
 use time::OffsetDateTime;
 
 // --------------------------------------------------------------------------
@@ -240,8 +240,8 @@ impl Visitor for Importer<'_> {
         for san_plus in &g.sans {
             match san_plus.san.to_move(&pos) {
                 Ok(m) => {
-                    uci_moves.push(shakmaty::uci::UciMove::from_move(&m, pos.castles()).to_string());
-                    pos.play_unchecked(&m);
+                    uci_moves.push(shakmaty::uci::UciMove::from_move(m, CastlingMode::Standard).to_string());
+                    pos.play_unchecked(m);
                 }
                 Err(_) => {
                     // Illegal move — skip this game

@@ -19,9 +19,11 @@ RUN mkdir -p src import-pgn/src/bin benches && \
     echo "fn main() {}" > src/main.rs && \
     echo "" > src/lib.rs && \
     echo "fn main() {}" > import-pgn/src/bin/import-lichess.rs && \
+    echo "fn main() {}" > import-pgn/src/bin/import-caissify.rs && \
     echo "fn main() {}" > benches/benches.rs
 
 RUN cargo build --release --bin caissify-explorer 2>/dev/null || true
+RUN cd import-pgn && cargo build --release 2>/dev/null || true
 
 # Copy actual sources and rebuild
 COPY src ./src
@@ -29,9 +31,10 @@ COPY import-pgn/src ./import-pgn/src
 COPY benches ./benches
 
 # Touch to force rebuild
-RUN touch src/main.rs src/lib.rs
+RUN touch src/main.rs src/lib.rs import-pgn/src/bin/import-caissify.rs import-pgn/src/bin/import-lichess.rs
 
 RUN cargo build --release --bin caissify-explorer
+RUN cd import-pgn && cargo build --release
 
 # ---- Runtime stage ----
 # Must match the Debian version used by rust:latest to avoid GLIBC mismatches.
@@ -42,9 +45,11 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     liburing2 \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/caissify-explorer /usr/local/bin/caissify-explorer
+COPY --from=builder /app/import-pgn/target/release/import-caissify /usr/local/bin/import-caissify
 
 # Data directory for RocksDB
 RUN mkdir -p /data

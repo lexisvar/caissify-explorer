@@ -20,6 +20,34 @@ services:
       - --db-cache
       - "536870912"  # 512 MB (reduce for local dev; default is 4 GB)
 
+  # ── Caissify / OMOTB importer ──────────────────────────────────────────────
+  # Usage:
+  #   PGN_URL="https://m224.sync.com/u/..." \
+  #   PGN_COOKIE="sync_auth=...; signature=..." \
+  #   docker compose --profile import up importer
+  #
+  # The service downloads the PGN (skipped if /pgn/omotb.pgn already exists)
+  # then streams it game-by-game to PUT /import/caissify on the explorer.
+  importer:
+    image: caissify-explorer:latest
+    profiles: [import]
+    depends_on:
+      - explorer
+    volumes:
+      - pgn-data:/pgn
+      - ./import-entrypoint.sh:/import-entrypoint.sh:ro
+    environment:
+      # Required: pass these when running the service
+      PGN_URL: "${PGN_URL}"
+      PGN_COOKIE: "${PGN_COOKIE}"
+      # Optional tuning
+      BATCH_SIZE: "${BATCH_SIZE:-200}"
+      EXPLORER_ENDPOINT: "http://explorer:9002"
+    entrypoint: ["/bin/sh", "/import-entrypoint.sh"]
+    restart: "no"
+
 volumes:
   explorer-db:
+    driver: local
+  pgn-data:
     driver: local
