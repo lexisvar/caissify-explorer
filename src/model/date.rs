@@ -108,7 +108,7 @@ impl fmt::Display for LaxDate {
     }
 }
 
-const MIN_YEAR: u16 = 1952;
+const MIN_YEAR: u16 = 1500;
 
 const MAX_YEAR: u16 = 3000; // MAX_YEAR * 12 + 12 < 2^16
 

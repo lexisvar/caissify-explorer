@@ -25,8 +25,8 @@ use time::OffsetDateTime;
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Player {
-    name: Option<String>,
-    rating: Option<u16>,
+    name: String,
+    rating: u16,
 }
 
 /// Matches the `MastersGameWithId` JSON schema understood by `/import/caissify`
@@ -179,19 +179,19 @@ impl Visitor for Importer<'_> {
             }
             b"Round" => g.round = Some(value.decode_utf8().unwrap_or_default().into_owned()),
             b"White" => {
-                g.white.name = Some(value.decode_utf8().unwrap_or_default().into_owned())
+                g.white.name = value.decode_utf8().unwrap_or_default().into_owned()
             }
             b"Black" => {
-                g.black.name = Some(value.decode_utf8().unwrap_or_default().into_owned())
+                g.black.name = value.decode_utf8().unwrap_or_default().into_owned()
             }
             b"WhiteElo" => {
                 if value.as_bytes() != b"?" {
-                    g.white.rating = btoi::btoi(value.as_bytes()).ok();
+                    g.white.rating = btoi::btoi(value.as_bytes()).unwrap_or(0);
                 }
             }
             b"BlackElo" => {
                 if value.as_bytes() != b"?" {
-                    g.black.rating = btoi::btoi(value.as_bytes()).ok();
+                    g.black.rating = btoi::btoi(value.as_bytes()).unwrap_or(0);
                 }
             }
             b"Result" => match KnownOutcome::from_ascii(value.as_bytes()) {
@@ -251,8 +251,8 @@ impl Visitor for Importer<'_> {
         }
 
         let event = g.event.as_deref().unwrap_or("");
-        let white = g.white.name.as_deref().unwrap_or("");
-        let black = g.black.name.as_deref().unwrap_or("");
+        let white = &g.white.name;
+        let black = &g.black.name;
         let date = g.date.as_deref().unwrap_or("????.??.??");
         let round = g.round.as_deref().unwrap_or("?");
 

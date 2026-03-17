@@ -248,7 +248,7 @@ Query master games (OTB games with average rating ≥ 2200).
 | `fen` | string | start pos | FEN of the position |
 | `play` | string | — | Comma-separated UCI moves to play from FEN |
 | `variant` | string | `chess` | Variant name |
-| `since` | year int | 1952 | Filter games since this year |
+| `since` | year int | 1500 | Filter games since this year |
 | `until` | year int | 3000 | Filter games until this year |
 | `moves` | int | 12 | Max number of moves to return |
 | `topGames` | int | 15 | Max top games to return |
@@ -359,7 +359,7 @@ Query the Caissify custom game database (e.g. OMOTB). Accepts all games regardle
 | `fen` | string | start pos | FEN of the position |
 | `play` | string | — | Comma-separated UCI moves to play from FEN |
 | `variant` | string | `chess` | Variant name |
-| `since` | year int | 1952 | Filter games since this year |
+| `since` | year int | 1500 | Filter games since this year |
 | `until` | year int | 3000 | Filter games until this year |
 | `moves` | int | 12 | Max number of moves to return |
 | `topGames` | int | 15 | Max top games to return |
