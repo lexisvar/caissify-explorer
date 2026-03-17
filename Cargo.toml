@@ -17,6 +17,7 @@ log = "0.4"
 moka = { version = "0.12", features = ["future"] }
 nohash-hasher = "0.2"
 partial_sort = "1"
+pgn-reader = "0.29"
 pin-project-lite = "0.2"
 reqwest = { version = "0.12", features = ["stream"] }
 rocksdb = { version = "0.24", features = ["io-uring", "lz4", "zstd", "jemalloc", "bindgen-runtime"], default-features = false }

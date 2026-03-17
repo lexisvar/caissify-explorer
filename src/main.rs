@@ -52,8 +52,8 @@ use crate::{
     },
     db::{CacheHint, Database, DbOpt, LichessDatabase},
     indexer::{
-        CaissifyImporter, LichessGameImport, LichessImporter, MastersImporter, PlayerIndexerOpt,
-        PlayerIndexerStub, QueueFull, Ticket,
+        CaissifyImporter, ImportStatus, LichessGameImport, LichessImporter, MastersImporter,
+        PlayerIndexerOpt, PlayerIndexerStub, PgnUrlImporter, QueueFull, Ticket,
     },
     lila::{Lila, LilaOpt},
     metrics::Metrics,
@@ -108,6 +108,7 @@ struct AppState {
     lichess_importer: LichessImporter,
     masters_importer: MastersImporter,
     caissify_importer: CaissifyImporter,
+    pgn_url_importer: PgnUrlImporter,
     player_indexer: PlayerIndexerStub,
     semaphore: &'static Semaphore,
 }
@@ -154,6 +155,8 @@ async fn serve() {
         .route("/import/masters", put(masters_import))
         .route("/import/lichess", put(lichess_import))
         .route("/import/caissify", put(caissify_import))
+        .route("/import/caissify/pgn-url", post(caissify_pgn_url_import))
+        .route("/import/caissify/pgn-url/status", get(caissify_pgn_url_status))
         .route("/import/openings", post(openings_import))
         .route("/masters/pgn/{id}", get(masters_pgn))
         .route("/masters", get(masters))
@@ -187,6 +190,7 @@ async fn serve() {
             lichess_importer: LichessImporter::new(Arc::clone(&db)),
             masters_importer: MastersImporter::new(Arc::clone(&db)),
             caissify_importer: CaissifyImporter::new(Arc::clone(&db)),
+            pgn_url_importer: PgnUrlImporter::new(CaissifyImporter::new(Arc::clone(&db))),
             player_indexer,
             db,
             semaphore: Box::leak(Box::new(Semaphore::new(128))),
@@ -737,6 +741,41 @@ async fn caissify_import(
     Json(body): Json<MastersGameWithId>,
 ) -> Result<(), Error> {
     spawn_blocking(semaphore, move || importer.import(body)).await
+}
+
+#[derive(serde::Deserialize)]
+struct PgnUrlImportRequest {
+    url: String,
+    cookie: String,
+}
+
+#[axum::debug_handler(state = AppState)]
+async fn caissify_pgn_url_import(
+    State(importer): State<PgnUrlImporter>,
+    Json(body): Json<PgnUrlImportRequest>,
+) -> impl axum::response::IntoResponse {
+    if importer.start(body.url, body.cookie) {
+        (
+            axum::http::StatusCode::ACCEPTED,
+            axum::Json(serde_json::json!({
+                "message": "PGN import job started in the background",
+            })),
+        )
+    } else {
+        (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({
+                "message": "An import is already running — check /import/caissify/pgn-url/status",
+            })),
+        )
+    }
+}
+
+#[axum::debug_handler(state = AppState)]
+async fn caissify_pgn_url_status(
+    State(importer): State<PgnUrlImporter>,
+) -> axum::Json<ImportStatus> {
+    axum::Json(importer.status())
 }
 
 #[axum::debug_handler(state = AppState)]
