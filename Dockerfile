@@ -1,6 +1,6 @@
 # ---- Chef stage: install cargo-chef ----
-FROM rust:1.86 AS chef
-RUN cargo install cargo-chef --version 0.1.71 --locked
+FROM rust:1.88 AS chef
+RUN cargo install cargo-chef --locked
 WORKDIR /app
 
 # Install RocksDB build dependencies (io-uring requires liburing-dev)
@@ -29,7 +29,7 @@ RUN cargo build --release --bin caissify-explorer
 RUN cd import-pgn && cargo build --release
 
 # ---- Runtime stage ----
-# Must match the Debian version used by rust:1.86 (bookworm) to avoid GLIBC mismatches.
+# Must match the Debian version used by rust:1.88 (bookworm) to avoid GLIBC mismatches.
 FROM debian:bookworm-slim
 
 WORKDIR /app
