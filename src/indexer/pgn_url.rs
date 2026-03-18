@@ -179,40 +179,17 @@ fn parse_and_import(
     state: State,
 ) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
     let file = std::fs::File::open(&path)?;
-    let mut visitor = PgnVisitor;
-    let mut imported: u64 = 0;
-    let mut skipped: u64 = 0;
+    let mut visitor = PgnVisitor {
+        caissify,
+        state: Arc::clone(&state),
+        imported: 0,
+        skipped: 0,
+    };
 
-    for result in Reader::new(file).into_iter(&mut visitor) {
-        match result {
-            Ok(Some(game)) => match caissify.import(game) {
-                Ok(()) => imported += 1,
-                Err(ApiError::DuplicateGame { .. }) => skipped += 1,
-                Err(e) => {
-                    log::debug!("skipped game during pgn-url import: {e}");
-                    skipped += 1;
-                }
-            },
-            Ok(None) => skipped += 1,
-            Err(e) => {
-                log::debug!("pgn parse error: {e}");
-                skipped += 1;
-            }
-        }
+    Reader::new(file).visit_all_games(&mut visitor)?;
 
-        if (imported + skipped) % 1_000 == 0 {
-            let mut guard = state.lock().expect("lock pgn_url state");
-            if let ImportStatus::Running {
-                games_imported,
-                games_skipped,
-                ..
-            } = &mut guard.0
-            {
-                *games_imported = imported;
-                *games_skipped = skipped;
-            }
-        }
-    }
+    let imported = visitor.imported;
+    let skipped = visitor.skipped;
 
     // Final status update
     {
@@ -253,12 +230,17 @@ struct RawGame {
     sans: Vec<SanPlus>,
 }
 
-struct PgnVisitor;
+struct PgnVisitor {
+    caissify: CaissifyImporter,
+    state: State,
+    imported: u64,
+    skipped: u64,
+}
 
 impl Visitor for PgnVisitor {
     type Tags = RawGame;
     type Movetext = RawGame;
-    type Output = Option<MastersGameWithId>;
+    type Output = ();
 
     fn begin_tags(&mut self) -> ControlFlow<Self::Output, Self::Tags> {
         ControlFlow::Continue(RawGame::default())
@@ -297,7 +279,7 @@ impl Visitor for PgnVisitor {
             }
             b"Result" => match KnownOutcome::from_ascii(value.as_bytes()) {
                 Ok(outcome) => g.winner = Some(outcome.winner()),
-                Err(_) => return ControlFlow::Break(None),
+                Err(_) => return ControlFlow::Break(()),
             },
             b"FEN" => {
                 let s = value.decode_utf8().unwrap_or_default().into_owned();
@@ -312,7 +294,7 @@ impl Visitor for PgnVisitor {
 
     fn begin_movetext(&mut self, g: RawGame) -> ControlFlow<Self::Output, Self::Movetext> {
         if g.winner.is_none() {
-            ControlFlow::Break(None)
+            ControlFlow::Break(())
         } else {
             ControlFlow::Continue(g)
         }
@@ -324,60 +306,88 @@ impl Visitor for PgnVisitor {
     }
 
     fn end_game(&mut self, g: RawGame) -> Self::Output {
-        // Replay moves from starting position (or custom FEN)
-        let mut pos: Chess = match g.fen.as_deref() {
-            Some(s) => match s.parse::<Fen>() {
-                Ok(fen) => match fen.into_position(CastlingMode::Standard) {
-                    Ok(p) => p,
-                    Err(_) => return None,
-                },
-                Err(_) => return None,
-            },
-            None => Chess::default(),
-        };
+        let game = convert_raw_game(g);
 
-        let mut uci_moves: Vec<shakmaty::uci::UciMove> = Vec::with_capacity(g.sans.len());
-        for san_plus in &g.sans {
-            match san_plus.san.to_move(&pos) {
-                Ok(m) => {
-                    uci_moves
-                        .push(shakmaty::uci::UciMove::from_move(m, CastlingMode::Standard));
-                    pos.play_unchecked(m);
+        match game {
+            Some(game) => match self.caissify.import(game) {
+                Ok(()) => self.imported += 1,
+                Err(ApiError::DuplicateGame { .. }) => self.skipped += 1,
+                Err(e) => {
+                    log::debug!("skipped game during pgn-url import: {e}");
+                    self.skipped += 1;
                 }
-                Err(_) => return None,
-            }
+            },
+            None => self.skipped += 1,
         }
 
-        let event = g.event.as_deref().unwrap_or("");
-        let date_str = g.date.as_deref().unwrap_or("????.??.??");
-        let round = g.round.as_deref().unwrap_or("?");
-
-        let id_str = make_game_id(event, &g.white_name, &g.black_name, date_str, round);
-        let id = id_str.parse::<GameId>().ok()?;
-        let date = date_str.parse::<LaxDate>().ok()?;
-
-        Some(MastersGameWithId {
-            id,
-            game: MastersGame {
-                event: g.event.unwrap_or_default(),
-                site: g.site.unwrap_or_default(),
-                date,
-                round: round.to_string(),
-                players: ByColor {
-                    white: GamePlayer {
-                        name: g.white_name,
-                        rating: g.white_rating,
-                    },
-                    black: GamePlayer {
-                        name: g.black_name,
-                        rating: g.black_rating,
-                    },
-                },
-                winner: g.winner.flatten(),
-                moves: uci_moves,
-            },
-        })
+        if (self.imported + self.skipped) % 1_000 == 0 {
+            let mut guard = self.state.lock().expect("lock pgn_url state");
+            if let ImportStatus::Running {
+                games_imported,
+                games_skipped,
+                ..
+            } = &mut guard.0
+            {
+                *games_imported = self.imported;
+                *games_skipped = self.skipped;
+            }
+        }
     }
+}
+
+fn convert_raw_game(g: RawGame) -> Option<MastersGameWithId> {
+    // Replay moves from starting position (or custom FEN)
+    let mut pos: Chess = match g.fen.as_deref() {
+        Some(s) => match s.parse::<Fen>() {
+            Ok(fen) => match fen.into_position(CastlingMode::Standard) {
+                Ok(p) => p,
+                Err(_) => return None,
+            },
+            Err(_) => return None,
+        },
+        None => Chess::default(),
+    };
+
+    let mut uci_moves: Vec<shakmaty::uci::UciMove> = Vec::with_capacity(g.sans.len());
+    for san_plus in &g.sans {
+        match san_plus.san.to_move(&pos) {
+            Ok(m) => {
+                uci_moves.push(shakmaty::uci::UciMove::from_move(m, CastlingMode::Standard));
+                pos.play_unchecked(m);
+            }
+            Err(_) => return None,
+        }
+    }
+
+    let event = g.event.as_deref().unwrap_or("");
+    let date_str = g.date.as_deref().unwrap_or("????.??.??");
+    let round = g.round.as_deref().unwrap_or("?");
+
+    let id_str = make_game_id(event, &g.white_name, &g.black_name, date_str, round);
+    let id = id_str.parse::<GameId>().ok()?;
+    let date = date_str.parse::<LaxDate>().ok()?;
+
+    Some(MastersGameWithId {
+        id,
+        game: MastersGame {
+            event: g.event.unwrap_or_default(),
+            site: g.site.unwrap_or_default(),
+            date,
+            round: round.to_string(),
+            players: ByColor {
+                white: GamePlayer {
+                    name: g.white_name,
+                    rating: g.white_rating,
+                },
+                black: GamePlayer {
+                    name: g.black_name,
+                    rating: g.black_rating,
+                },
+            },
+            winner: g.winner.flatten(),
+            moves: uci_moves,
+        },
+    })
 }
 
 // ── Game ID (must match import-caissify.rs) ───────────────────────────────────
