@@ -1,6 +1,6 @@
-# ---- Build stage ----
-FROM rust:latest AS builder
-
+# ---- Chef stage: install cargo-chef ----
+FROM rust:1.85 AS chef
+RUN cargo install cargo-chef --locked
 WORKDIR /app
 
 # Install RocksDB build dependencies (io-uring requires liburing-dev)
@@ -10,35 +10,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     liburing-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy workspace manifests first (better layer caching)
-COPY Cargo.toml Cargo.lock ./
-COPY import-pgn/Cargo.toml ./import-pgn/Cargo.toml
+# ---- Planner stage: compute the dependency recipe ----
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
 
-# Create dummy sources so Cargo can resolve dependencies
-RUN mkdir -p src import-pgn/src/bin benches && \
-    echo "fn main() {}" > src/main.rs && \
-    echo "" > src/lib.rs && \
-    echo "fn main() {}" > import-pgn/src/bin/import-lichess.rs && \
-    echo "fn main() {}" > import-pgn/src/bin/import-caissify.rs && \
-    echo "fn main() {}" > benches/benches.rs
+# ---- Build stage ----
+FROM chef AS builder
 
-RUN cargo build --release --bin caissify-explorer 2>/dev/null || true
-RUN cd import-pgn && cargo build --release 2>/dev/null || true
+COPY --from=planner /app/recipe.json recipe.json
 
-# Copy actual sources and rebuild
-COPY src ./src
-COPY import-pgn/src ./import-pgn/src
-COPY benches ./benches
+# Pre-build all dependencies (this layer is cached as long as Cargo.toml/Cargo.lock don't change)
+RUN cargo chef cook --release --recipe-path recipe.json
 
-# Touch to force rebuild
-RUN touch src/main.rs src/lib.rs import-pgn/src/bin/import-caissify.rs import-pgn/src/bin/import-lichess.rs
-
+# Copy actual sources and do the final build
+COPY . .
 RUN cargo build --release --bin caissify-explorer
 RUN cd import-pgn && cargo build --release
 
 # ---- Runtime stage ----
-# Must match the Debian version used by rust:latest to avoid GLIBC mismatches.
-FROM debian:trixie-slim
+# Must match the Debian version used by rust:1.85 (bookworm) to avoid GLIBC mismatches.
+FROM debian:bookworm-slim
 
 WORKDIR /app
 
