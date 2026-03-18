@@ -6,6 +6,7 @@ pub mod indexer;
 pub mod lila;
 pub mod metrics;
 pub mod model;
+pub mod openapi;
 pub mod opening;
 pub mod util;
 pub mod zobrist;
@@ -148,6 +149,8 @@ async fn serve() {
         PlayerIndexerStub::spawn(&mut join_set, Arc::clone(&db), opt.player_indexer, opt.lila);
 
     let app = Router::new()
+        .route("/api-docs/openapi.json", get(openapi_json))
+        .route("/api-docs", get(openapi_ui))
         .route("/monitor/cf/{cf}/{prop}", get(cf_prop))
         .route("/monitor/db/{prop}", get(db_prop))
         .route("/monitor", get(monitor))
@@ -978,4 +981,29 @@ async fn lichess_history(
         Query(with_source),
     )
     .await
+}
+
+async fn openapi_json() -> impl axum::response::IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        crate::openapi::spec().to_string(),
+    )
+}
+
+async fn openapi_ui() -> impl axum::response::IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        r#"<!doctype html>
+<html>
+<head>
+  <title>Caissify Explorer — API Docs</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+</head>
+<body>
+  <script id="api-reference" data-url="/api-docs/openapi.json"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+</body>
+</html>"#,
+    )
 }
