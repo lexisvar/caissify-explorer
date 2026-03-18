@@ -70,10 +70,10 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 #[derive(Parser)]
 struct Opt {
-    /// Binding address. Note that administrative endpoints must be protected
-    /// using a reverse proxy.
-    #[arg(long, default_value = "127.0.0.1:9002")]
-    bind: SocketAddr,
+    /// Binding address. Defaults to 127.0.0.1:9002, or 0.0.0.0:$PORT when
+    /// the PORT environment variable is set (e.g. Railway / Heroku).
+    #[arg(long)]
+    bind: Option<SocketAddr>,
     /// Allow access from all origins.
     #[arg(long)]
     cors: bool,
@@ -205,7 +205,16 @@ async fn serve() {
         app
     };
 
-    let listener = TcpListener::bind(&opt.bind).await.expect("bind");
+    let bind: SocketAddr = opt.bind.unwrap_or_else(|| {
+        if let Ok(port_str) = std::env::var("PORT") {
+            if let Ok(port) = port_str.parse::<u16>() {
+                return SocketAddr::from(([0, 0, 0, 0], port));
+            }
+        }
+        SocketAddr::from(([127, 0, 0, 1], 9002))
+    });
+    log::info!("Listening on {bind}");
+    let listener = TcpListener::bind(&bind).await.expect("bind");
     axum::serve(listener, app).await.expect("serve");
 }
 

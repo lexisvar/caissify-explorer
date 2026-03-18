@@ -3,7 +3,7 @@ builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "caissify-explorer --bind 0.0.0.0:$PORT --db /data --cors"
+startCommand = "caissify-explorer --db /data --cors"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 5
 
