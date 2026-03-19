@@ -711,33 +711,43 @@ impl CaissifyDatabase<'_> {
         limit: usize,
         reverse: bool,
     ) -> Result<Vec<CaissifyByDateKey>, rocksdb::Error> {
-        let lower = CaissifyByDateKey {
-            year: since_year,
-            id: GameId::MIN,
-        }
-        .into_bytes();
-        let upper = CaissifyByDateKey::upper_bound(until_year);
-
+        // No ReadOptions bounds: iterate_lower/upper_bound interacts badly with
+        // the 2-byte prefix extractor on this CF (seek_for_prev on a sentinel key
+        // whose prefix doesn't exist in data returns invalid immediately).
+        // Instead, use seek_to_first/seek_to_last (bloom-filter-free absolute
+        // seeks) and enforce year bounds manually in the loop.
         let mut opt = ReadOptions::default();
         opt.fill_cache(true);
-        opt.set_iterate_lower_bound(lower);
-        opt.set_iterate_upper_bound(upper);
-        opt.set_prefix_same_as_start(false);
 
         let mut iter = self
             .inner
             .raw_iterator_cf_opt(self.cf_caissify_game_by_date, opt);
 
         if reverse {
-            // Start from the cursor (exclusive) or from the end of the range.
             match cursor {
-                Some(c) => iter.seek_for_prev(c.into_bytes()),
+                Some(c) => {
+                    // The cursor is the last key returned on the previous page
+                    // (exclusive lower bound): position AT it then step past it.
+                    iter.seek_for_prev(c.into_bytes());
+                    if iter.valid() {
+                        iter.prev();
+                    }
+                }
+                // seek_to_last() seeks to the absolute last key without relying
+                // on bloom filters or needing a valid prefix — always works.
+                // Then the loop filters by year < since_year.
                 None => iter.seek_to_last(),
             }
         } else {
-            // Start from the cursor (inclusive) or from the beginning.
             match cursor {
-                Some(c) => iter.seek(c.into_bytes()),
+                Some(c) => {
+                    // Exclusive: step past the cursor.
+                    iter.seek(c.into_bytes());
+                    if iter.valid() {
+                        iter.next();
+                    }
+                }
+                // seek_to_first() seeks to the absolute first key, same reasoning.
                 None => iter.seek_to_first(),
             }
         }
@@ -749,7 +759,27 @@ impl CaissifyDatabase<'_> {
             };
             if key_bytes.len() >= CaissifyByDateKey::SIZE {
                 let entry = CaissifyByDateKey::read(&mut &key_bytes[..]);
-                results.push(entry);
+                if reverse {
+                    // Going newest→oldest: stop once we've passed the lower bound.
+                    if entry.year < since_year {
+                        break;
+                    }
+                    // Skip entries above the upper bound (only happens when no cursor
+                    // and until_year < current maximum year in the DB).
+                    if entry.year <= until_year {
+                        results.push(entry);
+                    }
+                } else {
+                    // Going oldest→newest: stop once we've passed the upper bound.
+                    if entry.year > until_year {
+                        break;
+                    }
+                    // Skip entries below the lower bound (only when no cursor
+                    // and since_year > current minimum year in the DB).
+                    if entry.year >= since_year {
+                        results.push(entry);
+                    }
+                }
             }
             if reverse {
                 iter.prev();
