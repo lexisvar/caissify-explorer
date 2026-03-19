@@ -28,26 +28,37 @@ services:
     entrypoint: [""]                        # override ENTRYPOINT so we can run arbitrary commands
     command: ["cargo", "check"]
 
+  # ── Local dev server ──────────────────────────────────────────────────────
+  # Runs the binary built by `docker compose run --rm dev cargo build --release`.
+  # Railway deploys using the Dockerfile directly — this service is local only.
+  #
+  # Workflow:
+  #   docker compose run --rm dev cargo build --release   # compile
+  #   docker compose up -d explorer                       # start / restart
+  #
   explorer:
-    build: .
-    image: caissify-explorer:latest
+    image: caissify-explorer-dev:latest   # the builder stage image (same as dev)
     restart: "no"
     ports:
       - "9002:9002"
     volumes:
       - explorer-db:/data
+      - dev-target:/app/target            # binary compiled by the dev container
+    working_dir: /app
     environment:
       EXPLORER_LOG: "info"
-      JEMALLOC_SYS_WITH_MALLOC_CONF: "abort_conf:true,background_thread:true,metadata_thp:auto,dirty_decay_ms:30000,muzzy_decode_ms:30000"
-      # Optional: EXPLORER_BEARER=<lichess-api-token>
+      RUST_BACKTRACE: "1"
+      JEMALLOC_SYS_WITH_MALLOC_CONF: "abort_conf:true,background_thread:true,metadata_thp:auto,dirty_decay_ms:30000,muzzy_decay_ms:30000"
+    entrypoint: [""]
     command:
+      - ./target/release/caissify-explorer
       - --bind
       - "0.0.0.0:9002"
       - --db
       - /data
       - --cors
       - --db-cache
-      - "536870912"  # 512 MB (reduce for local dev; default is 4 GB)
+      - "536870912"
 
   # ── Caissify / OMOTB importer ──────────────────────────────────────────────
   # Usage:
@@ -58,7 +69,7 @@ services:
   # The service downloads the PGN (skipped if /pgn/omotb.pgn already exists)
   # then streams it game-by-game to PUT /import/caissify on the explorer.
   importer:
-    image: caissify-explorer:latest
+    image: caissify-explorer-dev:latest
     profiles: [import]
     depends_on:
       - explorer

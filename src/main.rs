@@ -146,6 +146,7 @@ async fn serve() {
     join_set.spawn(periodic_blacklist_update(blacklist, opt.lila.clone()));
 
     let db = task::block_in_place(|| Arc::new(Database::open(opt.db).expect("db")));
+    join_set.spawn(periodic_fide_ratings_update(Arc::clone(&db)));
     let player_indexer =
         PlayerIndexerStub::spawn(&mut join_set, Arc::clone(&db), opt.player_indexer, opt.lila);
 
@@ -163,6 +164,7 @@ async fn serve() {
         .route("/import/caissify/pgn-url/status", get(caissify_pgn_url_status))
         .route("/import/caissify/reindex", post(caissify_reindex))
         .route("/import/fide", put(fide_import))
+        .route("/import/fide/refresh", post(fide_refresh))
         .route("/import/openings", post(openings_import))
         .route("/masters/pgn/{id}", get(masters_pgn))
         .route("/masters", get(masters))
@@ -226,6 +228,217 @@ async fn serve() {
     log::info!("Listening on {bind}");
     let listener = TcpListener::bind(&bind).await.expect("bind");
     axum::serve(listener, app).await.expect("serve");
+}
+
+// ─── FIDE periodic updater ───────────────────────────────────────────────────
+
+/// Raw record parsed from FIDE XML before writing to RocksDB.
+struct FideXmlRecord {
+    fide_id: u32,
+    name: String,
+    country: String,
+    sex: String,
+    title: String,
+    birth_year: u16,
+    flag: String,
+    standard: u16,
+    rapid: u16,
+    blitz: u16,
+    games_standard: u16,
+    k_factor: u8,
+}
+
+/// Event-based SAX-style XML parser for the FIDE standard rating list.
+fn fide_parse_xml(xml: &[u8]) -> Vec<FideXmlRecord> {
+    use quick_xml::{Reader, events::Event};
+
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut players: Vec<FideXmlRecord> = Vec::with_capacity(400_000);
+    let mut current: Option<FideXmlRecord> = None;
+    let mut current_tag = String::new();
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let tag = std::str::from_utf8(e.name().as_ref())
+                    .unwrap_or("")
+                    .to_owned();
+                if tag == "player" {
+                    current = Some(FideXmlRecord {
+                        fide_id: 0,
+                        name: String::new(),
+                        country: String::new(),
+                        sex: String::new(),
+                        title: String::new(),
+                        birth_year: 0,
+                        flag: String::new(),
+                        standard: 0,
+                        rapid: 0,
+                        blitz: 0,
+                        games_standard: 0,
+                        k_factor: 0,
+                    });
+                }
+                current_tag = tag;
+            }
+            Ok(Event::Text(e)) => {
+                if let Some(ref mut p) = current {
+                    let text = e.unescape().unwrap_or_default();
+                    let text = text.trim();
+                    if text.is_empty() {
+                        buf.clear();
+                        continue;
+                    }
+                    match current_tag.as_str() {
+                        "fideid"       => p.fide_id       = text.parse().unwrap_or(0),
+                        "name"         => p.name          = text.to_owned(),
+                        "country"      => p.country       = text.to_owned(),
+                        "sex"          => p.sex           = text.to_owned(),
+                        "title"        => p.title         = text.to_owned(),
+                        "birthday"     => p.birth_year    = text.parse().unwrap_or(0),
+                        "flag"         => p.flag = if text.eq_ignore_ascii_case("i") {
+                                              "inactive".to_owned()
+                                          } else {
+                                              "active".to_owned()
+                                          },
+                        "rating"       => p.standard      = text.parse().unwrap_or(0),
+                        "games"        => p.games_standard = text.parse().unwrap_or(0),
+                        "k"            => p.k_factor      = text.parse().unwrap_or(0),
+                        "rapid_rating" => p.rapid         = text.parse().unwrap_or(0),
+                        "blitz_rating" => p.blitz         = text.parse().unwrap_or(0),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::End(e)) => {
+                if std::str::from_utf8(e.name().as_ref()).unwrap_or("") == "player" {
+                    if let Some(p) = current.take() {
+                        if p.fide_id > 0 {
+                            players.push(p);
+                        }
+                    }
+                }
+                current_tag.clear();
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    players
+}
+
+async fn periodic_fide_ratings_update(db: Arc<Database>) {
+    const INTERVAL: Duration = Duration::from_secs(60 * 60 * 24 * 32);
+
+    loop {
+        match fide_ratings_import_once(Arc::clone(&db)).await {
+            Ok(n)  => log::info!("FIDE updater: imported {n} players"),
+            Err(e) => log::error!("FIDE updater: {e} — retrying in 1h"),
+        }
+        time::sleep(INTERVAL).await;
+    }
+}
+
+/// Admin endpoint — trigger a FIDE rating list download immediately.
+#[axum::debug_handler(state = AppState)]
+async fn fide_refresh(
+    State(db): State<Arc<Database>>,
+) -> Result<String, StatusCode> {
+    match fide_ratings_import_once(db).await {
+        Ok(n)  => Ok(format!("imported {n} FIDE players")),
+        Err(e) => {
+            log::error!("FIDE manual refresh failed: {e}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Download + parse + write the current FIDE standard rating list.
+/// Returns the number of players written.
+async fn fide_ratings_import_once(db: Arc<Database>) -> Result<usize, String> {
+    use crate::model::{FideFlag, FidePlayer, FideRatingKey, FideRatingSnapshot};
+    use std::io::Read as _;
+    use ::time::OffsetDateTime;
+
+    const FIDE_URL: &str =
+        "https://ratings.fide.com/download/standard_rating_list_xml.zip";
+
+    let client = reqwest::Client::builder()
+        .user_agent("caissify-explorer/fide-updater")
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let now = OffsetDateTime::now_utc();
+    let month_str = format!("{}-{:02}", now.year(), u8::from(now.month()));
+    let month: Month = month_str.parse().map_err(|e: crate::model::InvalidDate| e.to_string())?;
+
+    log::info!("FIDE: downloading rating list for {month}");
+
+    let zip_bytes = client
+        .get(FIDE_URL)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .bytes()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    log::info!("FIDE: downloaded {} MB — parsing…", zip_bytes.len() / 1_048_576);
+
+    task::spawn_blocking(move || -> Result<usize, String> {
+        let cursor = std::io::Cursor::new(zip_bytes);
+        let mut archive = zip::ZipArchive::new(cursor).map_err(|e| e.to_string())?;
+        let mut xml = Vec::new();
+        archive
+            .by_index(0)
+            .map_err(|e| e.to_string())?
+            .read_to_end(&mut xml)
+            .map_err(|e| e.to_string())?;
+
+        let records = fide_parse_xml(&xml);
+        let total = records.len();
+        log::info!("FIDE: parsed {total} records — writing…");
+
+        let fide_db = db.fide();
+        for chunk in records.chunks(500) {
+            let mut batch = fide_db.batch();
+            for rec in chunk {
+                batch.put_player(&FidePlayer {
+                    fide_id: rec.fide_id,
+                    name: rec.name.clone(),
+                    country: rec.country.clone(),
+                    sex: rec.sex.clone(),
+                    title: rec.title.clone(),
+                    birth_year: rec.birth_year,
+                    flag: match rec.flag.as_str() {
+                        "inactive" => FideFlag::Inactive,
+                        "active"   => FideFlag::Active,
+                        _          => FideFlag::Unknown,
+                    },
+                });
+                batch.put_rating_snapshot(
+                    FideRatingKey { fide_id: rec.fide_id, month },
+                    &FideRatingSnapshot {
+                        standard:      rec.standard,
+                        rapid:         rec.rapid,
+                        blitz:         rec.blitz,
+                        games_standard: rec.games_standard,
+                        k_factor:      rec.k_factor,
+                    },
+                );
+            }
+            batch.commit().map_err(|e| e.to_string())?;
+        }
+        Ok(total)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 async fn periodic_openings_import(openings: &'static RwLock<Openings>) {

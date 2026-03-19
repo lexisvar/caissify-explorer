@@ -468,7 +468,7 @@ These are non-breaking internal changes that all subsequent features depend on.
 - [x] `GET /fide/player/{fide_id}` endpoint. ✅ 2026-03-19
 - [x] `GET /fide/player/{fide_id}/ratings` endpoint with month range filter. ✅ 2026-03-19
 - [x] `PUT /import/fide` admin endpoint (accepts JSON batch `{ month, players[] }`). ✅ 2026-03-19
-- [ ] Add `periodic_fide_ratings_update` background task (~32 day interval).
+- [x] Add `periodic_fide_ratings_update` background task (~32 day interval). ✅ 2026-03-20
 - [x] Update OpenAPI spec. ✅ 2026-03-19 ✅ 2026-03-19
 
 ### Phase 3 — FIDE Player ↔ Game Linking (~3–4 days)
