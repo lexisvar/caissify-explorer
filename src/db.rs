@@ -933,6 +933,44 @@ impl FideDatabase<'_> {
         iter.status().map(|_| results)
     }
 
+    /// Fetch only the most recent rating snapshot for a player (reverse seek).
+    pub fn get_latest_rating_snapshot(
+        &self,
+        fide_id: u32,
+    ) -> Result<Option<(Month, FideRatingSnapshot)>, rocksdb::Error> {
+        let lower = FideRatingKey {
+            fide_id,
+            month: Month::min_value(),
+        }
+        .into_bytes();
+        let upper = FideRatingKey::upper_bound(fide_id);
+
+        let mut opt = ReadOptions::default();
+        opt.fill_cache(true);
+        opt.set_iterate_lower_bound(lower);
+        opt.set_iterate_upper_bound(upper);
+
+        let mut iter = self
+            .inner
+            .raw_iterator_cf_opt(self.cf_fide_rating_history, opt);
+        iter.seek_to_last();
+
+        let result = if let Some((key_bytes, value_bytes)) = iter.item() {
+            if key_bytes.len() >= FideRatingKey::SIZE {
+                let month_raw = u16::from_le_bytes([key_bytes[4], key_bytes[5]]);
+                Month::try_from(month_raw)
+                    .ok()
+                    .map(|month| (month, FideRatingSnapshot::read(&mut &value_bytes[..])))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        iter.status().map(|_| result)
+    }
+
     pub fn batch(&self) -> FideBatch<'_> {
         FideBatch {
             db: self,

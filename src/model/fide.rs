@@ -15,7 +15,14 @@ pub struct FidePlayer {
     pub country: String,
     /// "M" or "F"
     pub sex: String,
+    /// GM, IM, FM, CM, NM, etc.
     pub title: String,
+    /// Women's title (WGM, WIM, WFM, WCM)
+    pub w_title: String,
+    /// FIDE Online Arena title
+    pub o_title: String,
+    /// FOA (FIDE Online Arena) title
+    pub foa_title: String,
     /// Year of birth (0 = unknown)
     pub birth_year: u16,
     pub flag: FideFlag,
@@ -46,6 +53,13 @@ impl FidePlayer {
             FideFlag::Inactive => 1,
             FideFlag::Unknown => 2,
         });
+        // v2 fields — appended after flag for backward-compatible reads
+        write_uint(buf, self.w_title.len() as u64);
+        buf.put_slice(self.w_title.as_bytes());
+        write_uint(buf, self.o_title.len() as u64);
+        buf.put_slice(self.o_title.as_bytes());
+        write_uint(buf, self.foa_title.len() as u64);
+        buf.put_slice(self.foa_title.as_bytes());
     }
 
     pub fn read<B: Buf>(buf: &mut B) -> FidePlayer {
@@ -70,12 +84,28 @@ impl FidePlayer {
             _ => FideFlag::Unknown,
         };
 
+        // v2 fields — old records may not have these; default to empty string
+        let (w_title, o_title, foa_title) = if buf.remaining() > 0 {
+            let w_len = read_uint(buf) as usize;
+            let w = read_string(buf, w_len);
+            let o_len = read_uint(buf) as usize;
+            let o = read_string(buf, o_len);
+            let foa_len = read_uint(buf) as usize;
+            let foa = read_string(buf, foa_len);
+            (w, o, foa)
+        } else {
+            (String::new(), String::new(), String::new())
+        };
+
         FidePlayer {
             fide_id,
             name,
             country,
             sex,
             title,
+            w_title,
+            o_title,
+            foa_title,
             birth_year,
             flag,
         }

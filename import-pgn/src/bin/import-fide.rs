@@ -1,8 +1,9 @@
 /// import-fide — Downloads and imports FIDE monthly rating lists.
 ///
-/// Downloads the standard rating list XML from FIDE (which includes standard,
-/// rapid, and blitz ratings), parses it, and posts batches to the explorer's
-/// PUT /import/fide endpoint.
+/// Downloads the complete FIDE player list (players_list_xml.zip / FOA master
+/// list) which contains ALL registered FIDE players, including those with only
+/// rapid/blitz ratings and inactive players. Parses the XML and posts batches
+/// to the explorer's PUT /import/fide endpoint.
 ///
 /// Usage:
 ///   import-fide --endpoint http://localhost:9002 --month 2026-03
@@ -50,6 +51,9 @@ struct PlayerRecord {
     country: String,
     sex: String,
     title: String,
+    w_title: String,
+    o_title: String,
+    foa_title: String,
     birth_year: u16,
     flag: String,
     standard: u16,
@@ -121,6 +125,9 @@ fn parse_xml(xml: &[u8]) -> Vec<PlayerRecord> {
                         "country" => player.country = text.to_owned(),
                         "sex" => player.sex = text.to_owned(),
                         "title" => player.title = text.to_owned(),
+                        "w_title" => player.w_title = text.to_owned(),
+                        "o_title" => player.o_title = text.to_owned(),
+                        "foa_title" => player.foa_title = text.to_owned(),
                         "birthday" => player.birth_year = text.parse().unwrap_or(0),
                         "flag" => {
                             player.flag = if text.eq_ignore_ascii_case("i") {
@@ -196,9 +203,13 @@ fn main() {
         .build()
         .expect("http client");
 
-    // Download the standard rating list (includes all three time controls in
-    // the modern FIDE XML format).
-    let url = "https://ratings.fide.com/download/standard_rating_list_xml.zip";
+    // Download the complete FIDE player list (players_list_xml.zip).
+    // This is the FOA master list and contains ALL registered FIDE players,
+    // including those with only rapid/blitz ratings, inactive players, and
+    // newly registered players who have never played standard-rated games.
+    // The standard_rating_list_xml.zip only contains players who appear on
+    // the standard rating list and would miss a significant portion of players.
+    let url = "https://ratings.fide.com/download/players_list_xml.zip";
     let xml = download_zipped_xml(&client, url);
 
     eprintln!("Parsing XML ({} MB) …", xml.len() / 1_048_576);

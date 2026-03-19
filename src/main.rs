@@ -239,6 +239,9 @@ struct FideXmlRecord {
     country: String,
     sex: String,
     title: String,
+    w_title: String,
+    o_title: String,
+    foa_title: String,
     birth_year: u16,
     flag: String,
     standard: u16,
@@ -273,6 +276,9 @@ fn fide_parse_xml(xml: &[u8]) -> Vec<FideXmlRecord> {
                         country: String::new(),
                         sex: String::new(),
                         title: String::new(),
+                        w_title: String::new(),
+                        o_title: String::new(),
+                        foa_title: String::new(),
                         birth_year: 0,
                         flag: String::new(),
                         standard: 0,
@@ -298,6 +304,9 @@ fn fide_parse_xml(xml: &[u8]) -> Vec<FideXmlRecord> {
                         "country"      => p.country       = text.to_owned(),
                         "sex"          => p.sex           = text.to_owned(),
                         "title"        => p.title         = text.to_owned(),
+                        "w_title"      => p.w_title       = text.to_owned(),
+                        "o_title"      => p.o_title       = text.to_owned(),
+                        "foa_title"    => p.foa_title     = text.to_owned(),
                         "birthday"     => p.birth_year    = text.parse().unwrap_or(0),
                         "flag"         => p.flag = if text.eq_ignore_ascii_case("i") {
                                               "inactive".to_owned()
@@ -358,7 +367,9 @@ async fn fide_refresh(
     }
 }
 
-/// Download + parse + write the current FIDE standard rating list.
+/// Download + parse + write the current FIDE player list.
+/// Uses players_list_xml.zip (the FOA master list) which contains ALL registered
+/// FIDE players, not just those with a standard rating.
 /// Returns the number of players written.
 async fn fide_ratings_import_once(db: Arc<Database>) -> Result<usize, String> {
     use crate::model::{FideFlag, FidePlayer, FideRatingKey, FideRatingSnapshot};
@@ -366,7 +377,7 @@ async fn fide_ratings_import_once(db: Arc<Database>) -> Result<usize, String> {
     use ::time::OffsetDateTime;
 
     const FIDE_URL: &str =
-        "https://ratings.fide.com/download/standard_rating_list_xml.zip";
+        "https://ratings.fide.com/download/players_list_xml.zip";
 
     let client = reqwest::Client::builder()
         .user_agent("caissify-explorer/fide-updater")
@@ -415,6 +426,9 @@ async fn fide_ratings_import_once(db: Arc<Database>) -> Result<usize, String> {
                     country: rec.country.clone(),
                     sex: rec.sex.clone(),
                     title: rec.title.clone(),
+                    w_title: rec.w_title.clone(),
+                    o_title: rec.o_title.clone(),
+                    foa_title: rec.foa_title.clone(),
                     birth_year: rec.birth_year,
                     flag: match rec.flag.as_str() {
                         "inactive" => FideFlag::Inactive,
@@ -1039,8 +1053,45 @@ async fn fide_player(
     State(semaphore): State<&'static Semaphore>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     spawn_blocking(semaphore, move || {
-        match db.fide().get_player(fide_id).expect("get fide player") {
-            Some(player) => Ok(Json(serde_json::to_value(player).expect("serialize fide player"))),
+        let fide_db = db.fide();
+        match fide_db.get_player(fide_id).expect("get fide player") {
+            Some(player) => {
+                let mut json =
+                    serde_json::to_value(&player).expect("serialize fide player");
+                // Attach the latest rating snapshot so callers don't need a
+                // second round-trip to /fide/player/{id}/ratings.
+                if let Some((_month, snap)) = fide_db
+                    .get_latest_rating_snapshot(fide_id)
+                    .expect("get latest fide rating")
+                {
+                    let obj = json.as_object_mut().unwrap();
+                    obj.insert(
+                        "standard".into(),
+                        if snap.standard > 0 {
+                            snap.standard.into()
+                        } else {
+                            serde_json::Value::Null
+                        },
+                    );
+                    obj.insert(
+                        "rapid".into(),
+                        if snap.rapid > 0 {
+                            snap.rapid.into()
+                        } else {
+                            serde_json::Value::Null
+                        },
+                    );
+                    obj.insert(
+                        "blitz".into(),
+                        if snap.blitz > 0 {
+                            snap.blitz.into()
+                        } else {
+                            serde_json::Value::Null
+                        },
+                    );
+                }
+                Ok(Json(json))
+            }
             None => Err(StatusCode::NOT_FOUND),
         }
     })
@@ -1109,6 +1160,12 @@ struct FideImportRecord {
     #[serde(default)]
     title: String,
     #[serde(default)]
+    w_title: String,
+    #[serde(default)]
+    o_title: String,
+    #[serde(default)]
+    foa_title: String,
+    #[serde(default)]
     birth_year: u16,
     /// "active" | "inactive" (anything else → Unknown)
     #[serde(default)]
@@ -1153,6 +1210,9 @@ async fn fide_import(
                 country: rec.country,
                 sex: rec.sex,
                 title: rec.title,
+                w_title: rec.w_title,
+                o_title: rec.o_title,
+                foa_title: rec.foa_title,
                 birth_year: rec.birth_year,
                 flag: match rec.flag.as_str() {
                     "active" => FideFlag::Active,

@@ -623,15 +623,21 @@ pub fn spec() -> Value {
 
                 "FidePlayer": {
                     "type": "object",
-                    "description": "FIDE player profile",
+                    "description": "FIDE player profile. The `standard`, `rapid`, and `blitz` fields are the most recent known ratings, injected from the rating history CF at query time (absent when no snapshot has been imported yet).",
                     "properties": {
                         "fide_id":    { "type": "integer", "example": 1503014 },
                         "name":       { "type": "string",  "example": "Carlsen, Magnus" },
                         "country":    { "type": "string",  "example": "NOR" },
                         "sex":        { "type": "string",  "example": "M" },
-                        "title":      { "type": "string",  "example": "GM" },
+                        "title":      { "type": "string",  "example": "GM",  "description": "Open title (GM, IM, FM, CM, NM)" },
+                        "w_title":    { "type": "string",  "example": "WGM", "description": "Women's title (WGM, WIM, WFM, WCM); empty string when not held" },
+                        "o_title":    { "type": "string",  "example": "",   "description": "FIDE Online Arena title; empty string when not held" },
+                        "foa_title":  { "type": "string",  "example": "",   "description": "FOA title; empty string when not held" },
                         "birth_year": { "type": "integer", "example": 1990 },
-                        "flag":       { "type": "string",  "enum": ["Active", "Inactive", "Unknown"] }
+                        "flag":       { "type": "string",  "enum": ["Active", "Inactive", "Unknown"] },
+                        "standard":   { "type": "integer", "nullable": true, "example": 2833, "description": "Most recent standard rating (absent when no snapshot imported)" },
+                        "rapid":      { "type": "integer", "nullable": true, "example": 2850, "description": "Most recent rapid rating (absent when no snapshot imported)" },
+                        "blitz":      { "type": "integer", "nullable": true, "example": 2886, "description": "Most recent blitz rating (absent when no snapshot imported)" }
                     },
                     "required": ["fide_id", "name", "country", "flag"]
                 },
@@ -662,7 +668,10 @@ pub fn spec() -> Value {
                                     "name":          { "type": "string" },
                                     "country":       { "type": "string" },
                                     "sex":           { "type": "string" },
-                                    "title":         { "type": "string" },
+                                    "title":         { "type": "string", "description": "Open title (GM, IM, FM, CM, NM)" },
+                                    "w_title":       { "type": "string", "description": "Women's title (WGM, WIM, WFM, WCM)" },
+                                    "o_title":       { "type": "string", "description": "FIDE Online Arena title" },
+                                    "foa_title":     { "type": "string", "description": "FOA title" },
                                     "birth_year":    { "type": "integer" },
                                     "flag":          { "type": "string" },
                                     "standard":      { "type": "integer" },
