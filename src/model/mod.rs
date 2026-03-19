@@ -1,4 +1,6 @@
+mod caissify_meta;
 mod date;
+mod fide;
 mod game_id;
 mod history;
 mod key;
@@ -13,7 +15,9 @@ mod uci;
 mod uint;
 mod user;
 
+pub use caissify_meta::{CaissifyByDateKey, CaissifyGameMeta, GameResult};
 pub use date::{InvalidDate, LaxDate, Month, Year};
+pub use fide::{FideFlag, FidePlayer, FideRatingKey, FideRatingSnapshot};
 pub use game_id::{GameId, InvalidGameId};
 pub use history::{History, HistoryBuilder, HistorySegment};
 pub use key::{Key, KeyBuilder, KeyPrefix};

@@ -19,3 +19,5 @@ zstd = "0.13"
 time = "0.3"
 shakmaty = "0.30"
 sha1 = { version = "0.10", features = ["std"] }
+quick-xml = { version = "0.37", features = ["serialize"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }

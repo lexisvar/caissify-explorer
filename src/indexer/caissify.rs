@@ -9,7 +9,10 @@ use shakmaty::{Chess, Color, EnPassantMode, KnownOutcome, Position, uci::UciMove
 use crate::{
     api::Error,
     db::Database,
-    model::{KeyBuilder, LaxDate, MastersEntry, MastersGameWithId},
+    model::{
+        CaissifyByDateKey, CaissifyGameMeta, GameResult, KeyBuilder, LaxDate, MastersEntry,
+        MastersGameWithId,
+    },
     zobrist::StableZobrist128,
 };
 
@@ -73,6 +76,22 @@ impl CaissifyImporter {
 
         let mut batch = caissify_db.batch();
         batch.put_game(body.id, &body.game);
+
+        // Write compact metadata and date index (Phase 0 — foundation CFs).
+        let meta = CaissifyGameMeta {
+            year: u16::from(body.game.date.year()),
+            white_rating: body.game.players.white.rating,
+            black_rating: body.game.players.black.rating,
+            result: GameResult::from_winner(body.game.winner),
+            white_fide_id: 0, // unlinked until Phase 3
+            black_fide_id: 0,
+        };
+        batch.put_game_meta(body.id, &meta);
+        batch.put_by_date(CaissifyByDateKey {
+            year: meta.year,
+            id: body.id,
+        });
+
         for (key, (uci, turn)) in without_loops {
             batch.merge(
                 KeyBuilder::caissify()

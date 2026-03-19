@@ -1,4 +1,33 @@
 services:
+  # ── Development shell ──────────────────────────────────────────────────────
+  # Provides a container with Rust + all native build deps (clang, liburing).
+  # Source is bind-mounted; cargo registry/git/target are persisted in volumes.
+  #
+  # Usage:
+  #   docker compose run --rm dev cargo check
+  #   docker compose run --rm dev cargo build --release
+  #   docker compose run --rm dev cargo test
+  #   docker compose run --rm dev cargo clippy
+  #   docker compose run --rm dev cargo fmt
+  #
+  dev:
+    build:
+      context: .
+      target: builder          # reuse the builder stage — already has rustc + deps
+    image: caissify-explorer-dev:latest
+    profiles: [dev]
+    working_dir: /app
+    volumes:
+      - .:/app                              # live source mount
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - dev-target:/app/target              # persistent build cache
+    environment:
+      JEMALLOC_SYS_WITH_MALLOC_CONF: "abort_conf:true,background_thread:true,metadata_thp:auto,dirty_decay_ms:30000,muzzy_decay_ms:30000"
+      RUST_BACKTRACE: "1"
+    entrypoint: [""]                        # override ENTRYPOINT so we can run arbitrary commands
+    command: ["cargo", "check"]
+
   explorer:
     build: .
     image: caissify-explorer:latest
@@ -50,4 +79,10 @@ volumes:
   explorer-db:
     driver: local
   pgn-data:
+    driver: local
+  cargo-registry:
+    driver: local
+  cargo-git:
+    driver: local
+  dev-target:
     driver: local

@@ -72,6 +72,7 @@ caissify-explorer/
 │   ├── db.rs               # RocksDB wrapper (Database, column families, merge ops)
 │   ├── lila.rs             # Lichess API HTTP client (game streaming, mod blacklist)
 │   ├── metrics.rs          # AtomicU64 metrics in InfluxDB line-protocol format
+│   ├── openapi.rs          # OpenAPI 3.1.0 spec (served at /api-docs/openapi.json)
 │   ├── opening.rs          # Downloads and classifies opening names from TSV files
 │   ├── util.rs             # ByColorDef, sort_by_key_and_truncate, DedupStreamExt
 │   ├── zobrist.rs          # StableZobrist128 — stable Zobrist hashing across versions
@@ -83,7 +84,9 @@ caissify-explorer/
 │   │   └── response.rs     # Response structs (ExplorerResponse, ExplorerMove, etc.)
 │   ├── model/
 │   │   ├── mod.rs          # Re-exports
+│   │   ├── caissify_meta.rs# CaissifyGameMeta (15 bytes), CaissifyByDateKey, GameResult
 │   │   ├── date.rs         # LaxDate, Month (u16 = year*12+month-1), Year
+│   │   ├── fide.rs         # FidePlayer, FideRatingSnapshot, FideRatingKey, FideFlag
 │   │   ├── game_id.rs      # GameId (base-62, 8 chars, stored as 6-byte LE u64)
 │   │   ├── history.rs      # History, HistoryBuilder, HistorySegment
 │   │   ├── key.rs          # KeyBuilder, KeyPrefix (12 bytes), Key (14 bytes)
@@ -105,14 +108,17 @@ caissify-explorer/
 │       ├── player.rs       # PlayerIndexerActor, PlayerIndexerStub
 │       └── player_queue.rs # Queue<T>, Ticket, QueueFull
 ├── import-pgn/
-│   ├── Cargo.toml          # Separate workspace crate for bulk PGN import
+│   ├── Cargo.toml          # Separate workspace crate for bulk PGN/FIDE import
 │   └── src/bin/
 │       ├── import-caissify.rs  # Reads .pgn / .pgn.bz2 / .pgn.zst, POSTs batches to /import/caissify
+│       ├── import-fide.rs      # Downloads FIDE XML zip, parses, POSTs batches to /import/fide
 │       └── import-lichess.rs   # Reads .pgn / .pgn.bz2 / .pgn.zst, POSTs batches to /import/lichess
 ├── benches/                # iai benchmarks
 ├── tests/                  # Integration tests
+├── doc/
+│   └── ROADMAP.md          # Feature roadmap with implementation status
 ├── Dockerfile              # Multi-stage build (builder → debian-slim)
-├── docker-compose.yml      # Single-service compose for local development
+├── docker-compose.yml      # explorer (dev server) + dev (cargo runner) + importer services
 ├── railway.toml            # Railway deployment configuration
 ├── .env                    # Build-time jemalloc tuning (must be sourced before build)
 ├── rustfmt.toml            # Rust formatting settings
@@ -233,7 +239,29 @@ cargo run --release -- --help
 
 Base URL: `http://localhost:9002`
 
-> ⚠️ **Security**: In production, expose only `/masters`, `/lichess`, `/caissify`, and `/player` via your reverse proxy. Lock down all `/import/*`, `/compact`, and `/monitor` endpoints.
+> ⚠️ **Security**: In production, expose only `/masters`, `/lichess`, `/caissify`, `/player`, and `/api-docs` via your reverse proxy. Lock down all `/import/*`, `/compact`, and `/monitor` endpoints.
+
+---
+
+### `GET /api-docs`
+
+Serves an interactive **Scalar API Reference** UI for exploring all endpoints.
+
+```bash
+open http://localhost:9002/api-docs
+```
+
+---
+
+### `GET /api-docs/openapi.json`
+
+Returns the full **OpenAPI 3.1.0** specification as JSON. Generated from `src/openapi.rs` — the spec covers all Explorer, PGN, Import, and Admin endpoints with request/response schemas.
+
+```bash
+curl http://localhost:9002/api-docs/openapi.json
+```
+
+The UI is powered by [Scalar](https://scalar.com/) loaded from CDN (`@scalar/api-reference`).
 
 ---
 
@@ -378,6 +406,108 @@ curl http://localhost:9002/caissify/pgn/AbCd1234
 
 ---
 
+### `GET /caissify/games`
+
+Paginated list of games with compact metadata. Cursor-based pagination via `page_token` (hex-encoded `CaissifyByDateKey`).
+
+**Query Parameters:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `limit` | integer | `50` | Results per page (max 200) |
+| `since` | u16 (year) | `0` | Earliest year (inclusive) |
+| `until` | u16 (year) | `65535` | Latest year (inclusive) |
+| `page_token` | string | — | Cursor from previous response |
+| `reverse` | bool | `true` | Newest first if true |
+| `result` | `"white"` \| `"draw"` \| `"black"` | — | Filter by result |
+| `min_rating` | u16 | — | Min max(white_rating, black_rating) |
+| `max_rating` | u16 | — | Max max(white_rating, black_rating) |
+
+**Response:**
+
+```json
+{
+  "games": [
+    {
+      "id": "AbCd1234",
+      "year": 2024,
+      "white_rating": 2800,
+      "black_rating": 2750,
+      "result": "white",
+      "white_fide_id": 1503014
+    }
+  ],
+  "next_page_token": "0007d00000001234"
+}
+```
+
+Note: `white_fide_id`/`black_fide_id` are omitted when 0 (not yet linked). `next_page_token` is absent on the last page.
+
+---
+
+### `GET /caissify/games/:id`
+
+Returns compact metadata for a single Caissify game (fast point-get on `caissify_game_meta` CF).
+
+```bash
+curl http://localhost:9002/caissify/games/AbCd1234
+```
+
+**Response:** `CaissifyGameMeta` JSON object with `year`, `white_rating`, `black_rating`, `result`, `white_fide_id`, `black_fide_id`.
+
+---
+
+### `GET /fide/player/:fide_id`
+
+Returns FIDE player profile (name, country, title, birth year).
+
+```bash
+curl http://localhost:9002/fide/player/1503014
+```
+
+---
+
+### `GET /fide/player/:fide_id/ratings`
+
+Returns monthly rating history for a FIDE player.
+
+**Query Parameters:**
+
+| Param | Type | Description |
+|---|---|---|
+| `since` | `YYYY-MM` | Start month (inclusive) |
+| `until` | `YYYY-MM` | End month (inclusive) |
+
+```bash
+curl "http://localhost:9002/fide/player/1503014/ratings?since=2020-01"
+```
+
+**Response:** JSON array of `{ month, standard, rapid, blitz }`
+
+---
+
+### `PUT /import/fide`
+
+Import a batch of FIDE player records and rating snapshots.
+
+```bash
+curl -X PUT http://localhost:9002/import/fide \
+  -H "Content-Type: application/json" \
+  -d '{ "month": "2026-03", "players": [{"fide_id": 1503014, ...}] }'
+```
+
+---
+
+### `POST /import/caissify/reindex`
+
+Backfill `caissify_game_meta` and `caissify_game_by_date` for all games imported before Phase 0. Idempotent. Slow on large databases — run during maintenance.
+
+```bash
+curl -X POST http://localhost:9002/import/caissify/reindex
+```
+
+---
+
 ### `PUT /import/caissify`
 
 Import a single game into the Caissify database as PGN (multipart/form-data with field `pgn`).
@@ -447,7 +577,7 @@ curl http://localhost:9002/monitor/cf/lichess/rocksdb.stats
 curl http://localhost:9002/monitor/cf/masters/rocksdb.estimate-live-data-size
 ```
 
-Column families: `masters`, `masters_game`, `lichess`, `lichess_game`, `player`, `player_status`, `caissify`, `caissify_game`
+Column families: `masters`, `masters_game`, `lichess`, `lichess_game`, `player`, `player_status`, `caissify`, `caissify_game`, `caissify_game_meta`, `caissify_game_by_date`, `fide_player`, `fide_rating_history`
 
 ---
 
@@ -557,6 +687,10 @@ curl -X PUT http://localhost:9002/import/caissify \
 | `player_status` | `UserId(bytes)` | `PlayerStatus` | Indexing progress and cooldown per player |
 | `caissify` | `KeyPrefix(12) + Month(2)` | `MastersEntry` (merged) | Per-position Caissify game stats + top games (no rating floor) |
 | `caissify_game` | `GameId(6)` | `MastersGame` | Full game record for PGN generation |
+| `caissify_game_meta` | `GameId(6)` | `CaissifyGameMeta` (15 bytes) | Compact metadata: year, ratings, result, FIDE IDs |
+| `caissify_game_by_date` | `Year(2) + GameId(6)` | `[]` (empty) | Secondary date index for paginated game listing |
+| `fide_player` | `FideId(4)` | `FidePlayer` (variable) | FIDE player profile: name, country, title, birth year |
+| `fide_rating_history` | `FideId(4) + Month(2)` | `FideRatingSnapshot` (9 bytes) | Monthly standard/rapid/blitz rating snapshot per player |
 
 ### Key Encoding
 

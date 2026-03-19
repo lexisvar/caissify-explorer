@@ -1,0 +1,3726 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Chess Games Database API",
+    "description": "Aggregation service for chess games from multiple sources",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "summary": "Health Check",
+        "description": "Comprehensive health check endpoint.\n\nChecks:\n- Database connection and query\n- Redis connection\n- Celery workers status\n- Service statistics",
+        "operationId": "health_check_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/cache/stats": {
+      "get": {
+        "tags": [
+          "Cache"
+        ],
+        "summary": "Get Cache Stats",
+        "description": "Get Redis cache statistics.\n\nReturns:\n    Cache statistics including key counts and memory usage",
+        "operationId": "get_cache_stats_api_v1_cache_stats_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/players/": {
+      "post": {
+        "tags": [
+          "Players"
+        ],
+        "summary": "Create Player",
+        "description": "Create a new player with optional account mappings.\n\nArgs:\n    player_data: Player creation data including optional accounts list\n    service: Player service dependency\n\nReturns:\n    Created player with account mappings",
+        "operationId": "create_player_api_v1_players__post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlayerCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlayerResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/players/{fide_id}": {
+      "get": {
+        "tags": [
+          "Players"
+        ],
+        "summary": "Get Player",
+        "description": "Get player by FIDE ID with smart auto-discovery.\n\n**Smart API Workflow:**\n1. Check database for player\n2. If not found and auto_create=True → Fetch from FIDE website and create\n3. If newly created and auto_sync=True → Automatically sync games from all sources in background\n4. Return player data immediately (games sync in background)\n\n**Example:** You're playing against someone tomorrow. Just call GET /players/4406656\nand the API will:\n- Find them on FIDE\n- Create the player\n- Start syncing all their games from Lichess, Chess.com, Chess-results\n- Return player info immediately\n\nArgs:\n    fide_id: FIDE ID of the player\n    service: Player service dependency\n    auto_create: Whether to auto-create player from FIDE website if not found\n    auto_sync: Whether to automatically sync games when player is created\n    \nReturns:\n    Player data (games sync in background if newly created)\n    \nRaises:\n    HTTPException: If player not found and auto_create=False or FIDE lookup fails",
+        "operationId": "get_player_api_v1_players__fide_id__get",
+        "parameters": [
+          {
+            "name": "fide_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Fide Id"
+            }
+          },
+          {
+            "name": "auto_create",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Auto-create player from FIDE if not found",
+              "default": true,
+              "title": "Auto Create"
+            },
+            "description": "Auto-create player from FIDE if not found"
+          },
+          {
+            "name": "auto_sync",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Auto-sync games from all sources when player is created",
+              "default": true,
+              "title": "Auto Sync"
+            },
+            "description": "Auto-sync games from all sources when player is created"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlayerResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/players/lookup/lichess/{username}": {
+      "get": {
+        "tags": [
+          "Players"
+        ],
+        "summary": "Get Player By Lichess",
+        "description": "Find player by Lichess username.\n\nArgs:\n    username: Lichess username\n    service: Player service dependency\n    \nReturns:\n    Player data\n    \nRaises:\n    HTTPException: If player not found",
+        "operationId": "get_player_by_lichess_api_v1_players_lookup_lichess__username__get",
+        "parameters": [
+          {
+            "name": "username",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Username"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlayerResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/players/lookup/chesscom/{username}": {
+      "get": {
+        "tags": [
+          "Players"
+        ],
+        "summary": "Get Player By Chesscom",
+        "description": "Find player by Chess.com username.\n\nArgs:\n    username: Chess.com username\n    service: Player service dependency\n    \nReturns:\n    Player data\n    \nRaises:\n    HTTPException: If player not found",
+        "operationId": "get_player_by_chesscom_api_v1_players_lookup_chesscom__username__get",
+        "parameters": [
+          {
+            "name": "username",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Username"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlayerResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/players/search/": {
+      "get": {
+        "tags": [
+          "Players"
+        ],
+        "summary": "Search Players",
+        "description": "Search players by name (case-insensitive partial match).\n\nArgs:\n    name: Name to search for (minimum 2 characters)\n    limit: Maximum number of results (1-50)\n    service: Player service dependency\n    \nReturns:\n    List of matching players",
+        "operationId": "search_players_api_v1_players_search__get",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 2,
+              "description": "Player name to search for",
+              "title": "Name"
+            },
+            "description": "Player name to search for"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 50,
+              "minimum": 1,
+              "description": "Maximum number of results",
+              "default": 10,
+              "title": "Limit"
+            },
+            "description": "Maximum number of results"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PlayerResponse"
+                  },
+                  "title": "Response Search Players Api V1 Players Search  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/players/{fide_id}/sync": {
+      "post": {
+        "tags": [
+          "Players"
+        ],
+        "summary": "Sync Player Games",
+        "description": "Sync player games from a data source.\n    \n    This endpoint initiates a sync job that fetches games from the specified\n```\n    source (lichess, chesscom, or chess-results) and stores them in the database.\n    \n    Args:\n        fide_id: FIDE ID of the player\n        sync_request: Sync request data\n        service: Player service dependency\n        \n    Returns:\n        Sync job information\n        \n    Raises:\n        HTTPException: If player not found or invalid source",
+        "operationId": "sync_player_games_api_v1_players__fide_id__sync_post",
+        "parameters": [
+          {
+            "name": "fide_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Fide Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SyncRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SyncResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/players/{fide_id}/games": {
+      "get": {
+        "tags": [
+          "Games"
+        ],
+        "summary": "List Player Games",
+        "description": "Get paginated list of games for a player with optional filters.\n\nArgs:\n    fide_id: Player's FIDE ID\n    page: Page number (starting from 1)\n    page_size: Number of games per page (max 200)\n    source: Filter by source (lichess, chesscom, chess-results)\n    result: Filter by result\n    date_from: Filter games from this date\n    date_to: Filter games up to this date\n    color: Filter by player color\n    time_control: Filter by time control\n    event: Filter by event name (partial match)\n    service: Game service dependency\n    \nReturns:\n    Paginated list of games",
+        "operationId": "list_player_games_api_v1_players__fide_id__games_get",
+        "parameters": [
+          {
+            "name": "fide_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Fide Id"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Page number",
+              "default": 1,
+              "title": "Page"
+            },
+            "description": "Page number"
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "description": "Games per page",
+              "default": 50,
+              "title": "Page Size"
+            },
+            "description": "Games per page"
+          },
+          {
+            "name": "source",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by source",
+              "title": "Source"
+            },
+            "description": "Filter by source"
+          },
+          {
+            "name": "result",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by result (1-0, 0-1, 1/2-1/2)",
+              "title": "Result"
+            },
+            "description": "Filter by result (1-0, 0-1, 1/2-1/2)"
+          },
+          {
+            "name": "date_from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter from date (YYYY-MM-DD)",
+              "title": "Date From"
+            },
+            "description": "Filter from date (YYYY-MM-DD)"
+          },
+          {
+            "name": "date_to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter to date (YYYY-MM-DD)",
+              "title": "Date To"
+            },
+            "description": "Filter to date (YYYY-MM-DD)"
+          },
+          {
+            "name": "color",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by color (white/black)",
+              "title": "Color"
+            },
+            "description": "Filter by color (white/black)"
+          },
+          {
+            "name": "time_control",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by time control",
+              "title": "Time Control"
+            },
+            "description": "Filter by time control"
+          },
+          {
+            "name": "event",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by event name",
+              "title": "Event"
+            },
+            "description": "Filter by event name"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GameListResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/games/{game_id}": {
+      "get": {
+        "tags": [
+          "Games"
+        ],
+        "summary": "Get Game",
+        "description": "Get a single game by ID including PGN.\n\nArgs:\n    game_id: Game ID\n    service: Game service dependency\n    \nReturns:\n    Game data with PGN\n    \nRaises:\n    HTTPException: If game not found",
+        "operationId": "get_game_api_v1_games__game_id__get",
+        "parameters": [
+          {
+            "name": "game_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Game Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GameWithPGN"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/games/{game_id}/pgn": {
+      "get": {
+        "tags": [
+          "Games"
+        ],
+        "summary": "Get Game Pgn",
+        "description": "Get PGN for a specific game as plain text.\n\nArgs:\n    game_id: Game ID\n    service: Game service dependency\n    \nReturns:\n    PGN as plain text\n    \nRaises:\n    HTTPException: If game not found",
+        "operationId": "get_game_pgn_api_v1_games__game_id__pgn_get",
+        "parameters": [
+          {
+            "name": "game_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Game Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/players/{fide_id}/games/download": {
+      "get": {
+        "tags": [
+          "Games"
+        ],
+        "summary": "Download Player Games",
+        "description": "Download all games for a player as a single PGN file with streaming.\n\n**Performance Features:**\n- Streams games incrementally (starts sending data immediately)\n- Constant memory usage regardless of game count\n- Optional caching for repeated downloads (15min TTL)\n- Optimized for 1000s of games per player\n\nArgs:\n    fide_id: Player's FIDE ID\n    source: Filter by source\n    date_from: Filter games from this date\n    date_to: Filter games up to this date\n    use_cache: Use Redis cache if available (default: True)\n    service: Game service dependency\n    \nReturns:\n    Streaming PGN file with all games (one PGN per game, separated by blank lines)",
+        "operationId": "download_player_games_api_v1_players__fide_id__games_download_get",
+        "parameters": [
+          {
+            "name": "fide_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Fide Id"
+            }
+          },
+          {
+            "name": "source",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by source",
+              "title": "Source"
+            },
+            "description": "Filter by source"
+          },
+          {
+            "name": "date_from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter from date (YYYY-MM-DD)",
+              "title": "Date From"
+            },
+            "description": "Filter from date (YYYY-MM-DD)"
+          },
+          {
+            "name": "date_to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter to date (YYYY-MM-DD)",
+              "title": "Date To"
+            },
+            "description": "Filter to date (YYYY-MM-DD)"
+          },
+          {
+            "name": "use_cache",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Use cached result if available",
+              "default": true,
+              "title": "Use Cache"
+            },
+            "description": "Use cached result if available"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{job_id}": {
+      "get": {
+        "tags": [
+          "Jobs"
+        ],
+        "summary": "Get Job Status",
+        "description": "Get sync job status and statistics.\n\nArgs:\n    job_id: Job UUID\n    service: Player service dependency\n    \nReturns:\n    Sync job data\n    \nRaises:\n    HTTPException: If job not found",
+        "operationId": "get_job_status_api_v1_jobs__job_id__get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SyncJobResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/import-pgn": {
+      "post": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Import Pgn From Url",
+        "description": "Import PGN file from URL (S3, R2, HTTP, sync.com).\n\n**Supported Downloads:**\n- Direct URLs: S3, R2, HTTP/HTTPS\n- Sync.com: Provide full URL + cookies parameter\n\n**Sync.com Example:**\n```python\n{\n    \"url\": \"https://m224.sync.com/u/FILE.pgn?cachekey=...&datakey=...\",\n    \"source\": \"omotb\",\n    \"cookies\": \"sync_auth=...; signature=...\"\n}\n```\n\nUse `scripts/test_har_parser.py` to extract URL and cookies from HAR file.\n\nDownloads file in chunks to Railway temp storage,\nthen processes with existing PGN import service.\nRuns as background Celery task to survive disconnections.\n\nArgs:\n    request: PGN import request with URL and source\n\nReturns:\n    Job ID for tracking progress",
+        "operationId": "import_pgn_from_url_api_v1_admin_import_pgn_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PGNImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PGNImportResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/import-status/{job_id}": {
+      "get": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Get Import Status",
+        "description": "Get status of PGN import job.\n\nArgs:\n    job_id: Celery task ID\n\nReturns:\n    Job status, progress, and results",
+        "operationId": "get_import_status_api_v1_admin_import_status__job_id__get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/cancel-import/{job_id}": {
+      "post": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Cancel Import",
+        "description": "Cancel running PGN import job.\n\nArgs:\n    job_id: Celery task ID\n\nReturns:\n    Cancellation confirmation",
+        "operationId": "cancel_import_api_v1_admin_cancel_import__job_id__post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/link-players": {
+      "post": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Link Players To Games",
+        "description": "Link games to FIDE players using bulk SQL operations.\n\nThis endpoint triggers a Celery task that processes games in batches\nand matches them to FIDE player records based on player names.\n\nArgs:\n    request: Player linking request with source and batch size\n\nReturns:\n    Job ID for tracking progress\n\nExample:\n    ```\n    POST /api/v1/admin/link-players\n    {\n        \"source\": \"omotb\",\n        \"batch_size\": 100000\n    }\n    ```",
+        "operationId": "link_players_to_games_api_v1_admin_link_players_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlayerLinkingRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlayerLinkingResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/import-lichess-broadcast": {
+      "post": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Import Lichess Broadcast",
+        "description": "Import Lichess broadcast archive for a specific month.\n\nThis endpoint downloads and imports official Lichess broadcast games\n(tournaments, championships, etc.) for the specified year/month.\n\nFeatures:\n- Uses persistent volume (/app/data) - won't re-download on restart\n- Extracts FIDE IDs from PGN headers for automatic player linking\n- Deduplicates games automatically\n- Runs as background Celery task\n\nArgs:\n    request: Import request with year, month, and batch size\n\nReturns:\n    Job ID for tracking progress\n\nExample:\n    ```\n    POST /api/v1/admin/import-lichess-broadcast\n    {\n        \"year\": 2025,\n        \"month\": 1,\n        \"batch_size\": 1000\n    }\n    ```",
+        "operationId": "import_lichess_broadcast_api_v1_admin_import_lichess_broadcast_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LichessBroadcastImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LichessBroadcastImportResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/import-lichess-broadcast-all": {
+      "post": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Import Lichess Broadcast All",
+        "description": "Trigger an import that downloads and imports all Lichess broadcast archives\nin the given year range in a single consolidated task.",
+        "operationId": "import_lichess_broadcast_all_api_v1_admin_import_lichess_broadcast_all_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LichessBroadcastAllImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LichessBroadcastAllImportResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/import-fide-players": {
+      "post": {
+        "tags": [
+          "Admin"
+        ],
+        "summary": "Import Fide Players",
+        "description": "Import or update FIDE players database.\n\nThis endpoint downloads the latest FIDE players list (XML format)\nand imports/updates all player records in the database.\n\nFeatures:\n- Downloads latest FIDE data (~1 million players)\n- Uses PostgreSQL UPSERT for efficient updates\n- Processes in batches to avoid memory issues\n- Runs as background Celery task\n\nArgs:\n    request: Import request with skip_download option\n    \nReturns:\n    Job ID for tracking progress\n    \nExample:\n    ```\n    POST /api/v1/admin/import-fide-players\n    {\n        \"skip_download\": false\n    }\n    ```",
+        "operationId": "import_fide_players_api_v1_admin_import_fide_players_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FideImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FideImportResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/explorer/": {
+      "get": {
+        "tags": [
+          "Opening Explorer",
+          "Opening Explorer"
+        ],
+        "summary": "Position statistics",
+        "description": "Given a FEN position, return move statistics from the master games database (games with both players ≥ 2300 Elo, year ≥ 2000). Uses pre-aggregated data — sub-millisecond DB query.",
+        "operationId": "explore_position_api_v1_explorer__get",
+        "parameters": [
+          {
+            "name": "fen",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "FEN string of the position to query",
+              "examples": {
+                "starting": {
+                  "summary": "Starting position",
+                  "value": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+                },
+                "after_e4": {
+                  "summary": "After 1.e4",
+                  "value": "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1"
+                }
+              },
+              "title": "Fen"
+            },
+            "description": "FEN string of the position to query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExplorerPositionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/explorer/games": {
+      "get": {
+        "tags": [
+          "Opening Explorer",
+          "Opening Explorer"
+        ],
+        "summary": "Games reaching a position",
+        "description": "Return a paginated list of actual games that reached the given FEN position. Requires the explorer backfill to have been run first (populates game_position_index). Supports sorting by date, average rating, or random order.",
+        "operationId": "position_games_api_v1_explorer_games_get",
+        "parameters": [
+          {
+            "name": "fen",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "FEN string of the position to query",
+              "title": "Fen"
+            },
+            "description": "FEN string of the position to query"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "description": "Games per page (max 100)",
+              "default": 20,
+              "title": "Limit"
+            },
+            "description": "Games per page (max 100)"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Pagination offset",
+              "default": 0,
+              "title": "Offset"
+            },
+            "description": "Pagination offset"
+          },
+          {
+            "name": "min_rating",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 3500,
+              "minimum": 0,
+              "description": "Minimum Elo for both players (0 = no filter)",
+              "default": 2300,
+              "title": "Min Rating"
+            },
+            "description": "Minimum Elo for both players (0 = no filter)"
+          },
+          {
+            "name": "sort_by",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(date|rating|random)$",
+              "description": "Sort order: date (newest first), rating (highest first), random",
+              "default": "date",
+              "title": "Sort By"
+            },
+            "description": "Sort order: date (newest first), rating (highest first), random"
+          },
+          {
+            "name": "since_year",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 2030,
+              "minimum": 1900,
+              "description": "Only include games from this year onwards (0 = no filter)",
+              "default": 2000,
+              "title": "Since Year"
+            },
+            "description": "Only include games from this year onwards (0 = no filter)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PositionGamesResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/explorer/opening/": {
+      "get": {
+        "tags": [
+          "Opening Explorer",
+          "Opening Explorer"
+        ],
+        "summary": "Opening statistics by ECO code",
+        "description": "Return aggregate win/draw/loss statistics for a specific opening. Filter by ECO code (e.g. 'B90' for Sicilian Najdorf, 'E' for all King's Indian / Nimzo / English variations).",
+        "operationId": "opening_stats_api_v1_explorer_opening__get",
+        "parameters": [
+          {
+            "name": "eco",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "ECO code prefix (e.g. 'B90', 'E60', 'D'). Prefix match supported.",
+              "title": "Eco"
+            },
+            "description": "ECO code prefix (e.g. 'B90', 'E60', 'D'). Prefix match supported."
+          },
+          {
+            "name": "opening_name",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Treated as ECO prefix when eco is not provided.",
+              "title": "Opening Name"
+            },
+            "description": "Treated as ECO prefix when eco is not provided."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpeningStatsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/explorer/top-players/": {
+      "get": {
+        "tags": [
+          "Opening Explorer",
+          "Opening Explorer"
+        ],
+        "summary": "Top players in an opening",
+        "description": "Return the best-performing players in a given opening, ranked by score percentage. Filter by minimum games played.",
+        "operationId": "top_players_api_v1_explorer_top_players__get",
+        "parameters": [
+          {
+            "name": "eco",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "ECO code prefix",
+              "title": "Eco"
+            },
+            "description": "ECO code prefix"
+          },
+          {
+            "name": "opening_name",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Treated as ECO prefix when eco is absent",
+              "title": "Opening Name"
+            },
+            "description": "Treated as ECO prefix when eco is absent"
+          },
+          {
+            "name": "min_games",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Minimum games played in this opening",
+              "default": 10,
+              "title": "Min Games"
+            },
+            "description": "Minimum games played in this opening"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "description": "Number of players to return",
+              "default": 20,
+              "title": "Limit"
+            },
+            "description": "Number of players to return"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TopPlayersResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/explorer/backfill": {
+      "post": {
+        "tags": [
+          "Opening Explorer",
+          "Opening Explorer"
+        ],
+        "summary": "Trigger historical backfill",
+        "description": "Start a background Celery task that retroactively indexes all qualifying historical games (both players ≥ min_rating, year ≥ since_year) into the explorer_positions table. Safe to call multiple times — already-indexed games are skipped.",
+        "operationId": "trigger_backfill_api_v1_explorer_backfill_post",
+        "parameters": [
+          {
+            "name": "min_rating",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 3000,
+              "minimum": 1600,
+              "description": "Minimum rating for both players",
+              "default": 2300,
+              "title": "Min Rating"
+            },
+            "description": "Minimum rating for both players"
+          },
+          {
+            "name": "since_year",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 2030,
+              "minimum": 1900,
+              "description": "Index games from this year onwards",
+              "default": 2000,
+              "title": "Since Year"
+            },
+            "description": "Index games from this year onwards"
+          },
+          {
+            "name": "batch_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 5000,
+              "minimum": 50,
+              "description": "Games per processing batch",
+              "default": 2000,
+              "title": "Batch Size"
+            },
+            "description": "Games per processing batch"
+          },
+          {
+            "name": "start_after_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Resume from this game ID (0 = start from beginning)",
+              "default": 0,
+              "title": "Start After Id"
+            },
+            "description": "Resume from this game ID (0 = start from beginning)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackfillStatusResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/explorer/build-position-index": {
+      "post": {
+        "tags": [
+          "Opening Explorer",
+          "Opening Explorer"
+        ],
+        "summary": "Build game_position_index (one-time)",
+        "description": "Back-fill the game_position_index table for games that were already indexed into explorer_positions before this table existed. The regular backfill skips already-indexed games, so this separate task is needed for existing installations. Safe to run multiple times — already-processed games are skipped via ON CONFLICT DO NOTHING. Poll progress via GET /api/v1/explorer/backfill/status/{task_id}.",
+        "operationId": "trigger_build_position_index_api_v1_explorer_build_position_index_post",
+        "parameters": [
+          {
+            "name": "min_rating",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 3000,
+              "minimum": 0,
+              "description": "Minimum rating for both players (0 = no filter)",
+              "default": 2300,
+              "title": "Min Rating"
+            },
+            "description": "Minimum rating for both players (0 = no filter)"
+          },
+          {
+            "name": "since_year",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 2030,
+              "minimum": 1900,
+              "description": "Process games from this year onwards",
+              "default": 2000,
+              "title": "Since Year"
+            },
+            "description": "Process games from this year onwards"
+          },
+          {
+            "name": "batch_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 5000,
+              "minimum": 50,
+              "description": "Games per processing batch",
+              "default": 2000,
+              "title": "Batch Size"
+            },
+            "description": "Games per processing batch"
+          },
+          {
+            "name": "start_after_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Resume from this game ID (0 = start from beginning)",
+              "default": 0,
+              "title": "Start After Id"
+            },
+            "description": "Resume from this game ID (0 = start from beginning)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackfillStatusResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/explorer/backfill/status/{task_id}": {
+      "get": {
+        "tags": [
+          "Opening Explorer",
+          "Opening Explorer"
+        ],
+        "summary": "Poll backfill task progress",
+        "description": "Poll a running or completed backfill task by its Celery task ID. Returns completion percentage, throughput, and ETA while the task is running.",
+        "operationId": "get_backfill_status_api_v1_explorer_backfill_status__task_id__get",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackfillProgressResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/": {
+      "get": {
+        "summary": "Root",
+        "description": "Root endpoint.",
+        "operationId": "root__get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AccountMappingResponse": {
+        "properties": {
+          "platform": {
+            "type": "string",
+            "title": "Platform",
+            "description": "Platform: lichess or chesscom"
+          },
+          "username": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Username"
+          },
+          "confidence": {
+            "type": "string",
+            "title": "Confidence",
+            "description": "Confidence level: high, medium, or low",
+            "default": "medium"
+          },
+          "discovery_method": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Discovery Method",
+            "description": "How account was discovered"
+          },
+          "verified": {
+            "type": "boolean",
+            "title": "Verified",
+            "description": "Whether account is verified",
+            "default": false
+          },
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "fide_id": {
+            "type": "integer",
+            "title": "Fide Id"
+          },
+          "discovered_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Discovered At"
+          },
+          "last_verified": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Verified"
+          }
+        },
+        "type": "object",
+        "required": [
+          "platform",
+          "username",
+          "id",
+          "fide_id",
+          "discovered_at"
+        ],
+        "title": "AccountMappingResponse",
+        "description": "Schema for account mapping response."
+      },
+      "BackfillProgressResponse": {
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "title": "Task Id"
+          },
+          "state": {
+            "type": "string",
+            "title": "State",
+            "description": "Celery task state: PENDING, PROGRESS, SUCCESS, FAILURE"
+          },
+          "total_processed": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Processed",
+            "description": "Games processed so far"
+          },
+          "total_indexed": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Indexed",
+            "description": "Games that met criteria and were indexed"
+          },
+          "total_skipped": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Skipped",
+            "description": "Games skipped (already indexed)"
+          },
+          "total_games": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Games",
+            "description": "Total qualifying games (denominator for %)"
+          },
+          "current_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Id",
+            "description": "Last game ID processed (resume cursor)"
+          },
+          "percentage": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Percentage",
+            "description": "Completion percentage (0-100)"
+          },
+          "games_per_sec": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Games Per Sec",
+            "description": "Current indexing throughput"
+          },
+          "eta_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eta Seconds",
+            "description": "Estimated seconds until completion"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error",
+            "description": "Error message if state is FAILURE"
+          }
+        },
+        "type": "object",
+        "required": [
+          "task_id",
+          "state"
+        ],
+        "title": "BackfillProgressResponse",
+        "description": "Response for GET /explorer/backfill/status/{task_id} — live progress poll."
+      },
+      "BackfillStatusResponse": {
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "title": "Task Id"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "min_rating": {
+            "type": "integer",
+            "title": "Min Rating"
+          },
+          "since_year": {
+            "type": "integer",
+            "title": "Since Year"
+          }
+        },
+        "type": "object",
+        "required": [
+          "task_id",
+          "message",
+          "min_rating",
+          "since_year"
+        ],
+        "title": "BackfillStatusResponse",
+        "description": "Response for POST /explorer/backfill — backfill task trigger."
+      },
+      "ExplorerMove": {
+        "properties": {
+          "uci": {
+            "type": "string",
+            "title": "Uci",
+            "description": "Move in UCI format, e.g. 'e2e4'"
+          },
+          "san": {
+            "type": "string",
+            "title": "San",
+            "description": "Move in SAN format, e.g. 'e4'"
+          },
+          "game_count": {
+            "type": "integer",
+            "title": "Game Count",
+            "description": "Total games where this move was played"
+          },
+          "white_wins": {
+            "type": "integer",
+            "title": "White Wins"
+          },
+          "draws": {
+            "type": "integer",
+            "title": "Draws"
+          },
+          "black_wins": {
+            "type": "integer",
+            "title": "Black Wins"
+          },
+          "white_win_pct": {
+            "type": "number",
+            "title": "White Win Pct",
+            "description": "White win percentage (0-100)"
+          },
+          "draw_pct": {
+            "type": "number",
+            "title": "Draw Pct",
+            "description": "Draw percentage (0-100)"
+          },
+          "black_win_pct": {
+            "type": "number",
+            "title": "Black Win Pct",
+            "description": "Black win percentage (0-100)"
+          },
+          "avg_rating": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avg Rating",
+            "description": "Average player rating in these games"
+          }
+        },
+        "type": "object",
+        "required": [
+          "uci",
+          "san",
+          "game_count",
+          "white_wins",
+          "draws",
+          "black_wins",
+          "white_win_pct",
+          "draw_pct",
+          "black_win_pct",
+          "avg_rating"
+        ],
+        "title": "ExplorerMove",
+        "description": "Statistics for a single move from a position."
+      },
+      "ExplorerPositionResponse": {
+        "properties": {
+          "fen": {
+            "type": "string",
+            "title": "Fen",
+            "description": "The queried FEN position"
+          },
+          "total_games": {
+            "type": "integer",
+            "title": "Total Games",
+            "description": "Total games reaching this position"
+          },
+          "white_wins": {
+            "type": "integer",
+            "title": "White Wins"
+          },
+          "draws": {
+            "type": "integer",
+            "title": "Draws"
+          },
+          "black_wins": {
+            "type": "integer",
+            "title": "Black Wins"
+          },
+          "white_win_pct": {
+            "type": "number",
+            "title": "White Win Pct"
+          },
+          "draw_pct": {
+            "type": "number",
+            "title": "Draw Pct"
+          },
+          "black_win_pct": {
+            "type": "number",
+            "title": "Black Win Pct"
+          },
+          "avg_rating": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avg Rating"
+          },
+          "moves": {
+            "items": {
+              "$ref": "#/components/schemas/ExplorerMove"
+            },
+            "type": "array",
+            "title": "Moves",
+            "description": "Statistics per move, sorted by popularity"
+          }
+        },
+        "type": "object",
+        "required": [
+          "fen",
+          "total_games",
+          "white_wins",
+          "draws",
+          "black_wins",
+          "white_win_pct",
+          "draw_pct",
+          "black_win_pct",
+          "avg_rating",
+          "moves"
+        ],
+        "title": "ExplorerPositionResponse",
+        "description": "Response for GET /explorer/ — position statistics."
+      },
+      "FideImportRequest": {
+        "properties": {
+          "skip_download": {
+            "type": "boolean",
+            "title": "Skip Download",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "FideImportRequest",
+        "description": "Request to import/update FIDE players database."
+      },
+      "FideImportResponse": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "estimated_duration": {
+            "type": "string",
+            "title": "Estimated Duration"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "message",
+          "estimated_duration"
+        ],
+        "title": "FideImportResponse",
+        "description": "Response with job ID for FIDE import."
+      },
+      "GameListResponse": {
+        "properties": {
+          "games": {
+            "items": {
+              "$ref": "#/components/schemas/GameResponse"
+            },
+            "type": "array",
+            "title": "Games"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "page": {
+            "type": "integer",
+            "title": "Page"
+          },
+          "page_size": {
+            "type": "integer",
+            "title": "Page Size"
+          },
+          "total_pages": {
+            "type": "integer",
+            "title": "Total Pages"
+          }
+        },
+        "type": "object",
+        "required": [
+          "games",
+          "total",
+          "page",
+          "page_size",
+          "total_pages"
+        ],
+        "title": "GameListResponse",
+        "description": "Schema for paginated game list response."
+      },
+      "GameResponse": {
+        "properties": {
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "source_game_id": {
+            "type": "string",
+            "title": "Source Game Id"
+          },
+          "source_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Url"
+          },
+          "white_name": {
+            "type": "string",
+            "title": "White Name"
+          },
+          "black_name": {
+            "type": "string",
+            "title": "Black Name"
+          },
+          "white_rating": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "White Rating"
+          },
+          "black_rating": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Black Rating"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result"
+          },
+          "date": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date"
+          },
+          "event": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Event"
+          },
+          "site": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Site"
+          },
+          "round": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Round"
+          },
+          "eco": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eco"
+          },
+          "time_control": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Time Control"
+          },
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "white_fide_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "White Fide Id"
+          },
+          "black_fide_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Black Fide Id"
+          },
+          "indexed_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Indexed At"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source",
+          "source_game_id",
+          "source_url",
+          "white_name",
+          "black_name",
+          "id",
+          "white_fide_id",
+          "black_fide_id",
+          "indexed_at",
+          "created_at"
+        ],
+        "title": "GameResponse",
+        "description": "Game response model with database fields."
+      },
+      "GameWithPGN": {
+        "properties": {
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "source_game_id": {
+            "type": "string",
+            "title": "Source Game Id"
+          },
+          "source_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Url"
+          },
+          "white_name": {
+            "type": "string",
+            "title": "White Name"
+          },
+          "black_name": {
+            "type": "string",
+            "title": "Black Name"
+          },
+          "white_rating": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "White Rating"
+          },
+          "black_rating": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Black Rating"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result"
+          },
+          "date": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date"
+          },
+          "event": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Event"
+          },
+          "site": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Site"
+          },
+          "round": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Round"
+          },
+          "eco": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eco"
+          },
+          "time_control": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Time Control"
+          },
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "white_fide_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "White Fide Id"
+          },
+          "black_fide_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Black Fide Id"
+          },
+          "indexed_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Indexed At"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "pgn": {
+            "type": "string",
+            "title": "Pgn"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source",
+          "source_game_id",
+          "source_url",
+          "white_name",
+          "black_name",
+          "id",
+          "white_fide_id",
+          "black_fide_id",
+          "indexed_at",
+          "created_at",
+          "pgn"
+        ],
+        "title": "GameWithPGN",
+        "description": "Schema for game response with PGN."
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "LichessBroadcastAllImportRequest": {
+        "properties": {
+          "start_year": {
+            "type": "integer",
+            "title": "Start Year",
+            "default": 2019
+          },
+          "end_year": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End Year"
+          },
+          "chunk_size": {
+            "type": "integer",
+            "title": "Chunk Size",
+            "default": 10000
+          }
+        },
+        "type": "object",
+        "title": "LichessBroadcastAllImportRequest"
+      },
+      "LichessBroadcastAllImportResponse": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "started": {
+            "type": "string",
+            "title": "Started"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "message",
+          "started"
+        ],
+        "title": "LichessBroadcastAllImportResponse"
+      },
+      "LichessBroadcastImportRequest": {
+        "properties": {
+          "year": {
+            "type": "integer",
+            "title": "Year"
+          },
+          "month": {
+            "type": "integer",
+            "title": "Month"
+          },
+          "batch_size": {
+            "type": "integer",
+            "title": "Batch Size",
+            "default": 1000
+          }
+        },
+        "type": "object",
+        "required": [
+          "year",
+          "month"
+        ],
+        "title": "LichessBroadcastImportRequest",
+        "description": "Request to import Lichess broadcast archive."
+      },
+      "LichessBroadcastImportResponse": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "archive": {
+            "type": "string",
+            "title": "Archive"
+          },
+          "estimated_games": {
+            "type": "integer",
+            "title": "Estimated Games"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "message",
+          "archive",
+          "estimated_games"
+        ],
+        "title": "LichessBroadcastImportResponse",
+        "description": "Response with job ID for Lichess broadcast import."
+      },
+      "OpeningStatsResponse": {
+        "properties": {
+          "eco": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eco"
+          },
+          "opening_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Opening Name"
+          },
+          "total_games": {
+            "type": "integer",
+            "title": "Total Games"
+          },
+          "white_wins": {
+            "type": "integer",
+            "title": "White Wins"
+          },
+          "draws": {
+            "type": "integer",
+            "title": "Draws"
+          },
+          "black_wins": {
+            "type": "integer",
+            "title": "Black Wins"
+          },
+          "white_win_pct": {
+            "type": "number",
+            "title": "White Win Pct"
+          },
+          "draw_pct": {
+            "type": "number",
+            "title": "Draw Pct"
+          },
+          "black_win_pct": {
+            "type": "number",
+            "title": "Black Win Pct"
+          },
+          "avg_rating": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avg Rating"
+          }
+        },
+        "type": "object",
+        "required": [
+          "eco",
+          "opening_name",
+          "total_games",
+          "white_wins",
+          "draws",
+          "black_wins",
+          "white_win_pct",
+          "draw_pct",
+          "black_win_pct",
+          "avg_rating"
+        ],
+        "title": "OpeningStatsResponse",
+        "description": "Response for GET /explorer/opening/ — opening statistics by ECO or name."
+      },
+      "PGNImportRequest": {
+        "properties": {
+          "url": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2083,
+                "minLength": 1,
+                "format": "uri"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "title": "Url"
+          },
+          "source": {
+            "type": "string",
+            "title": "Source",
+            "default": "openingmaster"
+          },
+          "chunk_download": {
+            "type": "boolean",
+            "title": "Chunk Download",
+            "default": true
+          },
+          "force_reimport": {
+            "type": "boolean",
+            "title": "Force Reimport",
+            "default": false
+          },
+          "cookies": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cookies"
+          }
+        },
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "title": "PGNImportRequest",
+        "description": "Request to import PGN from URL."
+      },
+      "PGNImportResponse": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "estimated_duration": {
+            "type": "string",
+            "title": "Estimated Duration"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "message",
+          "estimated_duration"
+        ],
+        "title": "PGNImportResponse",
+        "description": "Response with job ID for tracking."
+      },
+      "PlayerCreate": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "country": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Country"
+          },
+          "sex": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sex"
+          },
+          "birthday": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Birthday"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "w_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "W Title"
+          },
+          "o_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "O Title"
+          },
+          "foa_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Foa Title"
+          },
+          "fide_id": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "title": "Fide Id",
+            "description": "FIDE ID must be positive"
+          },
+          "accounts": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accounts",
+            "description": "List of account mappings: [{'platform': 'lichess', 'username': 'user1'}, ...]"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "fide_id"
+        ],
+        "title": "PlayerCreate",
+        "description": "Schema for creating a player."
+      },
+      "PlayerLinkingRequest": {
+        "properties": {
+          "source": {
+            "type": "string",
+            "title": "Source",
+            "default": "omotb"
+          },
+          "batch_size": {
+            "type": "integer",
+            "title": "Batch Size",
+            "default": 10000
+          },
+          "from_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "From Date"
+          }
+        },
+        "type": "object",
+        "title": "PlayerLinkingRequest",
+        "description": "Request to link players to games."
+      },
+      "PlayerLinkingResponse": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "estimated_duration": {
+            "type": "string",
+            "title": "Estimated Duration"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "message",
+          "estimated_duration"
+        ],
+        "title": "PlayerLinkingResponse",
+        "description": "Response with job ID for tracking."
+      },
+      "PlayerResponse": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "country": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Country"
+          },
+          "sex": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sex"
+          },
+          "birthday": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Birthday"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "w_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "W Title"
+          },
+          "o_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "O Title"
+          },
+          "foa_title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Foa Title"
+          },
+          "fide_id": {
+            "type": "integer",
+            "title": "Fide Id"
+          },
+          "rating_standard": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rating Standard"
+          },
+          "games_standard": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Games Standard"
+          },
+          "k_standard": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "K Standard"
+          },
+          "rating_rapid": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rating Rapid"
+          },
+          "games_rapid": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Games Rapid"
+          },
+          "k_rapid": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "K Rapid"
+          },
+          "rating_blitz": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rating Blitz"
+          },
+          "games_blitz": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Games Blitz"
+          },
+          "k_blitz": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "K Blitz"
+          },
+          "flag": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Flag"
+          },
+          "sync_status": {
+            "type": "string",
+            "title": "Sync Status"
+          },
+          "last_synced": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Synced"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          },
+          "account_mappings": {
+            "items": {
+              "$ref": "#/components/schemas/AccountMappingResponse"
+            },
+            "type": "array",
+            "title": "Account Mappings"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "fide_id",
+          "sync_status",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "PlayerResponse",
+        "description": "Schema for player response."
+      },
+      "PositionGame": {
+        "properties": {
+          "game_id": {
+            "type": "integer",
+            "title": "Game Id",
+            "description": "Internal game ID"
+          },
+          "white": {
+            "$ref": "#/components/schemas/PositionGamePlayer"
+          },
+          "black": {
+            "$ref": "#/components/schemas/PositionGamePlayer"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result",
+            "description": "Game result: 1-0, 0-1, 1/2-1/2"
+          },
+          "date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Date",
+            "description": "Game date in ISO format YYYY-MM-DD"
+          },
+          "event": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Event"
+          },
+          "eco": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eco",
+            "description": "ECO opening code"
+          },
+          "moves": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Moves",
+            "description": "First 10 moves in compact SAN notation"
+          },
+          "pgn": {
+            "type": "string",
+            "title": "Pgn",
+            "description": "Full PGN with headers"
+          },
+          "move_number": {
+            "type": "integer",
+            "title": "Move Number",
+            "description": "Full-move number at which the queried position was reached"
+          },
+          "source": {
+            "type": "string",
+            "title": "Source",
+            "description": "Data source: lichess, chesscom, chess-results, ..."
+          },
+          "avg_rating": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avg Rating",
+            "description": "Average rating of both players"
+          }
+        },
+        "type": "object",
+        "required": [
+          "game_id",
+          "white",
+          "black",
+          "result",
+          "date",
+          "event",
+          "eco",
+          "pgn",
+          "move_number",
+          "source",
+          "avg_rating"
+        ],
+        "title": "PositionGame",
+        "description": "A single game that reached the queried FEN position."
+      },
+      "PositionGamePlayer": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "fide_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fide Id"
+          },
+          "rating": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rating"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "fide_id",
+          "rating"
+        ],
+        "title": "PositionGamePlayer",
+        "description": "Player info embedded in a position-games result."
+      },
+      "PositionGamesPagination": {
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "title": "Limit"
+          },
+          "offset": {
+            "type": "integer",
+            "title": "Offset"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "has_more": {
+            "type": "boolean",
+            "title": "Has More"
+          }
+        },
+        "type": "object",
+        "required": [
+          "limit",
+          "offset",
+          "total",
+          "has_more"
+        ],
+        "title": "PositionGamesPagination"
+      },
+      "PositionGamesResponse": {
+        "properties": {
+          "fen": {
+            "type": "string",
+            "title": "Fen",
+            "description": "The queried FEN position"
+          },
+          "total_games": {
+            "type": "integer",
+            "title": "Total Games",
+            "description": "Total games in the index reaching this position"
+          },
+          "games": {
+            "items": {
+              "$ref": "#/components/schemas/PositionGame"
+            },
+            "type": "array",
+            "title": "Games"
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/PositionGamesPagination"
+          }
+        },
+        "type": "object",
+        "required": [
+          "fen",
+          "total_games",
+          "games",
+          "pagination"
+        ],
+        "title": "PositionGamesResponse",
+        "description": "Response for GET /explorer/games — games reaching a FEN position."
+      },
+      "SyncJobResponse": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          },
+          "job_type": {
+            "type": "string",
+            "title": "Job Type"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "entity_type": {
+            "type": "string",
+            "title": "Entity Type"
+          },
+          "entity_id": {
+            "type": "string",
+            "title": "Entity Id"
+          },
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "games_found": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Games Found"
+          },
+          "games_new": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Games New"
+          },
+          "games_updated": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Games Updated"
+          },
+          "games_skipped": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Games Skipped"
+          },
+          "error_message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Message"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "job_type",
+          "status",
+          "entity_type",
+          "entity_id",
+          "source"
+        ],
+        "title": "SyncJobResponse",
+        "description": "Schema for sync job response."
+      },
+      "SyncRequest": {
+        "properties": {
+          "source": {
+            "type": "string",
+            "title": "Source",
+            "description": "Data source: lichess, chesscom, chess-results"
+          },
+          "username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Username",
+            "description": "Username for lichess/chesscom (not needed for chess-results)"
+          },
+          "max_games": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Games",
+            "description": "Maximum number of games to fetch"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source"
+        ],
+        "title": "SyncRequest",
+        "description": "Schema for sync request."
+      },
+      "SyncResponse": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Job Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "status",
+          "message"
+        ],
+        "title": "SyncResponse",
+        "description": "Schema for sync response."
+      },
+      "TopPlayer": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "fide_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fide Id"
+          },
+          "games_played": {
+            "type": "integer",
+            "title": "Games Played"
+          },
+          "white_games": {
+            "type": "integer",
+            "title": "White Games"
+          },
+          "black_games": {
+            "type": "integer",
+            "title": "Black Games"
+          },
+          "score": {
+            "type": "number",
+            "title": "Score",
+            "description": "Total score (1=win, 0.5=draw, 0=loss)"
+          },
+          "score_pct": {
+            "type": "number",
+            "title": "Score Pct",
+            "description": "Score percentage (0-100)"
+          },
+          "avg_rating": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avg Rating"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "fide_id",
+          "games_played",
+          "white_games",
+          "black_games",
+          "score",
+          "score_pct",
+          "avg_rating"
+        ],
+        "title": "TopPlayer",
+        "description": "Single player entry in the top-players response."
+      },
+      "TopPlayersResponse": {
+        "properties": {
+          "eco": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eco"
+          },
+          "opening_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Opening Name"
+          },
+          "total_players": {
+            "type": "integer",
+            "title": "Total Players"
+          },
+          "players": {
+            "items": {
+              "$ref": "#/components/schemas/TopPlayer"
+            },
+            "type": "array",
+            "title": "Players"
+          }
+        },
+        "type": "object",
+        "required": [
+          "eco",
+          "opening_name",
+          "total_players",
+          "players"
+        ],
+        "title": "TopPlayersResponse",
+        "description": "Response for GET /explorer/top-players/."
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}

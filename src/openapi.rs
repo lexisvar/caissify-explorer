@@ -18,6 +18,8 @@ pub fn spec() -> Value {
         ],
         "tags": [
             { "name": "Explorer",   "description": "Query opening statistics and games" },
+            { "name": "Games",      "description": "Browse and retrieve individual games" },
+            { "name": "FIDE",       "description": "FIDE player profiles and rating history" },
             { "name": "PGN",        "description": "Fetch full PGN of individual games" },
             { "name": "Import",     "description": "Import games into the database" },
             { "name": "Admin",      "description": "Monitoring and maintenance" }
@@ -47,6 +49,57 @@ pub fn spec() -> Value {
                     "parameters": [game_id_param()],
                     "responses": {
                         "200": pgn_200_response(),
+                        "404": not_found_response()
+                    }
+                }
+            },
+
+            // ── /caissify/games ───────────────────────────────────────────
+            "/caissify/games": {
+                "get": {
+                    "tags": ["Games"],
+                    "summary": "List Caissify games (paginated)",
+                    "description": "Returns a cursor-paginated list of Caissify games sorted by year. Use `next_page_token` from the response to fetch the next page.",
+                    "operationId": "listCaissifyGames",
+                    "parameters": [
+                        param("limit",       false, "integer", Some("Results per page (default 50, max 200)"), Some(json!(50))),
+                        param("since",       false, "integer", Some("Earliest year to include (inclusive)"), Some(json!(2020))),
+                        param("until",       false, "integer", Some("Latest year to include (inclusive)"), Some(json!(2026))),
+                        param("page_token",  false, "string",  Some("Opaque cursor from a previous response"), None),
+                        param("reverse",     false, "boolean", Some("Return newest games first (default true)"), Some(json!(true))),
+                        param("result",      false, "string",  Some("Filter by game result: white, draw, or black"), Some(json!("white"))),
+                        param("min_rating",  false, "integer", Some("Minimum max(white_rating, black_rating)"), Some(json!(2700))),
+                        param("max_rating",  false, "integer", Some("Maximum max(white_rating, black_rating)"), Some(json!(3000))),
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Paginated game list",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/CaissifyGameListResponse" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+
+            "/caissify/games/{id}": {
+                "get": {
+                    "tags": ["Games"],
+                    "summary": "Get compact metadata for a Caissify game",
+                    "description": "Returns compact metadata (year, ratings, result, FIDE IDs) for a single Caissify game. Fast point-get on the `caissify_game_meta` column family.",
+                    "operationId": "getCaissifyGameMeta",
+                    "parameters": [game_id_param()],
+                    "responses": {
+                        "200": {
+                            "description": "Game metadata",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/CaissifyGameMeta" }
+                                }
+                            }
+                        },
                         "404": not_found_response()
                     }
                 }
@@ -234,6 +287,99 @@ pub fn spec() -> Value {
                     "responses": {
                         "200": { "description": "Game imported successfully" },
                         "400": bad_request_response()
+                    }
+                }
+            },
+
+            // ── /fide ──────────────────────────────────────────────────────
+            "/fide/player/{fide_id}": {
+                "get": {
+                    "tags": ["FIDE"],
+                    "summary": "Get FIDE player profile",
+                    "description": "Returns profile information for a FIDE player: name, country, title, sex, birth year, and activity flag.",
+                    "operationId": "getFidePlayer",
+                    "parameters": [fide_id_param()],
+                    "responses": {
+                        "200": {
+                            "description": "FIDE player profile",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/FidePlayer" }
+                                }
+                            }
+                        },
+                        "404": not_found_response()
+                    }
+                }
+            },
+
+            "/fide/player/{fide_id}/ratings": {
+                "get": {
+                    "tags": ["FIDE"],
+                    "summary": "Get FIDE rating history",
+                    "description": "Returns monthly standard/rapid/blitz rating snapshots for a FIDE player.",
+                    "operationId": "getFidePlayerRatings",
+                    "parameters": (
+                        vec![fide_id_param()]
+                            .into_iter()
+                            .chain(vec![
+                                param("since", false, "string", Some("Start month inclusive (YYYY-MM)"), Some(json!("2020-01"))),
+                                param("until", false, "string", Some("End month inclusive (YYYY-MM)"),   Some(json!("2026-03"))),
+                            ])
+                            .collect::<Vec<_>>()
+                    ),
+                    "responses": {
+                        "200": {
+                            "description": "Rating history array",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "array",
+                                        "items": { "$ref": "#/components/schemas/FideRatingSnapshot" }
+                                    }
+                                }
+                            }
+                        },
+                        "404": not_found_response()
+                    }
+                }
+            },
+
+            // ── Import ────────────────────────────────────────────────────
+            "/import/fide": {
+                "put": {
+                    "tags": ["Import"],
+                    "summary": "Import FIDE player batch",
+                    "description": "Import a batch of FIDE player profiles and rating snapshots for a given month. Called by the `import-fide` binary after parsing the FIDE standard rating list XML.",
+                    "operationId": "importFide",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/FideImportBatch" },
+                                "example": {
+                                    "month": "2026-03",
+                                    "players": [{ "fide_id": 1503014, "name": "Carlsen, Magnus", "country": "NOR", "standard": 2833 }]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": { "description": "Number of FIDE records imported" },
+                        "400": bad_request_response()
+                    }
+                }
+            },
+
+            "/import/caissify/reindex": {
+                "post": {
+                    "tags": ["Import"],
+                    "summary": "Rebuild game metadata index",
+                    "description": "Backfills the `caissify_game_meta` and `caissify_game_by_date` column families from the existing `caissify_game` data. Safe to run multiple times. Progress is logged server-side.",
+                    "operationId": "caissifyReindex",
+                    "responses": {
+                        "200": { "description": "Number of games reindexed" },
+                        "500": { "description": "Reindex failed — check server logs" }
                     }
                 }
             },
@@ -426,6 +572,97 @@ pub fn spec() -> Value {
                         "cookie": { "type": "string", "description": "Cookie header value to send with the download request (e.g. for Sync.com authenticated links)" }
                     },
                     "required": ["url", "cookie"]
+                },
+
+                "CaissifyGameMeta": {
+                    "type": "object",
+                    "description": "Compact per-game metadata stored in caissify_game_meta CF",
+                    "properties": {
+                        "year":           { "type": "integer", "example": 2024 },
+                        "white_rating":   { "type": "integer", "example": 2800 },
+                        "black_rating":   { "type": "integer", "example": 2750 },
+                        "result":         { "type": "string", "enum": ["white", "draw", "black"] },
+                        "white_fide_id":  { "type": "integer", "nullable": true, "description": "FIDE ID of the White player, omitted when not yet linked" },
+                        "black_fide_id":  { "type": "integer", "nullable": true, "description": "FIDE ID of the Black player, omitted when not yet linked" }
+                    },
+                    "required": ["year", "white_rating", "black_rating", "result"]
+                },
+
+                "CaissifyGameListEntry": {
+                    "type": "object",
+                    "description": "One entry in a paginated game list",
+                    "allOf": [{ "$ref": "#/components/schemas/CaissifyGameMeta" }],
+                    "properties": {
+                        "id": { "type": "string", "description": "8-character base-62 game ID", "example": "AbCd1234" }
+                    },
+                    "required": ["id"]
+                },
+
+                "CaissifyGameListResponse": {
+                    "type": "object",
+                    "description": "Cursor-paginated list of Caissify games",
+                    "properties": {
+                        "games":           { "type": "array", "items": { "$ref": "#/components/schemas/CaissifyGameListEntry" } },
+                        "next_page_token": { "type": "string", "nullable": true, "description": "Opaque hex cursor; absent on the last page", "example": "0007d00000001234" }
+                    },
+                    "required": ["games"]
+                },
+
+                "FidePlayer": {
+                    "type": "object",
+                    "description": "FIDE player profile",
+                    "properties": {
+                        "fide_id":    { "type": "integer", "example": 1503014 },
+                        "name":       { "type": "string",  "example": "Carlsen, Magnus" },
+                        "country":    { "type": "string",  "example": "NOR" },
+                        "sex":        { "type": "string",  "example": "M" },
+                        "title":      { "type": "string",  "example": "GM" },
+                        "birth_year": { "type": "integer", "example": 1990 },
+                        "flag":       { "type": "string",  "enum": ["Active", "Inactive", "Unknown"] }
+                    },
+                    "required": ["fide_id", "name", "country", "flag"]
+                },
+
+                "FideRatingSnapshot": {
+                    "type": "object",
+                    "description": "Monthly FIDE rating snapshot",
+                    "properties": {
+                        "month":     { "type": "string",  "example": "2026-03" },
+                        "standard":  { "type": "integer", "nullable": true, "example": 2833 },
+                        "rapid":     { "type": "integer", "nullable": true, "example": 2850 },
+                        "blitz":     { "type": "integer", "nullable": true, "example": 2886 }
+                    },
+                    "required": ["month"]
+                },
+
+                "FideImportBatch": {
+                    "type": "object",
+                    "description": "Batch of FIDE players and rating snapshots for a given month",
+                    "properties": {
+                        "month":   { "type": "string", "description": "YYYY-MM of this rating list", "example": "2026-03" },
+                        "players": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "fide_id":       { "type": "integer" },
+                                    "name":          { "type": "string" },
+                                    "country":       { "type": "string" },
+                                    "sex":           { "type": "string" },
+                                    "title":         { "type": "string" },
+                                    "birth_year":    { "type": "integer" },
+                                    "flag":          { "type": "string" },
+                                    "standard":      { "type": "integer" },
+                                    "rapid":         { "type": "integer" },
+                                    "blitz":         { "type": "integer" },
+                                    "games_standard":{ "type": "integer" },
+                                    "k_factor":      { "type": "integer" }
+                                },
+                                "required": ["fide_id", "name", "country"]
+                            }
+                        }
+                    },
+                    "required": ["month", "players"]
                 }
             }
         }
@@ -514,6 +751,17 @@ fn game_id_param() -> Value {
         "schema": { "type": "string", "minLength": 8, "maxLength": 8 },
         "description": "8-character base-62 game ID",
         "example": "AbCd1234"
+    })
+}
+
+fn fide_id_param() -> Value {
+    json!({
+        "name": "fide_id",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "integer" },
+        "description": "FIDE ID",
+        "example": 1503014
     })
 }
 

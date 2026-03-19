@@ -15,6 +15,8 @@ pub struct GameId(u64);
 
 impl GameId {
     pub const SIZE: usize = 6;
+    /// Smallest valid GameId (numeric value 0 — used as lower/upper bound sentinels).
+    pub const MIN: GameId = GameId(0);
 
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];

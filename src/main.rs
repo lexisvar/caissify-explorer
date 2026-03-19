@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![recursion_limit = "512"]
 
 pub mod api;
 pub mod db;
@@ -59,8 +60,8 @@ use crate::{
     lila::{Lila, LilaOpt},
     metrics::Metrics,
     model::{
-        GameId, KeyBuilder, KeyPrefix, MastersGame, MastersGameWithId, PreparedMove, UserId,
-        UserName,
+        CaissifyByDateKey, CaissifyGameMeta, GameId, GameResult, KeyBuilder, KeyPrefix,
+        MastersGame, MastersGameWithId, Month, PreparedMove, UserId, UserName,
     },
     opening::{Opening, Openings},
     util::{DedupStreamExt as _, ply, spawn_blocking},
@@ -160,11 +161,17 @@ async fn serve() {
         .route("/import/caissify", put(caissify_import))
         .route("/import/caissify/pgn-url", post(caissify_pgn_url_import))
         .route("/import/caissify/pgn-url/status", get(caissify_pgn_url_status))
+        .route("/import/caissify/reindex", post(caissify_reindex))
+        .route("/import/fide", put(fide_import))
         .route("/import/openings", post(openings_import))
         .route("/masters/pgn/{id}", get(masters_pgn))
         .route("/masters", get(masters))
         .route("/caissify/pgn/{id}", get(caissify_pgn))
         .route("/caissify", get(caissify))
+        .route("/caissify/games", get(caissify_games))
+        .route("/caissify/games/{id}", get(caissify_game_meta_endpoint))
+        .route("/fide/player/{fide_id}", get(fide_player))
+        .route("/fide/player/{fide_id}/ratings", get(fide_player_ratings))
         .route("/lichess", get(lichess))
         .route("/lichess/history", get(lichess_history)) // bc
         .route("/player", get(player))
@@ -790,6 +797,184 @@ async fn caissify_pgn_url_status(
     axum::Json(importer.status())
 }
 
+/// Backfill `caissify_game_meta` and `caissify_game_by_date` for historical
+/// games imported before Phase 0. Idempotent — already-indexed games are
+/// skipped. Can be slow on large databases; run during a maintenance window.
+#[axum::debug_handler(state = AppState)]
+async fn caissify_reindex(
+    State(db): State<Arc<Database>>,
+    State(semaphore): State<&'static Semaphore>,
+) -> Result<String, StatusCode> {
+    spawn_blocking(semaphore, move || {
+        match db.caissify().reindex_meta() {
+            Ok(count) => Ok(format!("reindexed {count} games")),
+            Err(err) => {
+                log::error!("caissify reindex failed: {err}");
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        }
+    })
+    .await
+}
+
+// ─── FIDE endpoints ───────────────────────────────────────────────────────────
+
+#[axum::debug_handler(state = AppState)]
+async fn fide_player(
+    Path(fide_id): Path<u32>,
+    State(db): State<Arc<Database>>,
+    State(semaphore): State<&'static Semaphore>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    spawn_blocking(semaphore, move || {
+        match db.fide().get_player(fide_id).expect("get fide player") {
+            Some(player) => Ok(Json(serde_json::to_value(player).expect("serialize fide player"))),
+            None => Err(StatusCode::NOT_FOUND),
+        }
+    })
+    .await
+}
+
+#[serde_as]
+#[derive(serde::Deserialize)]
+struct FideRatingsQuery {
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[serde(default)]
+    since: Option<Month>,
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[serde(default)]
+    until: Option<Month>,
+}
+
+#[axum::debug_handler(state = AppState)]
+async fn fide_player_ratings(
+    Path(fide_id): Path<u32>,
+    Query(query): Query<FideRatingsQuery>,
+    State(db): State<Arc<Database>>,
+    State(semaphore): State<&'static Semaphore>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    spawn_blocking(semaphore, move || {
+        let history = db
+            .fide()
+            .get_rating_history(fide_id, query.since, query.until)
+            .expect("get fide rating history");
+
+        if history.is_empty() {
+            // Return 404 if no history at all (player not found or no ratings)
+            return match db.fide().get_player(fide_id).expect("check fide player") {
+                None => Err(StatusCode::NOT_FOUND),
+                Some(_) => Ok(Json(serde_json::json!([]))),
+            };
+        }
+
+        let entries: Vec<_> = history
+            .into_iter()
+            .map(|(month, snap)| {
+                serde_json::json!({
+                    "month": month.to_string(),
+                    "standard": if snap.standard > 0 { Some(snap.standard) } else { None },
+                    "rapid": if snap.rapid > 0 { Some(snap.rapid) } else { None },
+                    "blitz": if snap.blitz > 0 { Some(snap.blitz) } else { None },
+                })
+            })
+            .collect();
+
+        Ok(Json(serde_json::json!(entries)))
+    })
+    .await
+}
+
+// ─── FIDE import endpoint ─────────────────────────────────────────────────────
+
+/// One record in a FIDE import batch — all three time controls + profile.
+#[derive(serde::Deserialize)]
+struct FideImportRecord {
+    fide_id: u32,
+    name: String,
+    country: String,
+    #[serde(default)]
+    sex: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    birth_year: u16,
+    /// "active" | "inactive" (anything else → Unknown)
+    #[serde(default)]
+    flag: String,
+    #[serde(default)]
+    standard: u16,
+    #[serde(default)]
+    rapid: u16,
+    #[serde(default)]
+    blitz: u16,
+    #[serde(default)]
+    games_standard: u16,
+    #[serde(default)]
+    k_factor: u8,
+}
+
+#[serde_as]
+#[derive(serde::Deserialize)]
+struct FideImportBatch {
+    #[serde_as(as = "DisplayFromStr")]
+    month: Month,
+    players: Vec<FideImportRecord>,
+}
+
+#[axum::debug_handler(state = AppState)]
+async fn fide_import(
+    State(db): State<Arc<Database>>,
+    State(semaphore): State<&'static Semaphore>,
+    Json(body): Json<FideImportBatch>,
+) -> Result<String, StatusCode> {
+    spawn_blocking(semaphore, move || {
+        use crate::model::{FideFlag, FidePlayer, FideRatingKey, FideRatingSnapshot};
+
+        let fide_db = db.fide();
+        let mut batch = fide_db.batch();
+        let count = body.players.len();
+
+        for rec in body.players {
+            let player = FidePlayer {
+                fide_id: rec.fide_id,
+                name: rec.name,
+                country: rec.country,
+                sex: rec.sex,
+                title: rec.title,
+                birth_year: rec.birth_year,
+                flag: match rec.flag.as_str() {
+                    "active" => FideFlag::Active,
+                    "inactive" => FideFlag::Inactive,
+                    _ => FideFlag::Unknown,
+                },
+            };
+            batch.put_player(&player);
+
+            let snap = FideRatingSnapshot {
+                standard: rec.standard,
+                rapid: rec.rapid,
+                blitz: rec.blitz,
+                games_standard: rec.games_standard,
+                k_factor: rec.k_factor,
+            };
+            batch.put_rating_snapshot(
+                FideRatingKey {
+                    fide_id: rec.fide_id,
+                    month: body.month,
+                },
+                &snap,
+            );
+        }
+
+        batch.commit().map_err(|err| {
+            log::error!("fide import commit failed: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        Ok(format!("imported {count} FIDE records for {}", body.month))
+    })
+    .await
+}
+
 #[axum::debug_handler(state = AppState)]
 async fn caissify_pgn(
     Path(MastersGameId(id)): Path<MastersGameId>,
@@ -799,6 +984,175 @@ async fn caissify_pgn(
     spawn_blocking(semaphore, move || {
         match db.caissify().game(id).expect("get caissify game") {
             Some(game) => Ok(game),
+            None => Err(StatusCode::NOT_FOUND),
+        }
+    })
+    .await
+}
+
+// ─── Paginated game list ──────────────────────────────────────────────────────
+
+/// Encode an 8-byte CaissifyByDateKey as a 16-char lowercase hex string.
+fn encode_page_token(key: CaissifyByDateKey) -> String {
+    let bytes = key.into_bytes();
+    bytes.iter().fold(String::with_capacity(16), |mut s, b| {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// Decode a hex page token back to a CaissifyByDateKey.
+fn decode_page_token(s: &str) -> Option<CaissifyByDateKey> {
+    if s.len() != 16 {
+        return None;
+    }
+    let mut bytes = [0u8; 8];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        let hex_str = std::str::from_utf8(chunk).ok()?;
+        bytes[i] = u8::from_str_radix(hex_str, 16).ok()?;
+    }
+    Some(CaissifyByDateKey::read(&mut bytes.as_slice()))
+}
+
+/// Serialised entry in the paginated game list.
+#[derive(serde::Serialize)]
+struct CaissifyGameListEntry {
+    id: String,
+    year: u16,
+    white_rating: u16,
+    black_rating: u16,
+    result: GameResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    white_fide_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    black_fide_id: Option<u32>,
+}
+
+#[derive(serde::Serialize)]
+struct CaissifyGameListResponse {
+    games: Vec<CaissifyGameListEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_page_token: Option<String>,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct CaissifyGamesQuery {
+    /// Number of results to return. Default 50, max 200.
+    limit: Option<usize>,
+    /// Earliest year to include (inclusive).
+    since: Option<u16>,
+    /// Latest year to include (inclusive).
+    until: Option<u16>,
+    /// Opaque cursor from a previous response.
+    page_token: Option<String>,
+    /// If true (default) return newest games first.
+    reverse: Option<bool>,
+    /// Filter by game result: "white", "draw", or "black".
+    result: Option<GameResult>,
+    /// Minimum rating of either player.
+    min_rating: Option<u16>,
+    /// Maximum rating of either player.
+    max_rating: Option<u16>,
+}
+
+#[axum::debug_handler(state = AppState)]
+async fn caissify_games(
+    Query(q): Query<CaissifyGamesQuery>,
+    State(db): State<Arc<Database>>,
+    State(semaphore): State<&'static Semaphore>,
+) -> Result<Json<CaissifyGameListResponse>, Error> {
+    spawn_blocking(semaphore, move || {
+        let limit = q.limit.unwrap_or(50).min(200);
+        let since = q.since.unwrap_or(0);
+        let until = q.until.unwrap_or(u16::MAX);
+        let reverse = q.reverse.unwrap_or(true);
+        let cursor = q.page_token.as_deref().and_then(decode_page_token);
+
+        // Fetch one extra to detect whether a next page exists.
+        let scan_size = limit + 1;
+        let caissify_db = db.caissify();
+        let keys = caissify_db
+            .iter_by_date(since, until, cursor, scan_size, reverse)
+            .expect("iter caissify by date");
+
+        let has_more = keys.len() > limit;
+        let page_keys = &keys[..keys.len().min(limit)];
+
+        let mut games: Vec<CaissifyGameListEntry> = Vec::with_capacity(page_keys.len());
+        for key in page_keys {
+            let Some(meta) = caissify_db
+                .game_meta(key.id)
+                .expect("get caissify game meta")
+            else {
+                continue;
+            };
+
+            // Apply optional filters.
+            if let Some(rf) = q.result {
+                if meta.result != rf {
+                    continue;
+                }
+            }
+            let max_player_rating = meta.white_rating.max(meta.black_rating);
+            if let Some(min) = q.min_rating {
+                if max_player_rating < min {
+                    continue;
+                }
+            }
+            if let Some(max) = q.max_rating {
+                if max_player_rating > max {
+                    continue;
+                }
+            }
+
+            games.push(CaissifyGameListEntry {
+                id: key.id.to_string(),
+                year: meta.year,
+                white_rating: meta.white_rating,
+                black_rating: meta.black_rating,
+                result: meta.result,
+                white_fide_id: if meta.white_fide_id == 0 {
+                    None
+                } else {
+                    Some(meta.white_fide_id)
+                },
+                black_fide_id: if meta.black_fide_id == 0 {
+                    None
+                } else {
+                    Some(meta.black_fide_id)
+                },
+            });
+        }
+
+        let next_page_token = if has_more {
+            page_keys.last().map(|k| encode_page_token(*k))
+        } else {
+            None
+        };
+
+        Ok(Json(CaissifyGameListResponse {
+            games,
+            next_page_token,
+        }))
+    })
+    .await
+}
+
+#[axum::debug_handler(state = AppState)]
+async fn caissify_game_meta_endpoint(
+    Path(MastersGameId(id)): Path<MastersGameId>,
+    State(db): State<Arc<Database>>,
+    State(semaphore): State<&'static Semaphore>,
+) -> Result<Json<CaissifyGameMeta>, StatusCode> {
+    spawn_blocking(semaphore, move || {
+        match db
+            .caissify()
+            .game_meta(id)
+            .expect("get caissify game meta")
+        {
+            Some(meta) => Ok(Json(meta)),
             None => Err(StatusCode::NOT_FOUND),
         }
     })

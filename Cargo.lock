@@ -265,6 +265,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "caissify-explorer"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "clap",
+ "csv",
+ "env_logger 0.11.8",
+ "fastrand",
+ "futures-util",
+ "iai",
+ "log",
+ "moka",
+ "nohash-hasher",
+ "partial_sort",
+ "pgn-reader",
+ "pin-project-lite",
+ "quickcheck",
+ "reqwest",
+ "rocksdb",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "sha-1",
+ "shakmaty",
+ "sync_wrapper",
+ "thin-vec",
+ "thiserror",
+ "tikv-jemallocator",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tower-http",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1229,42 +1266,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lila-openingexplorer"
-version = "3.0.0"
-dependencies = [
- "axum",
- "bytes",
- "clap",
- "csv",
- "env_logger 0.11.8",
- "fastrand",
- "futures-util",
- "iai",
- "log",
- "moka",
- "nohash-hasher",
- "partial_sort",
- "pin-project-lite",
- "quickcheck",
- "reqwest",
- "rocksdb",
- "serde",
- "serde_json",
- "serde_with",
- "sha-1",
- "shakmaty",
- "sync_wrapper",
- "thin-vec",
- "thiserror",
- "tikv-jemallocator",
- "time",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tower-http",
-]
-
-[[package]]
 name = "linux-raw-sys"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1537,6 +1538,17 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "pgn-reader"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b822a2cfc1c90c109ea35458ad9bff6669198fdd4ea8de1132e702b4d9f64b88"
+dependencies = [
+ "btoi",
+ "memchr",
+ "shakmaty",
+]
 
 [[package]]
 name = "pin-project-lite"

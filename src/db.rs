@@ -10,7 +10,8 @@ use rocksdb::{
 use crate::{
     api::{HistoryWanted, LichessQueryFilter, Limits},
     model::{
-        GameId, History, HistoryBuilder, Key, KeyPrefix, LichessEntry, LichessGame, MastersEntry,
+        CaissifyByDateKey, CaissifyGameMeta, FidePlayer, FideRatingKey, FideRatingSnapshot, GameId,
+        History, HistoryBuilder, Key, KeyPrefix, LichessEntry, LichessGame, MastersEntry,
         MastersGame, Month, PlayerEntry, PlayerStatus, PreparedResponse, UserId, Year,
     },
 };
@@ -250,6 +251,38 @@ impl Database {
                     cache: &cache,
                 }
                 .descriptor(),
+                // Compact per-game metadata (year, ratings, result, FIDE IDs)
+                Column {
+                    name: "caissify_game_meta",
+                    prefix: None,
+                    merge: None,
+                    cache: &cache,
+                }
+                .descriptor(),
+                // Secondary index: year → GameId (for paginated listing)
+                Column {
+                    name: "caissify_game_by_date",
+                    prefix: Some(2), // 2-byte Year LE prefix
+                    merge: None,
+                    cache: &cache,
+                }
+                .descriptor(),
+                // FIDE player database
+                Column {
+                    name: "fide_player",
+                    prefix: None,
+                    merge: None,
+                    cache: &cache,
+                }
+                .descriptor(),
+                // FIDE rating history: prefix = 4-byte FIDE ID
+                Column {
+                    name: "fide_rating_history",
+                    prefix: Some(4),
+                    merge: None,
+                    cache: &cache,
+                }
+                .descriptor(),
             ],
         )?;
 
@@ -302,6 +335,20 @@ impl Database {
         }
     }
 
+    pub fn fide(&self) -> FideDatabase<'_> {
+        FideDatabase {
+            inner: &self.inner,
+            cf_fide_player: self
+                .inner
+                .cf_handle("fide_player")
+                .expect("cf fide_player"),
+            cf_fide_rating_history: self
+                .inner
+                .cf_handle("fide_rating_history")
+                .expect("cf fide_rating_history"),
+        }
+    }
+
     pub fn caissify(&self) -> CaissifyDatabase<'_> {
         CaissifyDatabase {
             inner: &self.inner,
@@ -310,6 +357,14 @@ impl Database {
                 .inner
                 .cf_handle("caissify_game")
                 .expect("cf caissify_game"),
+            cf_caissify_game_meta: self
+                .inner
+                .cf_handle("caissify_game_meta")
+                .expect("cf caissify_game_meta"),
+            cf_caissify_game_by_date: self
+                .inner
+                .cf_handle("caissify_game_by_date")
+                .expect("cf caissify_game_by_date"),
         }
     }
 }
@@ -460,12 +515,14 @@ impl MastersBatch<'_> {
 pub struct CaissifyDatabase<'a> {
     inner: &'a DB,
     cf_caissify: &'a ColumnFamily,
-    cf_caissify_game: &'a ColumnFamily,
-}
+    cf_caissify_game: &'a ColumnFamily,    cf_caissify_game_meta: &'a ColumnFamily,
+    cf_caissify_game_by_date: &'a ColumnFamily,}
 
 pub struct CaissifyMetrics {
     num_caissify: u64,
     num_caissify_game: u64,
+    num_caissify_game_meta: u64,
+    num_caissify_game_by_date: u64,
 }
 
 impl CaissifyMetrics {
@@ -473,6 +530,8 @@ impl CaissifyMetrics {
         [
             format!("caissify={}u", self.num_caissify),
             format!("caissify_game={}u", self.num_caissify_game),
+            format!("caissify_game_meta={}u", self.num_caissify_game_meta),
+            format!("caissify_game_by_date={}u", self.num_caissify_game_by_date),
         ]
         .join(",")
     }
@@ -484,6 +543,10 @@ impl CaissifyDatabase<'_> {
         compact_column(self.inner, self.cf_caissify);
         log::info!("running manual compaction for caissify_game ...");
         compact_column(self.inner, self.cf_caissify_game);
+        log::info!("running manual compaction for caissify_game_meta ...");
+        compact_column(self.inner, self.cf_caissify_game_meta);
+        log::info!("running manual compaction for caissify_game_by_date ...");
+        compact_column(self.inner, self.cf_caissify_game_by_date);
     }
 
     pub fn estimate_metrics(&self) -> Result<CaissifyMetrics, rocksdb::Error> {
@@ -495,6 +558,14 @@ impl CaissifyDatabase<'_> {
             num_caissify_game: self
                 .inner
                 .property_int_value_cf(self.cf_caissify_game, ESTIMATE_NUM_KEYS)?
+                .unwrap_or(0),
+            num_caissify_game_meta: self
+                .inner
+                .property_int_value_cf(self.cf_caissify_game_meta, ESTIMATE_NUM_KEYS)?
+                .unwrap_or(0),
+            num_caissify_game_by_date: self
+                .inner
+                .property_int_value_cf(self.cf_caissify_game_by_date, ESTIMATE_NUM_KEYS)?
                 .unwrap_or(0),
         })
     }
@@ -564,6 +635,132 @@ impl CaissifyDatabase<'_> {
         iter.status().map(|_| entry)
     }
 
+    /// Retrieve compact metadata for a single game (used by paginated list).
+    pub fn game_meta(&self, id: GameId) -> Result<Option<CaissifyGameMeta>, rocksdb::Error> {
+        Ok(self
+            .inner
+            .get_pinned_cf(self.cf_caissify_game_meta, id.to_bytes())?
+            .map(|buf| CaissifyGameMeta::read(&mut &buf[..])))
+    }
+
+    /// Backfill `caissify_game_meta` and `caissify_game_by_date` for any game
+    /// that was imported before Phase 0. Safe to run multiple times — already-
+    /// populated entries are skipped.
+    ///
+    /// Returns the number of records written.
+    pub fn reindex_meta(&self) -> Result<u64, rocksdb::Error> {
+        let mut count = 0u64;
+        let mut iter = self.inner.raw_iterator_cf(self.cf_caissify_game);
+        iter.seek_to_first();
+
+        while let Some((key_bytes, value_bytes)) = iter.item() {
+            if key_bytes.len() == GameId::SIZE {
+                let id = GameId::read(&mut &key_bytes[..]);
+
+                // Skip if already indexed.
+                if self
+                    .inner
+                    .get_pinned_cf(self.cf_caissify_game_meta, id.to_bytes())?
+                    .is_none()
+                {
+                    // Deserialise the full game to extract year and ratings.
+                    let game: MastersGame =
+                        serde_json::from_slice(value_bytes).expect("deserialize caissify game");
+
+                    let year = u16::from(game.date.year());
+                    let meta = CaissifyGameMeta {
+                        year,
+                        white_rating: game.players.white.rating,
+                        black_rating: game.players.black.rating,
+                        result: crate::model::GameResult::from_winner(game.winner),
+                        white_fide_id: 0,
+                        black_fide_id: 0,
+                    };
+
+                    let mut batch = WriteBatch::default();
+                    let mut meta_buf = Vec::with_capacity(CaissifyGameMeta::SIZE);
+                    meta.write(&mut meta_buf);
+                    batch.put_cf(self.cf_caissify_game_meta, id.to_bytes(), meta_buf);
+                    batch.put_cf(
+                        self.cf_caissify_game_by_date,
+                        CaissifyByDateKey { year, id }.into_bytes(),
+                        [],
+                    );
+                    self.inner.write(batch)?;
+                    count += 1;
+                }
+            }
+
+            iter.next();
+        }
+
+        iter.status().map(|_| count)
+    }
+
+    /// Iterate games sorted by (year, GameId). Returns up to `limit` entries
+    /// starting from an inclusive `cursor` key.
+    ///
+    /// If `reverse` is true the iterator runs backwards — useful for
+    /// "newest first" pagination. In reverse mode the `cursor` is the
+    /// *last* key seen on the previous page (exclusive lower bound).
+    pub fn iter_by_date(
+        &self,
+        since_year: u16,
+        until_year: u16,
+        cursor: Option<CaissifyByDateKey>,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<CaissifyByDateKey>, rocksdb::Error> {
+        let lower = CaissifyByDateKey {
+            year: since_year,
+            id: GameId::MIN,
+        }
+        .into_bytes();
+        let upper = CaissifyByDateKey::upper_bound(until_year);
+
+        let mut opt = ReadOptions::default();
+        opt.fill_cache(true);
+        opt.set_iterate_lower_bound(lower);
+        opt.set_iterate_upper_bound(upper);
+        opt.set_prefix_same_as_start(false);
+
+        let mut iter = self
+            .inner
+            .raw_iterator_cf_opt(self.cf_caissify_game_by_date, opt);
+
+        if reverse {
+            // Start from the cursor (exclusive) or from the end of the range.
+            match cursor {
+                Some(c) => iter.seek_for_prev(c.into_bytes()),
+                None => iter.seek_to_last(),
+            }
+        } else {
+            // Start from the cursor (inclusive) or from the beginning.
+            match cursor {
+                Some(c) => iter.seek(c.into_bytes()),
+                None => iter.seek_to_first(),
+            }
+        }
+
+        let mut results = Vec::with_capacity(limit);
+        while results.len() < limit {
+            let Some(key_bytes) = iter.key() else {
+                break;
+            };
+            if key_bytes.len() >= CaissifyByDateKey::SIZE {
+                let entry = CaissifyByDateKey::read(&mut &key_bytes[..]);
+                results.push(entry);
+            }
+            if reverse {
+                iter.prev();
+            } else {
+                iter.next();
+            }
+        }
+
+        iter.status().map(|_| results)
+    }
+
     pub fn batch(&self) -> CaissifyBatch<'_> {
         CaissifyBatch {
             db: self,
@@ -591,6 +788,150 @@ impl CaissifyBatch<'_> {
             id.to_bytes(),
             serde_json::to_vec(game).expect("serialize caissify game"),
         );
+    }
+
+    /// Write compact metadata for fast pagination and filtering.
+    pub fn put_game_meta(&mut self, id: GameId, meta: &CaissifyGameMeta) {
+        let mut buf = Vec::with_capacity(CaissifyGameMeta::SIZE);
+        meta.write(&mut buf);
+        self.batch
+            .put_cf(self.db.cf_caissify_game_meta, id.to_bytes(), buf);
+    }
+
+    /// Write the secondary date index entry.
+    pub fn put_by_date(&mut self, key: CaissifyByDateKey) {
+        self.batch.put_cf(
+            self.db.cf_caissify_game_by_date,
+            key.into_bytes(),
+            [], // value is empty; GameId is embedded in the key
+        );
+    }
+
+    pub fn commit(self) -> Result<(), rocksdb::Error> {
+        self.db.inner.write(self.batch)
+    }
+}
+
+// ─── FideDB ───────────────────────────────────────────────────────────────────
+
+pub struct FideDatabase<'a> {
+    inner: &'a DB,
+    cf_fide_player: &'a ColumnFamily,
+    cf_fide_rating_history: &'a ColumnFamily,
+}
+
+pub struct FideMetrics {
+    pub num_fide_player: u64,
+    pub num_fide_rating_history: u64,
+}
+
+impl FideMetrics {
+    pub fn to_influx_string(&self) -> String {
+        [
+            format!("fide_player={}u", self.num_fide_player),
+            format!("fide_rating_history={}u", self.num_fide_rating_history),
+        ]
+        .join(",")
+    }
+}
+
+impl FideDatabase<'_> {
+    pub fn estimate_metrics(&self) -> Result<FideMetrics, rocksdb::Error> {
+        Ok(FideMetrics {
+            num_fide_player: self
+                .inner
+                .property_int_value_cf(self.cf_fide_player, ESTIMATE_NUM_KEYS)?
+                .unwrap_or(0),
+            num_fide_rating_history: self
+                .inner
+                .property_int_value_cf(self.cf_fide_rating_history, ESTIMATE_NUM_KEYS)?
+                .unwrap_or(0),
+        })
+    }
+
+    pub fn get_player(&self, fide_id: u32) -> Result<Option<FidePlayer>, rocksdb::Error> {
+        Ok(self
+            .inner
+            .get_pinned_cf(self.cf_fide_player, FidePlayer::fide_id_key(fide_id))?
+            .map(|buf| FidePlayer::read(&mut &buf[..])))
+    }
+
+    /// Fetch all monthly rating snapshots for a player within an optional range.
+    pub fn get_rating_history(
+        &self,
+        fide_id: u32,
+        since: Option<Month>,
+        until: Option<Month>,
+    ) -> Result<Vec<(Month, FideRatingSnapshot)>, rocksdb::Error> {
+        let lower = FideRatingKey {
+            fide_id,
+            month: since.unwrap_or(Month::min_value()),
+        }
+        .into_bytes();
+        let upper = match until {
+            Some(m) => FideRatingKey {
+                fide_id,
+                month: m.add_months_saturating(1),
+            }
+            .into_bytes(),
+            None => FideRatingKey::upper_bound(fide_id),
+        };
+
+        let mut opt = ReadOptions::default();
+        opt.fill_cache(true);
+        opt.set_iterate_lower_bound(lower);
+        opt.set_iterate_upper_bound(upper);
+        opt.set_prefix_same_as_start(true);
+
+        let mut iter = self
+            .inner
+            .raw_iterator_cf_opt(self.cf_fide_rating_history, opt);
+        iter.seek_to_first();
+
+        let mut results = Vec::new();
+        while let Some((key_bytes, value_bytes)) = iter.item() {
+            if key_bytes.len() >= FideRatingKey::SIZE {
+                let month_raw = u16::from_le_bytes([key_bytes[4], key_bytes[5]]);
+                if let Ok(month) = Month::try_from(month_raw) {
+                    let snap = FideRatingSnapshot::read(&mut &value_bytes[..]);
+                    results.push((month, snap));
+                }
+            }
+            iter.next();
+        }
+
+        iter.status().map(|_| results)
+    }
+
+    pub fn batch(&self) -> FideBatch<'_> {
+        FideBatch {
+            db: self,
+            batch: WriteBatch::default(),
+        }
+    }
+}
+
+pub struct FideBatch<'a> {
+    db: &'a FideDatabase<'a>,
+    batch: WriteBatch,
+}
+
+impl FideBatch<'_> {
+    pub fn put_player(&mut self, player: &FidePlayer) {
+        let mut buf = Vec::new();
+        player.write(&mut buf);
+        self.batch.put_cf(
+            self.db.cf_fide_player,
+            FidePlayer::fide_id_key(player.fide_id),
+            buf,
+        );
+    }
+
+    pub fn put_rating_snapshot(&mut self, key: FideRatingKey, snap: &FideRatingSnapshot) {
+        let mut buf = Vec::with_capacity(FideRatingSnapshot::SIZE);
+        snap.write(&mut buf);
+        self.batch
+            .put_cf(self.db.cf_fide_rating_history, key.into_bytes(), buf);
     }
 
     pub fn commit(self) -> Result<(), rocksdb::Error> {
