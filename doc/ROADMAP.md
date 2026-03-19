@@ -457,7 +457,7 @@ These are non-breaking internal changes that all subsequent features depend on.
 
 - [x] `GET /caissify/games` endpoint with cursor pagination, date/result/rating filters. ✅ 2026-03-19
 - [x] `GET /caissify/games/{id}` single game metadata (fast point-get on `caissify_game_meta`). ✅ 2026-03-19
-- [x] Update OpenAPI spec in `src/openapi.rs` to document the new endpoints. ✅ 2026-03-19
+- [x] Update OpenAPI spec in `src/openapi.rs` to document the new endpoints. ✅ 2026-03-19 ✅ 2026-03-19
 - [ ] Add `caissify_games` counter to `/monitor` metrics.
 
 ### Phase 2 — FIDE Player Database (~3–4 days)
@@ -469,7 +469,7 @@ These are non-breaking internal changes that all subsequent features depend on.
 - [x] `GET /fide/player/{fide_id}/ratings` endpoint with month range filter. ✅ 2026-03-19
 - [x] `PUT /import/fide` admin endpoint (accepts JSON batch `{ month, players[] }`). ✅ 2026-03-19
 - [ ] Add `periodic_fide_ratings_update` background task (~32 day interval).
-- [x] Update OpenAPI spec. ✅ 2026-03-19
+- [x] Update OpenAPI spec. ✅ 2026-03-19 ✅ 2026-03-19
 
 ### Phase 3 — FIDE Player ↔ Game Linking (~3–4 days)
 
