@@ -371,6 +371,19 @@ pub fn spec() -> Value {
                 }
             },
 
+            "/import/fide/refresh": {
+                "post": {
+                    "tags": ["Import"],
+                    "summary": "Trigger FIDE rating list refresh",
+                    "description": "Downloads the current FIDE standard rating list immediately (same as the automatic ~32-day background task). Useful after initial deployment or to force an early update. Response is the number of players imported.",
+                    "operationId": "refreshFide",
+                    "responses": {
+                        "200": { "description": "Number of FIDE players imported" },
+                        "500": { "description": "Download or parse failed — check server logs" }
+                    }
+                }
+            },
+
             "/import/caissify/reindex": {
                 "post": {
                     "tags": ["Import"],
