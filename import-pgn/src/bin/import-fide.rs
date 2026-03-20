@@ -9,7 +9,6 @@
 ///   import-fide --endpoint http://localhost:9002 --month 2026-03
 ///   import-fide --endpoint http://localhost:9002  # defaults to current month
 use std::{
-    collections::HashMap,
     io::{BufRead, Read},
     str::FromStr,
     time::Duration,
@@ -36,7 +35,7 @@ struct Opt {
     month: Option<String>,
 
     /// Number of players per POST batch.
-    #[arg(long, default_value = "500")]
+    #[arg(long, default_value = "2000")]
     batch_size: usize,
 
     /// Timeout for each HTTP request (seconds).
@@ -60,7 +59,15 @@ struct PlayerRecord {
     rapid: u16,
     blitz: u16,
     games_standard: u16,
-    k_factor: u8,
+    #[serde(default)]
+    games_rapid: u16,
+    #[serde(default)]
+    games_blitz: u16,
+    k_standard: u8,
+    #[serde(default)]
+    k_rapid: u8,
+    #[serde(default)]
+    k_blitz: u8,
 }
 
 fn current_month() -> String {
@@ -130,7 +137,9 @@ fn parse_xml(xml: &[u8]) -> Vec<PlayerRecord> {
                         "foa_title" => player.foa_title = text.to_owned(),
                         "birthday" => player.birth_year = text.parse().unwrap_or(0),
                         "flag" => {
-                            player.flag = if text.eq_ignore_ascii_case("i") {
+                            // FIDE: "i" or "wi" = inactive, "w" = active woman,
+                            // anything else (or absent) = active.
+                            player.flag = if text.to_ascii_lowercase().contains('i') {
                                 "inactive".to_owned()
                             } else {
                                 "active".to_owned()
@@ -138,7 +147,7 @@ fn parse_xml(xml: &[u8]) -> Vec<PlayerRecord> {
                         }
                         "rating" => player.standard = text.parse().unwrap_or(0),
                         "games" => player.games_standard = text.parse().unwrap_or(0),
-                        "k" => player.k_factor = text.parse().unwrap_or(0),
+                        "k" => { player.k_standard = text.parse().unwrap_or(0); player.k_rapid = player.k_standard; player.k_blitz = player.k_standard; }
                         "rapid_rating" => player.rapid = text.parse().unwrap_or(0),
                         "blitz_rating" => player.blitz = text.parse().unwrap_or(0),
                         _ => {}
@@ -203,14 +212,13 @@ fn main() {
         .build()
         .expect("http client");
 
-    // Download the complete FIDE player list (players_list_xml.zip).
-    // This is the FOA master list and contains ALL registered FIDE players,
-    // including those with only rapid/blitz ratings, inactive players, and
-    // newly registered players who have never played standard-rated games.
-    // The standard_rating_list_xml.zip only contains players who appear on
-    // the standard rating list and would miss a significant portion of players.
-    let url = "https://ratings.fide.com/download/players_list_xml.zip";
-    let xml = download_zipped_xml(&client, url);
+    // players_list_xml.zip is the FOA master list: ALL ~1.8M registered FIDE
+    // players including profiles AND rating data (standard/rapid/blitz) for
+    // rated players. Single download — no merge needed.
+    let xml = download_zipped_xml(
+        &client,
+        "https://ratings.fide.com/download/players_list_xml.zip",
+    );
 
     eprintln!("Parsing XML ({} MB) …", xml.len() / 1_048_576);
     let players = parse_xml(&xml);

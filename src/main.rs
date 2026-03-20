@@ -248,7 +248,11 @@ struct FideXmlRecord {
     rapid: u16,
     blitz: u16,
     games_standard: u16,
-    k_factor: u8,
+    games_rapid: u16,
+    games_blitz: u16,
+    k_standard: u8,
+    k_rapid: u8,
+    k_blitz: u8,
 }
 
 /// Event-based SAX-style XML parser for the FIDE standard rating list.
@@ -285,7 +289,11 @@ fn fide_parse_xml(xml: &[u8]) -> Vec<FideXmlRecord> {
                         rapid: 0,
                         blitz: 0,
                         games_standard: 0,
-                        k_factor: 0,
+                        games_rapid: 0,
+                        games_blitz: 0,
+                        k_standard: 0,
+                        k_rapid: 0,
+                        k_blitz: 0,
                     });
                 }
                 current_tag = tag;
@@ -308,14 +316,17 @@ fn fide_parse_xml(xml: &[u8]) -> Vec<FideXmlRecord> {
                         "o_title"      => p.o_title       = text.to_owned(),
                         "foa_title"    => p.foa_title     = text.to_owned(),
                         "birthday"     => p.birth_year    = text.parse().unwrap_or(0),
-                        "flag"         => p.flag = if text.eq_ignore_ascii_case("i") {
+                        // FIDE flag: "wi" = inactive woman, "i" = inactive,
+                        // "w" = woman (active), anything else = active.
+                        // Absence of the tag entirely also means active.
+                        "flag"         => p.flag = if text.to_ascii_lowercase().contains('i') {
                                               "inactive".to_owned()
                                           } else {
                                               "active".to_owned()
                                           },
                         "rating"       => p.standard      = text.parse().unwrap_or(0),
                         "games"        => p.games_standard = text.parse().unwrap_or(0),
-                        "k"            => p.k_factor      = text.parse().unwrap_or(0),
+                        "k"            => { p.k_standard = text.parse().unwrap_or(0); p.k_rapid = p.k_standard; p.k_blitz = p.k_standard; }
                         "rapid_rating" => p.rapid         = text.parse().unwrap_or(0),
                         "blitz_rating" => p.blitz         = text.parse().unwrap_or(0),
                         _ => {}
@@ -368,16 +379,16 @@ async fn fide_refresh(
 }
 
 /// Download + parse + write the current FIDE player list.
-/// Uses players_list_xml.zip (the FOA master list) which contains ALL registered
-/// FIDE players, not just those with a standard rating.
-/// Returns the number of players written.
+///
+/// Uses `players_list_xml.zip` — the combined FOA master list with ALL ~1.8M
+/// registered players including their standard, rapid, and blitz ratings.
+/// Unrated players are stored with zero ratings.
 async fn fide_ratings_import_once(db: Arc<Database>) -> Result<usize, String> {
     use crate::model::{FideFlag, FidePlayer, FideRatingKey, FideRatingSnapshot};
     use std::io::Read as _;
     use ::time::OffsetDateTime;
 
-    const FIDE_URL: &str =
-        "https://ratings.fide.com/download/players_list_xml.zip";
+    const URL: &str = "https://ratings.fide.com/download/players_list_xml.zip";
 
     let client = reqwest::Client::builder()
         .user_agent("caissify-explorer/fide-updater")
@@ -389,10 +400,10 @@ async fn fide_ratings_import_once(db: Arc<Database>) -> Result<usize, String> {
     let month_str = format!("{}-{:02}", now.year(), u8::from(now.month()));
     let month: Month = month_str.parse().map_err(|e: crate::model::InvalidDate| e.to_string())?;
 
-    log::info!("FIDE: downloading rating list for {month}");
+    log::info!("FIDE: downloading player list for {month}");
 
     let zip_bytes = client
-        .get(FIDE_URL)
+        .get(URL)
         .send()
         .await
         .map_err(|e| e.to_string())?
@@ -416,24 +427,28 @@ async fn fide_ratings_import_once(db: Arc<Database>) -> Result<usize, String> {
         let total = records.len();
         log::info!("FIDE: parsed {total} records — writing…");
 
+        const BATCH_SIZE: usize = 2000;
+        // Log progress every 5% (at least every 10k records).
+        let log_every = ((total / 20).max(10_000) / BATCH_SIZE).max(1);
+
         let fide_db = db.fide();
-        for chunk in records.chunks(500) {
+        let mut written = 0usize;
+        for (batch_idx, chunk) in records.chunks(BATCH_SIZE).enumerate() {
             let mut batch = fide_db.batch();
             for rec in chunk {
                 batch.put_player(&FidePlayer {
-                    fide_id: rec.fide_id,
-                    name: rec.name.clone(),
-                    country: rec.country.clone(),
-                    sex: rec.sex.clone(),
-                    title: rec.title.clone(),
-                    w_title: rec.w_title.clone(),
-                    o_title: rec.o_title.clone(),
-                    foa_title: rec.foa_title.clone(),
+                    fide_id:    rec.fide_id,
+                    name:       rec.name.clone(),
+                    country:    rec.country.clone(),
+                    sex:        rec.sex.clone(),
+                    title:      rec.title.clone(),
+                    w_title:    rec.w_title.clone(),
+                    o_title:    rec.o_title.clone(),
+                    foa_title:  rec.foa_title.clone(),
                     birth_year: rec.birth_year,
                     flag: match rec.flag.as_str() {
                         "inactive" => FideFlag::Inactive,
-                        "active"   => FideFlag::Active,
-                        _          => FideFlag::Unknown,
+                        _          => FideFlag::Active,
                     },
                 });
                 batch.put_rating_snapshot(
@@ -443,12 +458,22 @@ async fn fide_ratings_import_once(db: Arc<Database>) -> Result<usize, String> {
                         rapid:         rec.rapid,
                         blitz:         rec.blitz,
                         games_standard: rec.games_standard,
-                        k_factor:      rec.k_factor,
+                        games_rapid:   rec.games_rapid,
+                        games_blitz:   rec.games_blitz,
+                        k_standard:    rec.k_standard,
+                        k_rapid:       rec.k_rapid,
+                        k_blitz:       rec.k_blitz,
                     },
                 );
             }
             batch.commit().map_err(|e| e.to_string())?;
+            written += chunk.len();
+            if (batch_idx + 1) % log_every == 0 {
+                let pct = written * 100 / total;
+                log::info!("FIDE: writing… {pct}% ({written}/{total})");
+            }
         }
+
         Ok(total)
     })
     .await
@@ -1065,30 +1090,26 @@ async fn fide_player(
                     .expect("get latest fide rating")
                 {
                     let obj = json.as_object_mut().unwrap();
-                    obj.insert(
-                        "standard".into(),
-                        if snap.standard > 0 {
-                            snap.standard.into()
-                        } else {
-                            serde_json::Value::Null
-                        },
-                    );
-                    obj.insert(
-                        "rapid".into(),
-                        if snap.rapid > 0 {
-                            snap.rapid.into()
-                        } else {
-                            serde_json::Value::Null
-                        },
-                    );
-                    obj.insert(
-                        "blitz".into(),
-                        if snap.blitz > 0 {
-                            snap.blitz.into()
-                        } else {
-                            serde_json::Value::Null
-                        },
-                    );
+                    let obj = json.as_object_mut().unwrap();
+                    macro_rules! ins_rating {
+                        ($key:literal, $val:expr) => {
+                            obj.insert($key.into(), if $val > 0 { $val.into() } else { serde_json::Value::Null });
+                        };
+                    }
+                    macro_rules! ins_u {
+                        ($key:literal, $val:expr) => {
+                            obj.insert($key.into(), ($val as u64).into());
+                        };
+                    }
+                    ins_rating!("rating_standard", snap.standard);
+                    ins_u!("games_standard",  snap.games_standard);
+                    ins_u!("k_standard",      snap.k_standard);
+                    ins_rating!("rating_rapid", snap.rapid);
+                    ins_u!("games_rapid",     snap.games_rapid);
+                    ins_u!("k_rapid",         snap.k_rapid);
+                    ins_rating!("rating_blitz", snap.blitz);
+                    ins_u!("games_blitz",     snap.games_blitz);
+                    ins_u!("k_blitz",         snap.k_blitz);
                 }
                 Ok(Json(json))
             }
@@ -1179,7 +1200,15 @@ struct FideImportRecord {
     #[serde(default)]
     games_standard: u16,
     #[serde(default)]
-    k_factor: u8,
+    games_rapid: u16,
+    #[serde(default)]
+    games_blitz: u16,
+    #[serde(default)]
+    k_standard: u8,
+    #[serde(default)]
+    k_rapid: u8,
+    #[serde(default)]
+    k_blitz: u8,
 }
 
 #[serde_as]
@@ -1223,11 +1252,15 @@ async fn fide_import(
             batch.put_player(&player);
 
             let snap = FideRatingSnapshot {
-                standard: rec.standard,
-                rapid: rec.rapid,
-                blitz: rec.blitz,
+                standard:       rec.standard,
+                rapid:          rec.rapid,
+                blitz:          rec.blitz,
                 games_standard: rec.games_standard,
-                k_factor: rec.k_factor,
+                games_rapid:    rec.games_rapid,
+                games_blitz:    rec.games_blitz,
+                k_standard:     rec.k_standard,
+                k_rapid:        rec.k_rapid,
+                k_blitz:        rec.k_blitz,
             };
             batch.put_rating_snapshot(
                 FideRatingKey {

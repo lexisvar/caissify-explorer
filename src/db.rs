@@ -938,37 +938,11 @@ impl FideDatabase<'_> {
         &self,
         fide_id: u32,
     ) -> Result<Option<(Month, FideRatingSnapshot)>, rocksdb::Error> {
-        let lower = FideRatingKey {
-            fide_id,
-            month: Month::min_value(),
-        }
-        .into_bytes();
-        let upper = FideRatingKey::upper_bound(fide_id);
-
-        let mut opt = ReadOptions::default();
-        opt.fill_cache(true);
-        opt.set_iterate_lower_bound(lower);
-        opt.set_iterate_upper_bound(upper);
-
-        let mut iter = self
-            .inner
-            .raw_iterator_cf_opt(self.cf_fide_rating_history, opt);
-        iter.seek_to_last();
-
-        let result = if let Some((key_bytes, value_bytes)) = iter.item() {
-            if key_bytes.len() >= FideRatingKey::SIZE {
-                let month_raw = u16::from_le_bytes([key_bytes[4], key_bytes[5]]);
-                Month::try_from(month_raw)
-                    .ok()
-                    .map(|month| (month, FideRatingSnapshot::read(&mut &value_bytes[..])))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        iter.status().map(|_| result)
+        // Reuse get_rating_history (which handles the prefix-bloom correctly)
+        // and take the last entry.  Players have at most a few months of
+        // history, so the overhead is negligible.
+        let history = self.get_rating_history(fide_id, None, None)?;
+        Ok(history.into_iter().last())
     }
 
     pub fn batch(&self) -> FideBatch<'_> {

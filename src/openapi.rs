@@ -623,21 +623,27 @@ pub fn spec() -> Value {
 
                 "FidePlayer": {
                     "type": "object",
-                    "description": "FIDE player profile. The `standard`, `rapid`, and `blitz` fields are the most recent known ratings, injected from the rating history CF at query time (absent when no snapshot has been imported yet).",
+                    "description": "FIDE player profile. The rating/games/k fields are the most recent known snapshot, injected at query time (absent when no snapshot has been imported yet).",
                     "properties": {
-                        "fide_id":    { "type": "integer", "example": 1503014 },
-                        "name":       { "type": "string",  "example": "Carlsen, Magnus" },
-                        "country":    { "type": "string",  "example": "NOR" },
-                        "sex":        { "type": "string",  "example": "M" },
-                        "title":      { "type": "string",  "example": "GM",  "description": "Open title (GM, IM, FM, CM, NM)" },
-                        "w_title":    { "type": "string",  "example": "WGM", "description": "Women's title (WGM, WIM, WFM, WCM); empty string when not held" },
-                        "o_title":    { "type": "string",  "example": "",   "description": "FIDE Online Arena title; empty string when not held" },
-                        "foa_title":  { "type": "string",  "example": "",   "description": "FOA title; empty string when not held" },
-                        "birth_year": { "type": "integer", "example": 1990 },
-                        "flag":       { "type": "string",  "enum": ["Active", "Inactive", "Unknown"] },
-                        "standard":   { "type": "integer", "nullable": true, "example": 2833, "description": "Most recent standard rating (absent when no snapshot imported)" },
-                        "rapid":      { "type": "integer", "nullable": true, "example": 2850, "description": "Most recent rapid rating (absent when no snapshot imported)" },
-                        "blitz":      { "type": "integer", "nullable": true, "example": 2886, "description": "Most recent blitz rating (absent when no snapshot imported)" }
+                        "fide_id":         { "type": "integer", "example": 1503014 },
+                        "name":            { "type": "string",  "example": "Carlsen, Magnus" },
+                        "country":         { "type": "string",  "example": "NOR" },
+                        "sex":             { "type": "string",  "example": "M" },
+                        "title":           { "type": "string",  "example": "GM",  "description": "Open title (GM, IM, FM, CM, NM)" },
+                        "w_title":         { "type": "string",  "example": "WGM", "description": "Women's title; empty string when not held" },
+                        "o_title":         { "type": "string",  "example": "",   "description": "FIDE Online Arena title; empty string when not held" },
+                        "foa_title":       { "type": "string",  "example": "",   "description": "FOA title; empty string when not held" },
+                        "birth_year":      { "type": "integer", "example": 1990 },
+                        "flag":            { "type": "string",  "enum": ["Active", "Inactive", "Unknown"] },
+                        "rating_standard": { "type": "integer", "nullable": true, "example": 2833 },
+                        "games_standard":  { "type": "integer", "example": 0 },
+                        "k_standard":      { "type": "integer", "example": 10 },
+                        "rating_rapid":    { "type": "integer", "nullable": true, "example": 2850 },
+                        "games_rapid":     { "type": "integer", "example": 0 },
+                        "k_rapid":         { "type": "integer", "example": 20 },
+                        "rating_blitz":    { "type": "integer", "nullable": true, "example": 2886 },
+                        "games_blitz":     { "type": "integer", "example": 0 },
+                        "k_blitz":         { "type": "integer", "example": 20 }
                     },
                     "required": ["fide_id", "name", "country", "flag"]
                 },
@@ -678,7 +684,11 @@ pub fn spec() -> Value {
                                     "rapid":         { "type": "integer" },
                                     "blitz":         { "type": "integer" },
                                     "games_standard":{ "type": "integer" },
-                                    "k_factor":      { "type": "integer" }
+                                    "games_rapid":   { "type": "integer" },
+                                    "games_blitz":   { "type": "integer" },
+                                    "k_standard":    { "type": "integer" },
+                                    "k_rapid":       { "type": "integer" },
+                                    "k_blitz":       { "type": "integer" }
                                 },
                                 "required": ["fide_id", "name", "country"]
                             }

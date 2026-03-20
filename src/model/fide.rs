@@ -137,29 +137,45 @@ pub struct FideRatingSnapshot {
     pub blitz: u16,
     /// Number of games used for standard rating (capped at u16::MAX)
     pub games_standard: u16,
-    /// K-factor for standard (13, 20, or 40)
-    pub k_factor: u8,
+    /// Number of games used for rapid rating
+    pub games_rapid: u16,
+    /// Number of games used for blitz rating
+    pub games_blitz: u16,
+    /// K-factor for standard rating (10, 20, or 40)
+    pub k_standard: u8,
+    /// K-factor for rapid rating
+    pub k_rapid: u8,
+    /// K-factor for blitz rating
+    pub k_blitz: u8,
 }
 
 impl FideRatingSnapshot {
-    pub const SIZE: usize = 2 + 2 + 2 + 2 + 1; // 9
+    pub const SIZE: usize = 2 + 2 + 2 + 2 + 2 + 2 + 1 + 1 + 1; // 15
 
     pub fn write<B: BufMut>(&self, buf: &mut B) {
         buf.put_u16_le(self.standard);
         buf.put_u16_le(self.rapid);
         buf.put_u16_le(self.blitz);
         buf.put_u16_le(self.games_standard);
-        buf.put_u8(self.k_factor);
+        buf.put_u16_le(self.games_rapid);
+        buf.put_u16_le(self.games_blitz);
+        buf.put_u8(self.k_standard);
+        buf.put_u8(self.k_rapid);
+        buf.put_u8(self.k_blitz);
     }
 
     pub fn read<B: Buf>(buf: &mut B) -> FideRatingSnapshot {
-        FideRatingSnapshot {
-            standard: buf.get_u16_le(),
-            rapid: buf.get_u16_le(),
-            blitz: buf.get_u16_le(),
-            games_standard: buf.get_u16_le(),
-            k_factor: buf.get_u8(),
-        }
+        // Tolerant of the old 9-byte format that predates games_rapid/blitz and k_rapid/blitz.
+        let standard       = if buf.remaining() >= 2 { buf.get_u16_le() } else { 0 };
+        let rapid          = if buf.remaining() >= 2 { buf.get_u16_le() } else { 0 };
+        let blitz          = if buf.remaining() >= 2 { buf.get_u16_le() } else { 0 };
+        let games_standard = if buf.remaining() >= 2 { buf.get_u16_le() } else { 0 };
+        let games_rapid    = if buf.remaining() >= 2 { buf.get_u16_le() } else { 0 };
+        let games_blitz    = if buf.remaining() >= 2 { buf.get_u16_le() } else { 0 };
+        let k_standard     = if buf.remaining() >= 1 { buf.get_u8()     } else { 0 };
+        let k_rapid        = if buf.remaining() >= 1 { buf.get_u8()     } else { 0 };
+        let k_blitz        = if buf.remaining() >= 1 { buf.get_u8()     } else { 0 };
+        FideRatingSnapshot { standard, rapid, blitz, games_standard, games_rapid, games_blitz, k_standard, k_rapid, k_blitz }
     }
 }
 
