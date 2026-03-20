@@ -1090,7 +1090,6 @@ async fn fide_player(
                     .expect("get latest fide rating")
                 {
                     let obj = json.as_object_mut().unwrap();
-                    let obj = json.as_object_mut().unwrap();
                     macro_rules! ins_rating {
                         ($key:literal, $val:expr) => {
                             obj.insert($key.into(), if $val > 0 { $val.into() } else { serde_json::Value::Null });
@@ -1366,6 +1365,10 @@ struct CaissifyGamesQuery {
     min_rating: Option<u16>,
     /// Maximum rating of either player.
     max_rating: Option<u16>,
+    /// Case-insensitive substring filter on the white player's name.
+    white_player: Option<String>,
+    /// Case-insensitive substring filter on the black player's name.
+    black_player: Option<String>,
     /// Optional position filter: FEN + UCI moves to play. When provided the
     /// response is drawn from the position index (up to 15 top games) instead
     /// of the date index, and `next_page_token` is never returned.
@@ -1437,6 +1440,16 @@ async fn caissify_games(
                 }
                 if let Some(max_r) = q.max_rating {
                     if max_player_rating > max_r {
+                        continue;
+                    }
+                }
+                if let Some(ref wp) = q.white_player {
+                    if !game.players.white.name.to_lowercase().contains(&wp.to_lowercase()) {
+                        continue;
+                    }
+                }
+                if let Some(ref bp) = q.black_player {
+                    if !game.players.black.name.to_lowercase().contains(&bp.to_lowercase()) {
                         continue;
                     }
                 }
@@ -1520,6 +1533,16 @@ async fn caissify_games(
             }
             if let Some(max) = q.max_rating {
                 if max_player_rating > max {
+                    continue;
+                }
+            }
+            if let Some(ref wp) = q.white_player {
+                if !game.players.white.name.to_lowercase().contains(&wp.to_lowercase()) {
+                    continue;
+                }
+            }
+            if let Some(ref bp) = q.black_player {
+                if !game.players.black.name.to_lowercase().contains(&bp.to_lowercase()) {
                     continue;
                 }
             }

@@ -5,6 +5,34 @@ Based on the upstream [lila-openingexplorer](https://github.com/lichess-org/lila
 
 ---
 
+> ## ⚠️ IMPORTANT — Build Environment
+>
+> **Rust / `cargo` is NOT installed on the host machine.**
+> All `cargo` commands (build, check, test, clippy, fmt, …) **must** be run
+> inside the `dev` Docker container, which has the full Rust toolchain.
+>
+> ```bash
+> # Any cargo command — always prefix with this:
+> docker compose --profile dev run --rm dev <cargo command>
+>
+> # Examples:
+> docker compose --profile dev run --rm dev cargo check
+> docker compose --profile dev run --rm dev cargo build --release
+> docker compose --profile dev run --rm dev cargo test
+> docker compose --profile dev run --rm dev cargo clippy
+> docker compose --profile dev run --rm dev cargo fmt
+> ```
+>
+> After a release build, restart the running explorer to load the new binary:
+>
+> ```bash
+> docker compose restart explorer
+> ```
+>
+> **Never run `cargo` directly in a host terminal — it will not be found.**
+
+---
+
 ## Table of Contents
 
 1. [Project Overview](#1-project-overview)
@@ -214,23 +242,21 @@ ulimit -n 131072
 
 ## 6. Building & Running Locally
 
+> **The host has no Rust toolchain.** All `cargo` commands run inside the
+> `dev` Docker container. See the ⚠️ note at the top of this file.
+
 ```bash
-# Source build-time env vars first
-set -a && source .env && set +a
+# 1. Compile a release binary (runs inside the dev container):
+docker compose --profile dev run --rm dev cargo build --release
 
-# Debug build (fast compile, slower runtime)
-cargo run -- --db _db --cors
+# 2. Restart the explorer container to load the new binary:
+docker compose restart explorer
 
-# Release build (required for production performance)
-cargo run --release -- \
-  --db /data \
-  --bind 0.0.0.0:9002 \
-  --cors \
-  --db-compaction-readahead \
-  --db-cache 4294967296
+# Quick dev check (no binary produced — just verifies the code compiles):
+docker compose --profile dev run --rm dev cargo check
 
-# View all options
-cargo run --release -- --help
+# View all CLI options:
+docker compose --profile dev run --rm dev cargo run --release -- --help
 ```
 
 ---
@@ -823,44 +849,46 @@ curl http://localhost:9002/monitor/cf/lichess/rocksdb.estimate-pending-compactio
 
 ## 13. Development Workflows
 
+> **All `cargo` commands must run inside the `dev` container — the host has no Rust toolchain.**
+
+### Reflect code changes in the running explorer
+
+```bash
+# Step 1 — compile
+docker compose --profile dev run --rm dev cargo build --release
+
+# Step 2 — restart the server to load the new binary
+docker compose restart explorer
+```
+
+### Check compilation (fast — no binary)
+
+```bash
+docker compose --profile dev run --rm dev cargo check
+```
+
 ### Run tests
 
 ```bash
-cargo test
+docker compose --profile dev run --rm dev cargo test
 ```
 
 ### Run benchmarks (iai)
 
 ```bash
-cargo bench
+docker compose --profile dev run --rm dev cargo bench
 ```
 
 ### Format code
 
 ```bash
-cargo fmt
+docker compose --profile dev run --rm dev cargo fmt
 ```
 
 ### Lint
 
 ```bash
-cargo clippy
-```
-
-### Check compilation without running
-
-```bash
-set -a && source .env && set +a
-cargo check
-```
-
-### Watch mode (auto-recompile on file change)
-
-```bash
-# Install cargo-watch if not present
-cargo install cargo-watch
-
-cargo watch -x "run -- --db _db --cors"
+docker compose --profile dev run --rm dev cargo clippy
 ```
 
 ### Test a specific endpoint locally
@@ -882,7 +910,8 @@ curl -X POST http://localhost:9002/import/openings
 ### Debug logging
 
 ```bash
-EXPLORER_LOG=caissify_explorer=debug cargo run -- --db _db
+# Set EXPLORER_LOG in docker-compose.yml or pass via environment:
+EXPLORER_LOG=caissify_explorer=debug docker compose up explorer
 ```
 
 ---
