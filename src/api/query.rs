@@ -170,17 +170,17 @@ pub struct PlayerQueryFilter {
 }
 
 #[serde_as]
-#[derive(Deserialize, Clone, Debug, Eq)]
+#[derive(Deserialize, Clone, Debug, Default, Eq)]
 pub struct Play {
     #[serde_as(as = "DisplayFromStr")]
     #[serde(default)]
-    variant: Variant,
+    pub variant: Variant,
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(default)]
-    fen: Option<Fen>,
+    pub fen: Option<Fen>,
     #[serde_as(as = "StringWithSeparator<CommaSeparator, UciMove>")]
     #[serde(default)]
-    play: Vec<UciMove>,
+    pub play: Vec<UciMove>,
 }
 
 impl Hash for Play {

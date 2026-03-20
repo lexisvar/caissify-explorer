@@ -146,6 +146,15 @@ impl MastersEntry {
         }
     }
 
+    /// Returns all game IDs stored in this entry (at most `MAX_MASTERS_GAMES`
+    /// across all move groups — these are the top games kept by the merge operator).
+    pub fn all_game_ids(self) -> Vec<GameId> {
+        self.groups
+            .into_values()
+            .flat_map(|group| group.games.into_iter().map(|(_, id)| id))
+            .collect()
+    }
+
     pub fn write<B: BufMut>(&self, buf: &mut B) {
         let mut top_games: Vec<_> = self
             .groups

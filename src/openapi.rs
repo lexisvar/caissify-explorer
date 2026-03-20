@@ -62,10 +62,13 @@ pub fn spec() -> Value {
                     "description": "Returns a cursor-paginated list of Caissify games sorted by year. Use `next_page_token` from the response to fetch the next page.",
                     "operationId": "listCaissifyGames",
                     "parameters": [
+                        param("fen",         false, "string",  Some("FEN of the position to filter by. When provided, returns games passing through that position (up to 15 top games from the opening index) instead of the full date-sorted list."), None),
+                        param("play",        false, "string",  Some("Comma-separated UCI moves to play from the FEN before filtering"), None),
+                        param("variant",     false, "string",  Some("Variant (default: chess)"), Some(json!("chess"))),
                         param("limit",       false, "integer", Some("Results per page (default 50, max 200)"), Some(json!(50))),
                         param("since",       false, "integer", Some("Earliest year to include (inclusive)"), Some(json!(2020))),
                         param("until",       false, "integer", Some("Latest year to include (inclusive)"), Some(json!(2026))),
-                        param("page_token",  false, "string",  Some("Opaque cursor from a previous response"), None),
+                        param("page_token",  false, "string",  Some("Opaque cursor from a previous response (ignored when fen is set)"), None),
                         param("reverse",     false, "boolean", Some("Return newest games first (default true)"), Some(json!(true))),
                         param("result",      false, "string",  Some("Filter by game result: white, draw, or black"), Some(json!("white"))),
                         param("min_rating",  false, "integer", Some("Minimum max(white_rating, black_rating)"), Some(json!(2700))),
@@ -603,12 +606,22 @@ pub fn spec() -> Value {
 
                 "CaissifyGameListEntry": {
                     "type": "object",
-                    "description": "One entry in a paginated game list",
-                    "allOf": [{ "$ref": "#/components/schemas/CaissifyGameMeta" }],
+                    "description": "One entry in a paginated game list, containing full PGN header fields",
                     "properties": {
-                        "id": { "type": "string", "description": "8-character base-62 game ID", "example": "AbCd1234" }
+                        "id":            { "type": "string",  "description": "8-character base-62 game ID", "example": "AbCd1234" },
+                        "white":         { "type": "string",  "description": "White player name", "example": "Carlsen, Magnus" },
+                        "white_rating":  { "type": "integer", "description": "White player Elo rating (0 = unknown)", "example": 2800 },
+                        "black":         { "type": "string",  "description": "Black player name", "example": "Nepomniachtchi, Ian" },
+                        "black_rating":  { "type": "integer", "description": "Black player Elo rating (0 = unknown)", "example": 2750 },
+                        "event":         { "type": "string",  "description": "Event name", "example": "Candidates 2024" },
+                        "site":          { "type": "string",  "description": "Site or location", "example": "Toronto CAN" },
+                        "date":          { "type": "string",  "description": "Full PGN date (YYYY.MM.DD or partial)", "example": "2024.04.04" },
+                        "round":         { "type": "string",  "description": "Round number or label", "example": "1" },
+                        "result":        { "type": "string",  "enum": ["white", "draw", "black"], "description": "Game result from White's perspective" },
+                        "white_fide_id": { "type": "integer", "nullable": true, "description": "White player FIDE ID (absent if unlinked)" },
+                        "black_fide_id": { "type": "integer", "nullable": true, "description": "Black player FIDE ID (absent if unlinked)" }
                     },
-                    "required": ["id"]
+                    "required": ["id", "white", "white_rating", "black", "black_rating", "event", "site", "date", "round", "result"]
                 },
 
                 "CaissifyGameListResponse": {

@@ -49,8 +49,8 @@ use tokio::{
 use crate::{
     api::{
         CaissifyQuery, Error, ExplorerGame, ExplorerGameWithUciMove, ExplorerMove, ExplorerResponse,
-        HistoryWanted, LichessQuery, MastersQuery, NdJson, PlayPosition, PlayerLimits, PlayerQuery,
-        PlayerQueryFilter, WithSource,
+        HistoryWanted, LichessQuery, MastersQuery, NdJson, Play, PlayPosition, PlayerLimits,
+        PlayerQuery, PlayerQueryFilter, WithSource,
     },
     db::{CacheHint, Database, DbOpt, LichessDatabase},
     indexer::{
@@ -61,7 +61,7 @@ use crate::{
     metrics::Metrics,
     model::{
         CaissifyByDateKey, CaissifyGameMeta, GameId, GameResult, KeyBuilder, KeyPrefix,
-        MastersGame, MastersGameWithId, Month, PreparedMove, UserId, UserName,
+        MastersGame, MastersGameWithId, Month, PreparedMove, UserId, UserName, Year,
     },
     opening::{Opening, Openings},
     util::{DedupStreamExt as _, ply, spawn_blocking},
@@ -1325,9 +1325,14 @@ fn decode_page_token(s: &str) -> Option<CaissifyByDateKey> {
 #[derive(serde::Serialize)]
 struct CaissifyGameListEntry {
     id: String,
-    year: u16,
+    white: String,
     white_rating: u16,
+    black: String,
     black_rating: u16,
+    event: String,
+    site: String,
+    date: String,
+    round: String,
     result: GameResult,
     #[serde(skip_serializing_if = "Option::is_none")]
     white_fide_id: Option<u32>,
@@ -1361,11 +1366,17 @@ struct CaissifyGamesQuery {
     min_rating: Option<u16>,
     /// Maximum rating of either player.
     max_rating: Option<u16>,
+    /// Optional position filter: FEN + UCI moves to play. When provided the
+    /// response is drawn from the position index (up to 15 top games) instead
+    /// of the date index, and `next_page_token` is never returned.
+    #[serde(flatten)]
+    pub position_filter: Play,
 }
 
 #[axum::debug_handler(state = AppState)]
 async fn caissify_games(
     Query(q): Query<CaissifyGamesQuery>,
+    State(openings): State<&'static RwLock<Openings>>,
     State(db): State<Arc<Database>>,
     State(semaphore): State<&'static Semaphore>,
 ) -> Result<Json<CaissifyGameListResponse>, Error> {
@@ -1374,11 +1385,103 @@ async fn caissify_games(
         let since = q.since.unwrap_or(0);
         let until = q.until.unwrap_or(u16::MAX);
         let reverse = q.reverse.unwrap_or(true);
-        let cursor = q.page_token.as_deref().and_then(decode_page_token);
-
-        // Fetch one extra to detect whether a next page exists.
-        let scan_size = limit + 1;
+        let position_filter = q.position_filter;
         let caissify_db = db.caissify();
+
+        // ── Position (FEN) filter path ───────────────────────────────────────
+        // When a FEN or play sequence is provided, look up the position in the
+        // caissify opening index and return the stored top games for it.
+        if position_filter.fen.is_some() || !position_filter.play.is_empty() {
+            let openings_guard = openings.read().expect("read openings");
+            let PlayPosition { pos, .. } = position_filter.position(&openings_guard)?;
+            drop(openings_guard);
+
+            let key = KeyBuilder::caissify()
+                .with_zobrist(pos.variant(), pos.zobrist_hash(EnPassantMode::Legal));
+
+            let ids = caissify_db
+                .read(key, Year::min_value(), Year::max_value(), CacheHint::always())
+                .expect("read caissify entry for position")
+                .all_game_ids();
+
+            let full_games = caissify_db
+                .games(ids.iter().copied())
+                .expect("batch fetch caissify games for position");
+
+            let mut games: Vec<CaissifyGameListEntry> = Vec::new();
+            for (id, maybe_game) in ids.iter().zip(full_games.iter()) {
+                let Some(meta) = caissify_db
+                    .game_meta(*id)
+                    .expect("get caissify game meta")
+                else {
+                    continue;
+                };
+                let Some(game) = maybe_game.as_ref() else {
+                    continue;
+                };
+
+                // Apply all filters post-hoc.
+                if meta.year < since || meta.year > until {
+                    continue;
+                }
+                if let Some(rf) = q.result {
+                    if meta.result != rf {
+                        continue;
+                    }
+                }
+                let max_player_rating = meta.white_rating.max(meta.black_rating);
+                if let Some(min_r) = q.min_rating {
+                    if max_player_rating < min_r {
+                        continue;
+                    }
+                }
+                if let Some(max_r) = q.max_rating {
+                    if max_player_rating > max_r {
+                        continue;
+                    }
+                }
+
+                games.push(CaissifyGameListEntry {
+                    id: id.to_string(),
+                    white: game.players.white.name.clone(),
+                    white_rating: meta.white_rating,
+                    black: game.players.black.name.clone(),
+                    black_rating: meta.black_rating,
+                    event: game.event.clone(),
+                    site: game.site.clone(),
+                    date: game.date.to_string(),
+                    round: game.round.clone(),
+                    result: meta.result,
+                    white_fide_id: if meta.white_fide_id == 0 {
+                        None
+                    } else {
+                        Some(meta.white_fide_id)
+                    },
+                    black_fide_id: if meta.black_fide_id == 0 {
+                        None
+                    } else {
+                        Some(meta.black_fide_id)
+                    },
+                });
+            }
+
+            // Sort newest-first (or oldest-first if reverse=false).
+            if reverse {
+                games.sort_by(|a, b| b.date.cmp(&a.date));
+            } else {
+                games.sort_by(|a, b| a.date.cmp(&b.date));
+            }
+            games.truncate(limit);
+
+            return Ok(Json(CaissifyGameListResponse {
+                games,
+                next_page_token: None,
+            }));
+        }
+
+        // ── Date-index path (default, cursor-paginated) ──────────────────────
+        let cursor = q.page_token.as_deref().and_then(decode_page_token);
+        let scan_size = limit + 1;
         let keys = caissify_db
             .iter_by_date(since, until, cursor, scan_size, reverse)
             .expect("iter caissify by date");
@@ -1386,12 +1489,20 @@ async fn caissify_games(
         let has_more = keys.len() > limit;
         let page_keys = &keys[..keys.len().min(limit)];
 
+        // Batch-fetch full game records for the page in a single RocksDB multi-get.
+        let full_games = caissify_db
+            .games(page_keys.iter().map(|k| k.id))
+            .expect("batch fetch caissify games");
+
         let mut games: Vec<CaissifyGameListEntry> = Vec::with_capacity(page_keys.len());
-        for key in page_keys {
+        for (key, maybe_game) in page_keys.iter().zip(full_games.iter()) {
             let Some(meta) = caissify_db
                 .game_meta(key.id)
                 .expect("get caissify game meta")
             else {
+                continue;
+            };
+            let Some(game) = maybe_game.as_ref() else {
                 continue;
             };
 
@@ -1415,9 +1526,14 @@ async fn caissify_games(
 
             games.push(CaissifyGameListEntry {
                 id: key.id.to_string(),
-                year: meta.year,
+                white: game.players.white.name.clone(),
                 white_rating: meta.white_rating,
+                black: game.players.black.name.clone(),
                 black_rating: meta.black_rating,
+                event: game.event.clone(),
+                site: game.site.clone(),
+                date: game.date.to_string(),
+                round: game.round.clone(),
                 result: meta.result,
                 white_fide_id: if meta.white_fide_id == 0 {
                     None
