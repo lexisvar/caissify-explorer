@@ -62,13 +62,13 @@ pub fn spec() -> Value {
                     "description": "Returns a cursor-paginated list of Caissify games sorted by year. Use `next_page_token` from the response to fetch the next page.",
                     "operationId": "listCaissifyGames",
                     "parameters": [
-                        param("fen",         false, "string",  Some("FEN of the position to filter by. When provided, returns games passing through that position (up to 15 top games from the opening index) instead of the full date-sorted list."), None),
+                        param("fen",         false, "string",  Some("FEN of the position to filter by. When provided, returns all games through that position from the `caissify_game_by_position` index with full cursor-based pagination (no game cap)."), None),
                         param("play",        false, "string",  Some("Comma-separated UCI moves to play from the FEN before filtering"), None),
                         param("variant",     false, "string",  Some("Variant (default: chess)"), Some(json!("chess"))),
                         param("limit",       false, "integer", Some("Results per page (default 50, max 200)"), Some(json!(50))),
                         param("since",       false, "integer", Some("Earliest year to include (inclusive)"), Some(json!(2020))),
                         param("until",       false, "integer", Some("Latest year to include (inclusive)"), Some(json!(2026))),
-                        param("page_token",  false, "string",  Some("Opaque cursor from a previous response (ignored when fen is set)"), None),
+                        param("page_token",  false, "string",  Some("Opaque cursor from a previous response. Supported for all three query paths (date, fide, and position)."), None),
                         param("reverse",     false, "boolean", Some("Return newest games first (default true)"), Some(json!(true))),
                         param("result",      false, "string",  Some("Filter by game result: white, draw, or black"), Some(json!("white"))),
                         param("min_rating",  false, "integer", Some("Minimum max(white_rating, black_rating)"), Some(json!(2700))),
@@ -425,6 +425,46 @@ pub fn spec() -> Value {
                     "responses": {
                         "200": { "description": "Number of games reindexed" },
                         "500": { "description": "Reindex failed — check server logs" }
+                    }
+                }
+            },
+
+            "/import/caissify/reindex-position": {
+                "post": {
+                    "tags": ["Import"],
+                    "summary": "Backfill the position → game index",
+                    "description": "Cursor-resumable backfill for the `caissify_game_by_position` column family.\n\nReplays all existing Caissify games to write one entry per unique position visited per game. Required once after upgrading to Phase 6 so that `GET /caissify/games?fen=` can return fully paginated results.\n\nSafe to run multiple times (puts are idempotent). Pass `next_cursor` from the response to continue the pass in subsequent calls.",
+                    "operationId": "caissifyReindexPosition",
+                    "requestBody": {
+                        "required": false,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "batch": { "type": "integer", "description": "Games to process per call (default 2000, max 20000)", "example": 2000 },
+                                        "cursor": { "type": "string", "description": "Opaque cursor from a previous response to resume the pass" }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Batch result",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "processed":      { "type": "integer", "description": "Games processed in this batch" },
+                                            "entries_written": { "type": "integer", "description": "Position index entries written" },
+                                            "next_cursor":    { "type": "string", "nullable": true, "description": "Cursor for the next batch; null when complete" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             },

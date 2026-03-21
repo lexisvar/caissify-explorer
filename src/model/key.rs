@@ -70,6 +70,15 @@ pub struct KeyPrefix {
 impl KeyPrefix {
     pub const SIZE: usize = 12;
 
+    /// Return the 12 significant bytes of this prefix as a fixed-size array.
+    /// Used to build `CaissifyByPositionKey` without exposing the internal
+    /// 16-byte representation.
+    pub fn key_bytes(&self) -> [u8; KeyPrefix::SIZE] {
+        let mut out = [0u8; KeyPrefix::SIZE];
+        out.copy_from_slice(&self.prefix[..KeyPrefix::SIZE]);
+        out
+    }
+
     pub fn with_month(&self, month: Month) -> Key {
         let mut buf = [0; Key::SIZE];
         buf[..KeyPrefix::SIZE].clone_from_slice(&self.prefix[..KeyPrefix::SIZE]);

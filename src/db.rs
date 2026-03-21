@@ -10,10 +10,10 @@ use rocksdb::{
 use crate::{
     api::{HistoryWanted, LichessQueryFilter, Limits},
     model::{
-        CaissifyByDateKey, CaissifyByFideKey, CaissifyGameMeta, FideNameIndex, FidePlayer,
-        FideRatingKey, FideRatingSnapshot, GameId, History, HistoryBuilder, Key, KeyPrefix,
-        LichessEntry, LichessGame, MastersEntry, MastersGame, Month, PlayerEntry, PlayerStatus,
-        PreparedResponse, UserId, Year,
+        CaissifyByDateKey, CaissifyByFideKey, CaissifyByPositionKey, CaissifyGameMeta,
+        FideNameIndex, FidePlayer, FideRatingKey, FideRatingSnapshot, GameId, History,
+        HistoryBuilder, Key, KeyPrefix, LichessEntry, LichessGame, MastersEntry, MastersGame,
+        Month, PlayerEntry, PlayerStatus, PreparedResponse, UserId, Year,
     },
 };
 // Re-export so callers don't need to import from model
@@ -280,6 +280,18 @@ impl Database {
                     cache: &cache,
                 }
                 .descriptor(),
+                // Secondary index: position → games
+                // Key: [12-byte KeyPrefix][2-byte Year LE][6-byte GameId]
+                // Value: empty (GameId is embedded in the key)
+                // Prefix extractor: 12 bytes (same KeyPrefix as `caissify` CF)
+                // One entry per unique position per game (~40/game).
+                Column {
+                    name: "caissify_game_by_position",
+                    prefix: Some(12), // 12-byte KeyPrefix
+                    merge: None,
+                    cache: &cache,
+                }
+                .descriptor(),
                 // FIDE player database
                 Column {
                     name: "fide_player",
@@ -382,6 +394,10 @@ impl Database {
                 .inner
                 .cf_handle("caissify_game_by_fide")
                 .expect("cf caissify_game_by_fide"),
+            cf_caissify_game_by_position: self
+                .inner
+                .cf_handle("caissify_game_by_position")
+                .expect("cf caissify_game_by_position"),
         }
     }
 }
@@ -536,6 +552,7 @@ pub struct CaissifyDatabase<'a> {
     cf_caissify_game_meta: &'a ColumnFamily,
     cf_caissify_game_by_date: &'a ColumnFamily,
     cf_caissify_game_by_fide: &'a ColumnFamily,
+    cf_caissify_game_by_position: &'a ColumnFamily,
 }
 
 pub struct CaissifyMetrics {
@@ -544,6 +561,7 @@ pub struct CaissifyMetrics {
     num_caissify_game_meta: u64,
     num_caissify_game_by_date: u64,
     pub num_caissify_game_by_fide: u64,
+    pub num_caissify_game_by_position: u64,
 }
 
 impl CaissifyMetrics {
@@ -554,6 +572,10 @@ impl CaissifyMetrics {
             format!("caissify_game_meta={}u", self.num_caissify_game_meta),
             format!("caissify_game_by_date={}u", self.num_caissify_game_by_date),
             format!("caissify_game_by_fide={}u", self.num_caissify_game_by_fide),
+            format!(
+                "caissify_game_by_position={}u",
+                self.num_caissify_game_by_position
+            ),
         ]
         .join(",")
     }
@@ -571,6 +593,8 @@ impl CaissifyDatabase<'_> {
         compact_column(self.inner, self.cf_caissify_game_by_date);
         log::info!("running manual compaction for caissify_game_by_fide ...");
         compact_column(self.inner, self.cf_caissify_game_by_fide);
+        log::info!("running manual compaction for caissify_game_by_position ...");
+        compact_column(self.inner, self.cf_caissify_game_by_position);
     }
 
     pub fn estimate_metrics(&self) -> Result<CaissifyMetrics, rocksdb::Error> {
@@ -594,6 +618,10 @@ impl CaissifyDatabase<'_> {
             num_caissify_game_by_fide: self
                 .inner
                 .property_int_value_cf(self.cf_caissify_game_by_fide, ESTIMATE_NUM_KEYS)?
+                .unwrap_or(0),
+            num_caissify_game_by_position: self
+                .inner
+                .property_int_value_cf(self.cf_caissify_game_by_position, ESTIMATE_NUM_KEYS)?
                 .unwrap_or(0),
         })
     }
@@ -926,6 +954,137 @@ impl CaissifyDatabase<'_> {
         iter.status().map(|_| results)
     }
 
+    /// Iterate games through a specific position, sorted by (year, GameId).
+    ///
+    /// Returns up to `limit + 1` `CaissifyByPositionKey` entries (the `+ 1`
+    /// allows the caller to detect whether a next page exists).
+    pub fn iter_by_position(
+        &self,
+        prefix: [u8; 12],
+        since_year: u16,
+        until_year: u16,
+        cursor: Option<CaissifyByPositionKey>,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<CaissifyByPositionKey>, rocksdb::Error> {
+        let want = limit + 1;
+
+        let mut opt = ReadOptions::default();
+        opt.fill_cache(true);
+        let mut iter = self
+            .inner
+            .raw_iterator_cf_opt(self.cf_caissify_game_by_position, opt);
+
+        if reverse {
+            match cursor {
+                Some(c) => {
+                    iter.seek_for_prev(c.into_bytes());
+                    if iter.valid() {
+                        iter.prev();
+                    }
+                }
+                None => {
+                    iter.seek_for_prev(CaissifyByPositionKey::upper_bound_sentinel(
+                        prefix, until_year,
+                    ));
+                }
+            }
+        } else {
+            match cursor {
+                Some(c) => {
+                    iter.seek(c.into_bytes());
+                    if iter.valid() {
+                        iter.next();
+                    }
+                }
+                None => {
+                    iter.seek(CaissifyByPositionKey::lower_bound(prefix, since_year));
+                }
+            }
+        }
+
+        let mut results = Vec::with_capacity(want);
+
+        loop {
+            if results.len() >= want {
+                break;
+            }
+            let Some(key_bytes) = iter.key() else {
+                break;
+            };
+            if key_bytes.len() < CaissifyByPositionKey::SIZE {
+                break;
+            }
+            let entry = CaissifyByPositionKey::read(&mut &key_bytes[..]);
+            // Stop if we've drifted outside this position's key space.
+            if entry.prefix != prefix {
+                break;
+            }
+            if reverse {
+                if entry.year < since_year {
+                    break;
+                }
+                if entry.year <= until_year {
+                    results.push(entry);
+                }
+                iter.prev();
+            } else {
+                if entry.year > until_year {
+                    break;
+                }
+                if entry.year >= since_year {
+                    results.push(entry);
+                }
+                iter.next();
+            }
+        }
+
+        iter.status().map(|_| results)
+    }
+
+    /// Cursor-paginated scan over the raw game store (`caissify_game` CF).
+    ///
+    /// Returns up to `limit` `(GameId, MastersGame)` pairs starting
+    /// *exclusively* after `cursor`. Used by the position backfill pass.
+    pub fn iter_games_from(
+        &self,
+        cursor: Option<GameId>,
+        limit: usize,
+    ) -> Result<Vec<(GameId, MastersGame)>, rocksdb::Error> {
+        let mut opt = ReadOptions::default();
+        opt.fill_cache(false); // back-fill scan — don't pollute the cache
+
+        let mut iter = self
+            .inner
+            .raw_iterator_cf_opt(self.cf_caissify_game, opt);
+
+        match cursor {
+            Some(c) => {
+                iter.seek(c.to_bytes());
+                if iter.valid() {
+                    iter.next();
+                }
+            }
+            None => iter.seek_to_first(),
+        }
+
+        let mut results = Vec::with_capacity(limit);
+        while results.len() < limit {
+            let Some((key_bytes, value_bytes)) = iter.item() else {
+                break;
+            };
+            if key_bytes.len() == GameId::SIZE {
+                let id = GameId::read(&mut &key_bytes[..]);
+                let game: MastersGame =
+                    serde_json::from_slice(value_bytes).expect("deserialize caissify game");
+                results.push((id, game));
+            }
+            iter.next();
+        }
+
+        iter.status().map(|_| results)
+    }
+
     /// Iterate `caissify_game_meta` records starting (exclusively) from
     /// `cursor`, returning up to `limit` `(GameId, CaissifyGameMeta)` pairs.
     ///
@@ -1022,6 +1181,18 @@ impl CaissifyBatch<'_> {
             self.db.cf_caissify_game_by_fide,
             key.into_bytes(),
             [is_black as u8],
+        );
+    }
+
+    /// Write a position → game secondary index entry.
+    ///
+    /// One call per unique Zobrist position visited in a game (~40/game).
+    /// Value is empty — the GameId is embedded in the key.
+    pub fn put_by_position(&mut self, key: CaissifyByPositionKey) {
+        self.batch.put_cf(
+            self.db.cf_caissify_game_by_position,
+            key.into_bytes(),
+            [],
         );
     }
 

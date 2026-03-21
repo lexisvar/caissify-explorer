@@ -31,10 +31,10 @@ use moka::future::Cache;
 use serde::Deserialize;
 use serde_with::{DisplayFromStr, serde_as};
 use shakmaty::{
-    Color, EnPassantMode, Position as _,
+    Chess, Color, EnPassantMode, Position as _,
     san::{San, SanPlus},
     uci::UciMove,
-    variant::VariantPosition,
+    variant::{Variant, VariantPosition},
 };
 use tikv_jemallocator::Jemalloc;
 use tokio::{
@@ -60,9 +60,9 @@ use crate::{
     lila::{Lila, LilaOpt},
     metrics::Metrics,
     model::{
-        CaissifyByDateKey, CaissifyByFideKey, CaissifyGameMeta, FideNameIndex, GameId, GameResult,
-        KeyBuilder, KeyPrefix, MastersGame, MastersGameWithId, Month, PreparedMove, UserId,
-        UserName, Year,
+        CaissifyByDateKey, CaissifyByFideKey, CaissifyByPositionKey, CaissifyGameMeta,
+        FideNameIndex, GameId, GameResult, KeyBuilder, KeyPrefix, MastersGame, MastersGameWithId,
+        Month, PreparedMove, UserId, UserName,
     },
     opening::{Opening, Openings},
     util::{DedupStreamExt as _, ply, spawn_blocking},
@@ -181,6 +181,7 @@ async fn serve() {
         .route("/import/caissify/pgn-url", post(caissify_pgn_url_import))
         .route("/import/caissify/pgn-url/status", get(caissify_pgn_url_status))
         .route("/import/caissify/reindex", post(caissify_reindex))
+        .route("/import/caissify/reindex-position", post(caissify_reindex_position))
         .route("/import/caissify/fide-link", post(caissify_fide_link))
         .route("/import/fide", put(fide_import))
         .route("/import/fide/refresh", post(fide_refresh))
@@ -1096,6 +1097,108 @@ async fn caissify_reindex(
     .await
 }
 
+/// Request body for `POST /import/caissify/reindex-position`.
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct ReindexPositionRequest {
+    /// Maximum games to process per call. Defaults to 2000.
+    batch: Option<usize>,
+    /// Opaque cursor from a previous response (GameId hex string).
+    cursor: Option<String>,
+}
+
+/// Response from `POST /import/caissify/reindex-position`.
+#[derive(serde::Serialize)]
+struct ReindexPositionResponse {
+    /// Number of games processed in this batch.
+    processed: u64,
+    /// Total position index entries written in this batch.
+    entries_written: u64,
+    /// Cursor for the next batch, or null when complete.
+    next_cursor: Option<String>,
+}
+
+/// Backfill pass for the `caissify_game_by_position` CF.
+///
+/// Iterates games in `caissify_game`, replays moves to collect all unique
+/// positions, and writes one `CaissifyByPositionKey` entry per unique position
+/// per game. Safe to run multiple times (puts are idempotent).
+///
+/// Returns a cursor so the pass can be resumed in subsequent HTTP calls.
+#[axum::debug_handler(state = AppState)]
+async fn caissify_reindex_position(
+    State(db): State<Arc<Database>>,
+    State(semaphore): State<&'static Semaphore>,
+    body: Option<Json<ReindexPositionRequest>>,
+) -> Json<ReindexPositionResponse> {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let batch_size = req.batch.unwrap_or(2000).min(20_000);
+    let cursor: Option<GameId> = req.cursor.as_deref().and_then(|s| s.parse().ok());
+
+    spawn_blocking(semaphore, move || {
+        let caissify_db = db.caissify();
+        let games = caissify_db
+            .iter_games_from(cursor, batch_size)
+            .expect("iter games for position reindex");
+
+        let last_id = games.last().map(|(id, _)| *id);
+        let total = games.len();
+        let mut entries_written = 0u64;
+
+        for (id, game) in &games {
+            let year = u16::from(game.date.year());
+            let mut pos = Chess::default();
+            let mut seen: std::collections::HashSet<[u8; 12]> =
+                std::collections::HashSet::with_capacity(64);
+
+            let mut batch = caissify_db.batch();
+
+            for uci in &game.moves {
+                let zobrist = pos.zobrist_hash(EnPassantMode::Legal);
+                let key_prefix =
+                    KeyBuilder::caissify().with_zobrist(Variant::Chess, zobrist);
+                let prefix_bytes = key_prefix.key_bytes();
+
+                if seen.insert(prefix_bytes) {
+                    batch.put_by_position(CaissifyByPositionKey {
+                        prefix: prefix_bytes,
+                        year,
+                        id: *id,
+                    });
+                    entries_written += 1;
+                }
+
+                match uci.to_move(&pos) {
+                    Ok(m) => pos.play_unchecked(m),
+                    Err(_) => break, // malformed move — stop replaying this game
+                }
+            }
+
+            batch.commit().expect("commit position reindex batch");
+        }
+
+        let next_cursor = if total == batch_size {
+            last_id.map(|id| id.to_string())
+        } else {
+            None
+        };
+
+        Ok::<_, Error>(Json(ReindexPositionResponse {
+            processed: total as u64,
+            entries_written,
+            next_cursor,
+        }))
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Json(ReindexPositionResponse {
+            processed: 0,
+            entries_written: 0,
+            next_cursor: None,
+        })
+    })
+}
+
 // ─── FIDE endpoints ───────────────────────────────────────────────────────────
 
 #[axum::debug_handler(state = AppState)]
@@ -1324,6 +1427,34 @@ async fn caissify_pgn(
 
 // ─── Paginated game list ──────────────────────────────────────────────────────
 
+/// Encode a 20-byte CaissifyByPositionKey as a 40-char lowercase hex string.
+fn encode_position_page_token(key: CaissifyByPositionKey) -> String {
+    let bytes = key.into_bytes();
+    bytes.iter().fold(String::with_capacity(40), |mut s, b| {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// Decode a 40-char position page token.  Validates that the embedded prefix
+/// matches `expected_prefix` to prevent cross-position token reuse.
+fn decode_position_page_token(
+    s: &str,
+    expected_prefix: &[u8; 12],
+) -> Option<CaissifyByPositionKey> {
+    if s.len() != 40 {
+        return None;
+    }
+    let mut bytes = [0u8; CaissifyByPositionKey::SIZE];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        let hex_str = std::str::from_utf8(chunk).ok()?;
+        bytes[i] = u8::from_str_radix(hex_str, 16).ok()?;
+    }
+    let key = CaissifyByPositionKey::read(&mut bytes.as_slice());
+    (&key.prefix == expected_prefix).then_some(key)
+}
+
 /// Encode an 8-byte CaissifyByDateKey as a 16-char lowercase hex string.
 fn encode_page_token(key: CaissifyByDateKey) -> String {
     let bytes = key.into_bytes();
@@ -1425,8 +1556,8 @@ struct CaissifyGamesQuery {
     /// `"white"` or `"black"`.  Omit for both colours.
     color: Option<String>,
     /// Optional position filter: FEN + UCI moves to play. When provided the
-    /// response is drawn from the position index (up to 15 top games) instead
-    /// of the date index, and `next_page_token` is never returned.
+    /// response uses the `caissify_game_by_position` CF for full paginated
+    /// iteration over all games through that position (with `next_page_token`).
     #[serde(flatten)]
     pub position_filter: Play,
 }
@@ -1447,59 +1578,68 @@ async fn caissify_games(
         let caissify_db = db.caissify();
 
         // ── Position (FEN) filter path ───────────────────────────────────────
-        // When a FEN or play sequence is provided, look up the position in the
-        // caissify opening index and return the stored top games for it.
+        // When a FEN or play sequence is provided, look up all games through
+        // that position using the `caissify_game_by_position` CF.  This gives
+        // fully paginated results (no 15-game cap) with cursor support.
         if position_filter.fen.is_some() || !position_filter.play.is_empty() {
             let openings_guard = openings.read().expect("read openings");
             let PlayPosition { pos, .. } = position_filter.position(&openings_guard)?;
             drop(openings_guard);
 
-            let key = KeyBuilder::caissify()
+            let key_prefix_obj = KeyBuilder::caissify()
                 .with_zobrist(pos.variant(), pos.zobrist_hash(EnPassantMode::Legal));
+            let prefix_bytes = key_prefix_obj.key_bytes();
 
-            let ids = caissify_db
-                .read(key, Year::min_value(), Year::max_value(), CacheHint::always())
-                .expect("read caissify entry for position")
-                .all_game_ids();
+            let cursor = q
+                .page_token
+                .as_deref()
+                .and_then(|s| decode_position_page_token(s, &prefix_bytes));
+
+            let scan_size = limit + 1;
+
+            let pos_keys = caissify_db
+                .iter_by_position(prefix_bytes, since, until, cursor, scan_size, reverse)
+                .expect("iter caissify by position");
+
+            let has_more = pos_keys.len() > limit;
+            let page_keys = &pos_keys[..pos_keys.len().min(limit)];
 
             let full_games = caissify_db
-                .games(ids.iter().copied())
+                .games(page_keys.iter().map(|k| k.id))
                 .expect("batch fetch caissify games for position");
 
-            let mut games: Vec<CaissifyGameListEntry> = Vec::new();
-            for (id, maybe_game) in ids.iter().zip(full_games.iter()) {
+            let meta_passes = |meta: &CaissifyGameMeta| -> bool {
+                if let Some(rf) = q.result {
+                    if meta.result != rf {
+                        return false;
+                    }
+                }
+                let max_r = meta.white_rating.max(meta.black_rating);
+                if q.min_rating.is_some_and(|m| max_r < m) {
+                    return false;
+                }
+                if q.max_rating.is_some_and(|m| max_r > m) {
+                    return false;
+                }
+                true
+            };
+
+            let mut games: Vec<CaissifyGameListEntry> = Vec::with_capacity(limit);
+            for (key, maybe_game) in page_keys.iter().zip(full_games.iter()) {
                 let Some(meta) = caissify_db
-                    .game_meta(*id)
-                    .expect("get caissify game meta")
+                    .game_meta(key.id)
+                    .expect("get caissify game meta for position")
                 else {
                     continue;
                 };
                 let Some(game) = maybe_game.as_ref() else {
                     continue;
                 };
-
-                // Apply all filters post-hoc.
-                if meta.year < since || meta.year > until {
+                if !meta_passes(&meta) {
                     continue;
                 }
-                if let Some(rf) = q.result {
-                    if meta.result != rf {
-                        continue;
-                    }
-                }
-                let max_player_rating = meta.white_rating.max(meta.black_rating);
-                if let Some(min_r) = q.min_rating {
-                    if max_player_rating < min_r {
-                        continue;
-                    }
-                }
-                if let Some(max_r) = q.max_rating {
-                    if max_player_rating > max_r {
-                        continue;
-                    }
-                }
                 games.push(CaissifyGameListEntry {
-                    id: id.to_string(),
+                    id: key.id.to_string(),
                     white: game.players.white.name.clone(),
                     white_rating: meta.white_rating,
                     black: game.players.black.name.clone(),
@@ -1522,17 +1662,17 @@ async fn caissify_games(
                 });
             }
 
-            // Sort newest-first (or oldest-first if reverse=false).
-            if reverse {
-                games.sort_by(|a, b| b.date.cmp(&a.date));
+            let next_page_token = if has_more {
+                page_keys
+                    .last()
+                    .map(|k| encode_position_page_token(*k))
             } else {
-                games.sort_by(|a, b| a.date.cmp(&b.date));
-            }
-            games.truncate(limit);
+                None
+            };
 
             return Ok(Json(CaissifyGameListResponse {
                 games,
-                next_page_token: None,
+                next_page_token,
             }));
         }
 

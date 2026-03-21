@@ -10,8 +10,8 @@ use crate::{
     api::Error,
     db::Database,
     model::{
-        CaissifyByDateKey, CaissifyByFideKey, CaissifyGameMeta, FideNameIndex, GameResult,
-        KeyBuilder, LaxDate, MastersEntry, MastersGameWithId,
+        CaissifyByDateKey, CaissifyByFideKey, CaissifyByPositionKey, CaissifyGameMeta,
+        FideNameIndex, GameResult, KeyBuilder, LaxDate, MastersEntry, MastersGameWithId,
     },
     zobrist::StableZobrist128,
 };
@@ -133,10 +133,11 @@ impl CaissifyImporter {
         }
 
         for (key, (uci, turn)) in without_loops {
+            let key_prefix = KeyBuilder::caissify().with_zobrist(Variant::Chess, key);
+
+            // Opening-stats merge (pre-aggregated, top-N per position)
             batch.merge(
-                KeyBuilder::caissify()
-                    .with_zobrist(Variant::Chess, key)
-                    .with_year(body.game.date.year()),
+                key_prefix.with_year(body.game.date.year()),
                 MastersEntry::new_single(
                     uci,
                     body.id,
@@ -145,6 +146,13 @@ impl CaissifyImporter {
                     body.game.players.get(!turn).rating,
                 ),
             );
+
+            // Full position index (one entry per unique position per game)
+            batch.put_by_position(CaissifyByPositionKey {
+                prefix: key_prefix.key_bytes(),
+                year,
+                id: body.id,
+            });
         }
 
         batch.commit().expect("commit caissify game");

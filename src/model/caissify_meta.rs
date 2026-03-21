@@ -183,3 +183,68 @@ impl CaissifyByFideKey {
         .into_bytes()
     }
 }
+
+// ─── CaissifyByPositionKey ────────────────────────────────────────────────────
+
+/// Key for the `caissify_game_by_position` column family.
+///
+/// Layout (20 bytes): [12-byte KeyPrefix][2-byte Year LE][6-byte GameId LE]
+///
+/// Prefix extractor: 12 bytes (same KeyPrefix as the `caissify` opening-stats
+/// CF). This enables bloom-filter-accelerated per-position seeks and efficient
+/// year-range scans, plus cursor-based pagination over all games through a
+/// given position.
+///
+/// Value: empty (GameId is embedded in the key; year is kept for sorting).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaissifyByPositionKey {
+    /// First 12 bytes of a `KeyPrefix` (from `KeyPrefix::key_bytes()`).
+    pub prefix: [u8; 12], // 12 = KeyPrefix::SIZE
+    pub year: u16,
+    pub id: GameId,
+}
+
+impl CaissifyByPositionKey {
+    pub const SIZE: usize = 12 + 2 + GameId::SIZE; // 20
+
+    pub fn write<B: BufMut>(&self, buf: &mut B) {
+        buf.put_slice(&self.prefix);
+        buf.put_u16_le(self.year);
+        self.id.write(buf);
+    }
+
+    pub fn into_bytes(self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        self.write(&mut &mut buf[..]);
+        buf
+    }
+
+    pub fn read<B: bytes::Buf>(buf: &mut B) -> CaissifyByPositionKey {
+        let mut prefix = [0u8; 12];
+        buf.copy_to_slice(&mut prefix);
+        let year = buf.get_u16_le();
+        let id = GameId::read(buf);
+        CaissifyByPositionKey { prefix, year, id }
+    }
+
+    /// First key for this position at or after `since_year`.
+    pub fn lower_bound(prefix: [u8; 12], since_year: u16) -> [u8; Self::SIZE] {
+        CaissifyByPositionKey {
+            prefix,
+            year: since_year,
+            id: GameId::MIN,
+        }
+        .into_bytes()
+    }
+
+    /// Exclusive upper-bound sentinel for all keys with this position and
+    /// year ≤ `until_year`. Used with `seek_for_prev`.
+    pub fn upper_bound_sentinel(prefix: [u8; 12], until_year: u16) -> [u8; Self::SIZE] {
+        CaissifyByPositionKey {
+            prefix,
+            year: until_year.saturating_add(1),
+            id: GameId::MIN,
+        }
+        .into_bytes()
+    }
+}

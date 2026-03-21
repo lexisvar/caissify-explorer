@@ -493,6 +493,84 @@ These are non-breaking internal changes that all subsequent features depend on.
 - [ ] Stress test the paginated endpoint with cursor pagination depth > 10,000 records.
 - [ ] Load test FIDE name index lookup under concurrent import pressure.
 
+### Phase 6 — Position-based Paginated Game List (~2–3 days)
+
+**Problem**: `GET /caissify/games?fen=` currently returns at most 15 games (the `MAX_MASTERS_GAMES` cap) with no pagination. This is because the `caissify` opening-stats CF stores only a compact top-N list per position — it is a write-time aggregation designed for the explorer, not a full game index.
+
+**Approach**: Add a dedicated `caissify_game_by_position` secondary index CF that stores one entry per (position, game) pair, enabling true cursor-paginated listing of every game that passed through a given position.
+
+#### Why the same endpoint, no breaking changes
+
+The response shape (`games[]`, `next_page_token`) is identical to the non-FEN path. Existing clients get more results automatically and can follow `next_page_token` if they want. The endpoint URL and all existing parameters remain unchanged.
+
+#### Storage Design
+
+```
+CF: caissify_game_by_position
+Key:   [12-byte KeyPrefix][2-byte Year LE][6-byte GameId]  (20 bytes)
+Value: [] (empty — 0 bytes)
+Prefix extractor: 12 bytes (KeyPrefix = Zobrist + variant mask, identical to the caissify CF)
+```
+
+`KeyPrefix` is the exact same 12-byte value already computed during import for the `caissify` CF merge. No new hashing is required — reuse `KeyBuilder::caissify().with_zobrist(variant, zobrist)` for every position in the game.
+
+Including `Year` in the key enables efficient year-range filtering via start/end key scans without touching `caissify_game_meta` for every entry. Including `GameId` as the last component gives a unique key per game and acts as the cursor.
+
+#### Write amplification analysis
+
+| Writes per game | Before | After |
+|---|---|---|
+| Full game body (`caissify_game`) | 1 | 1 |
+| Compact metadata (`caissify_game_meta`) | 1 | 1 |
+| Date index (`caissify_game_by_date`) | 1 | 1 |
+| FIDE index (`caissify_game_by_fide`) | 0–2 | 0–2 |
+| Opening stats merges (`caissify`) | ~40 | ~40 |
+| **Position index puts (`caissify_game_by_position`)** | **0** | **~40** |
+
+Total: ~43–45 writes → ~83–85 writes. The merge ops on `caissify` are already the dominant cost (they require read-modify on compaction). The 40 additional pure `put` ops add roughly the same number of WAL entries but are cheaper than merges at compaction time. Net import speed reduction: **~30–40%**.
+
+#### Disk overhead
+
+Each entry: 20-byte key + 0-byte value = 20 bytes raw, ~5–8 bytes compressed (LZ4 + prefix compression is very effective on sorted keys). At ~40 positions/game × 1M games = 40M entries × ~6 bytes compressed ≈ **~240 MB per million games**.
+
+#### Query path
+
+```
+GET /caissify/games?fen=...&limit=50&since=2024&until=2026&page_token=...
+```
+
+1. Compute position (same as `GET /caissify`) → get `KeyPrefix` (12 bytes, Zobrist + variant).
+2. Build start/end scan keys using `KeyPrefix + Year + GameId::MIN`.
+3. Prefix scan `caissify_game_by_position` with `ReadOptions` prefix = 12 bytes.
+4. Collect `limit + 1` GameIds for has-more detection; encode last key as `next_page_token` (hex of the full 20-byte key).
+5. Batch-fetch `caissify_game_meta` + `caissify_game` for the page (same as existing FEN path, but now for up to 200 games per page instead of 15).
+6. Apply result/rating filters post-fetch (same pattern as date-index path).
+
+Expected latency: **< 5 ms** per page — one O(limit) prefix scan + batch point-gets, all within RocksDB.
+
+#### Backfill endpoint
+
+`POST /import/caissify/reindex-position` — cursor-resumable background pass:
+1. Iterate `caissify_game` CF sequentially (same pattern as `reindex`).
+2. For each game, deserialize moves and replay through shakmaty (CPU-bound — runs in `spawn_blocking`).
+3. For each unique position, write one `caissify_game_by_position` entry.
+4. Commit in batches of ~1000 games.
+5. Return `{ indexed, next_cursor }` — call repeatedly until `next_cursor` is null.
+
+One-time cost for 500K games: approximately 20–60 minutes of CPU on Railway.
+
+#### Implementation checklist
+
+- [ ] Add `caissify_game_by_position` CF descriptor and handle in `src/db.rs`
+- [ ] Add `CaissifyByPositionKey` model type (20 bytes) in `src/model/caissify_meta.rs`
+- [ ] Add `put_by_position(key)` to `CaissifyBatch` in `src/db.rs`
+- [ ] Add `iter_by_position(key_prefix, since, until, cursor, limit, reverse)` to `CaissifyDatabase`
+- [ ] Update `CaissifyImporter`: write position index entries for every unique position in each imported game
+- [ ] Replace the FEN path in `caissify_games` handler: use `iter_by_position` instead of `entry.all_game_ids()` — full pagination support
+- [ ] Add `POST /import/caissify/reindex-position` backfill endpoint
+- [ ] Update OpenAPI spec
+- [ ] Update `CONTEXT.md`
+
 ### Total Estimated Effort
 
 | Phase | Effort | Risk |
@@ -503,6 +581,7 @@ These are non-breaking internal changes that all subsequent features depend on.
 | Phase 3 — Game linking | 3–4 days | Medium (name matching quality) |
 | Phase 4 — Player search | 1–2 days | Low (if prefix only), Medium (if Tantivy) |
 | Phase 5 — Hardening | 1–2 days | Low |
-| **Total** | **11–17 days** | |
+| Phase 6 — Position-based game list | 2–3 days | Low |
+| **Total** | **13–20 days** | |
 
 
