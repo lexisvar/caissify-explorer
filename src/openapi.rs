@@ -75,6 +75,7 @@ pub fn spec() -> Value {
                         param("max_rating",  false, "integer", Some("Maximum max(white_rating, black_rating)"), Some(json!(3000))),
                         param("white_player", false, "string",  Some("Case-insensitive substring filter on the white player's name"), None),
                         param("black_player", false, "string",  Some("Case-insensitive substring filter on the black player's name"), None),
+                        param("player",       false, "string",  Some("Case-insensitive substring filter matching either player (white OR black)"), None),
                     ],
                     "responses": {
                         "200": {

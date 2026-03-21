@@ -1369,6 +1369,8 @@ struct CaissifyGamesQuery {
     white_player: Option<String>,
     /// Case-insensitive substring filter on the black player's name.
     black_player: Option<String>,
+    /// Case-insensitive substring filter matching either player (white OR black).
+    player: Option<String>,
     /// Optional position filter: FEN + UCI moves to play. When provided the
     /// response is drawn from the position index (up to 15 top games) instead
     /// of the date index, and `next_page_token` is never returned.
@@ -1453,6 +1455,14 @@ async fn caissify_games(
                         continue;
                     }
                 }
+                if let Some(ref p) = q.player {
+                    let pl = p.to_lowercase();
+                    if !game.players.white.name.to_lowercase().contains(&pl)
+                        && !game.players.black.name.to_lowercase().contains(&pl)
+                    {
+                        continue;
+                    }
+                }
 
                 games.push(CaissifyGameListEntry {
                     id: id.to_string(),
@@ -1493,94 +1503,214 @@ async fn caissify_games(
         }
 
         // ── Date-index path (default, cursor-paginated) ──────────────────────
-        let cursor = q.page_token.as_deref().and_then(decode_page_token);
-        let scan_size = limit + 1;
-        let keys = caissify_db
-            .iter_by_date(since, until, cursor, scan_size, reverse)
-            .expect("iter caissify by date");
+        let has_name_filter =
+            q.player.is_some() || q.white_player.is_some() || q.black_player.is_some();
 
-        let has_more = keys.len() > limit;
-        let page_keys = &keys[..keys.len().min(limit)];
+        // When name filters are active we cannot know how many date-index entries
+        // we need to scan to fill a page.  Scan in chunks of CHUNK_SIZE, applying
+        // all filters, until we have `limit + 1` matches (the extra one lets us
+        // detect whether a next page exists) or the range is exhausted.
+        // When no name filter is active the fast O(limit) single-fetch path is
+        // used instead.
+        const CHUNK_SIZE: usize = 500;
 
-        // Batch-fetch full game records for the page in a single RocksDB multi-get.
-        let full_games = caissify_db
-            .games(page_keys.iter().map(|k| k.id))
-            .expect("batch fetch caissify games");
+        let initial_cursor = q.page_token.as_deref().and_then(decode_page_token);
 
-        let mut games: Vec<CaissifyGameListEntry> = Vec::with_capacity(page_keys.len());
-        for (key, maybe_game) in page_keys.iter().zip(full_games.iter()) {
-            let Some(meta) = caissify_db
-                .game_meta(key.id)
-                .expect("get caissify game meta")
-            else {
-                continue;
-            };
-            let Some(game) = maybe_game.as_ref() else {
-                continue;
-            };
-
-            // Apply optional filters.
+        // Helper closure: applies all non-name filters that only need `meta`.
+        let meta_passes = |meta: &CaissifyGameMeta| -> bool {
             if let Some(rf) = q.result {
                 if meta.result != rf {
-                    continue;
+                    return false;
                 }
             }
-            let max_player_rating = meta.white_rating.max(meta.black_rating);
-            if let Some(min) = q.min_rating {
-                if max_player_rating < min {
-                    continue;
-                }
+            let max_r = meta.white_rating.max(meta.black_rating);
+            if q.min_rating.is_some_and(|m| max_r < m) {
+                return false;
             }
-            if let Some(max) = q.max_rating {
-                if max_player_rating > max {
-                    continue;
-                }
+            if q.max_rating.is_some_and(|m| max_r > m) {
+                return false;
             }
+            true
+        };
+
+        // Helper closure: applies name filters that need the full game record.
+        let name_passes = |game: &MastersGame| -> bool {
             if let Some(ref wp) = q.white_player {
-                if !game.players.white.name.to_lowercase().contains(&wp.to_lowercase()) {
-                    continue;
+                if !game
+                    .players
+                    .white
+                    .name
+                    .to_lowercase()
+                    .contains(&wp.to_lowercase())
+                {
+                    return false;
                 }
             }
             if let Some(ref bp) = q.black_player {
-                if !game.players.black.name.to_lowercase().contains(&bp.to_lowercase()) {
-                    continue;
+                if !game
+                    .players
+                    .black
+                    .name
+                    .to_lowercase()
+                    .contains(&bp.to_lowercase())
+                {
+                    return false;
                 }
             }
-
-            games.push(CaissifyGameListEntry {
-                id: key.id.to_string(),
-                white: game.players.white.name.clone(),
-                white_rating: meta.white_rating,
-                black: game.players.black.name.clone(),
-                black_rating: meta.black_rating,
-                event: game.event.clone(),
-                site: game.site.clone(),
-                date: game.date.to_string(),
-                round: game.round.clone(),
-                result: meta.result,
-                white_fide_id: if meta.white_fide_id == 0 {
-                    None
-                } else {
-                    Some(meta.white_fide_id)
-                },
-                black_fide_id: if meta.black_fide_id == 0 {
-                    None
-                } else {
-                    Some(meta.black_fide_id)
-                },
-            });
-        }
-
-        let next_page_token = if has_more {
-            page_keys.last().map(|k| encode_page_token(*k))
-        } else {
-            None
+            if let Some(ref p) = q.player {
+                let pl = p.to_lowercase();
+                if !game.players.white.name.to_lowercase().contains(&pl)
+                    && !game.players.black.name.to_lowercase().contains(&pl)
+                {
+                    return false;
+                }
+            }
+            true
         };
 
-        Ok(Json(CaissifyGameListResponse {
-            games,
-            next_page_token,
-        }))
+        let make_entry =
+            |key: &CaissifyByDateKey, meta: &CaissifyGameMeta, game: &MastersGame| {
+                CaissifyGameListEntry {
+                    id: key.id.to_string(),
+                    white: game.players.white.name.clone(),
+                    white_rating: meta.white_rating,
+                    black: game.players.black.name.clone(),
+                    black_rating: meta.black_rating,
+                    event: game.event.clone(),
+                    site: game.site.clone(),
+                    date: game.date.to_string(),
+                    round: game.round.clone(),
+                    result: meta.result,
+                    white_fide_id: if meta.white_fide_id == 0 {
+                        None
+                    } else {
+                        Some(meta.white_fide_id)
+                    },
+                    black_fide_id: if meta.black_fide_id == 0 {
+                        None
+                    } else {
+                        Some(meta.black_fide_id)
+                    },
+                }
+            };
+
+        if has_name_filter {
+            // ── Scan-loop path (name filters active) ──────────────────────────
+            // We need `limit + 1` matches to know if there is a next page.
+            // Scan in CHUNK_SIZE windows; next_page_token = key of the
+            // (limit+1)-th match so pagination resumes correctly.
+            let want = limit + 1;
+            let mut matches: Vec<(CaissifyByDateKey, CaissifyGameListEntry)> =
+                Vec::with_capacity(want);
+            let mut chunk_cursor = initial_cursor;
+
+            'outer: loop {
+                let chunk = caissify_db
+                    .iter_by_date(since, until, chunk_cursor, CHUNK_SIZE, reverse)
+                    .expect("iter caissify by date");
+
+                if chunk.is_empty() {
+                    break;
+                }
+
+                // Only load full game records for keys whose meta passes first.
+                let mut candidate_keys: Vec<CaissifyByDateKey> = Vec::new();
+                let mut candidate_metas: Vec<CaissifyGameMeta> = Vec::new();
+                for key in &chunk {
+                    let Some(meta) = caissify_db
+                        .game_meta(key.id)
+                        .expect("get caissify game meta")
+                    else {
+                        continue;
+                    };
+                    if meta_passes(&meta) {
+                        candidate_keys.push(*key);
+                        candidate_metas.push(meta);
+                    }
+                }
+
+                let full_games = caissify_db
+                    .games(candidate_keys.iter().map(|k| k.id))
+                    .expect("batch fetch caissify games");
+
+                for ((key, meta), maybe_game) in candidate_keys
+                    .iter()
+                    .zip(candidate_metas.iter())
+                    .zip(full_games.iter())
+                {
+                    let Some(game) = maybe_game.as_ref() else {
+                        continue;
+                    };
+                    if name_passes(game) {
+                        matches.push((*key, make_entry(key, meta, game)));
+                        if matches.len() >= want {
+                            break 'outer;
+                        }
+                    }
+                }
+
+                if chunk.len() < CHUNK_SIZE {
+                    break;
+                }
+
+                chunk_cursor = chunk.last().copied();
+            }
+
+            let has_more = matches.len() > limit;
+            let next_page_token = if has_more {
+                matches.get(limit).map(|(k, _)| encode_page_token(*k))
+            } else {
+                None
+            };
+            matches.truncate(limit);
+            let games: Vec<CaissifyGameListEntry> = matches.into_iter().map(|(_, e)| e).collect();
+
+            Ok(Json(CaissifyGameListResponse {
+                games,
+                next_page_token,
+            }))
+        } else {
+            // ── Fast path (no name filter) — single O(limit) fetch ────────────
+            let scan_size = limit + 1;
+            let keys = caissify_db
+                .iter_by_date(since, until, initial_cursor, scan_size, reverse)
+                .expect("iter caissify by date");
+
+            let has_more = keys.len() > limit;
+            let page_keys = &keys[..keys.len().min(limit)];
+
+            let full_games = caissify_db
+                .games(page_keys.iter().map(|k| k.id))
+                .expect("batch fetch caissify games");
+
+            let mut games: Vec<CaissifyGameListEntry> = Vec::with_capacity(page_keys.len());
+            for (key, maybe_game) in page_keys.iter().zip(full_games.iter()) {
+                let Some(meta) = caissify_db
+                    .game_meta(key.id)
+                    .expect("get caissify game meta")
+                else {
+                    continue;
+                };
+                let Some(game) = maybe_game.as_ref() else {
+                    continue;
+                };
+                if !meta_passes(&meta) {
+                    continue;
+                }
+                games.push(make_entry(key, &meta, game));
+            }
+
+            let next_page_token = if has_more {
+                page_keys.last().map(|k| encode_page_token(*k))
+            } else {
+                None
+            };
+
+            Ok(Json(CaissifyGameListResponse {
+                games,
+                next_page_token,
+            }))
+        }
     })
     .await
 }
