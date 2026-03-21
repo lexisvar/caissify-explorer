@@ -743,11 +743,14 @@ pub fn spec() -> Value {
                     "type": "object",
                     "description": "Result of a POST /import/caissify/fide-link batch run",
                     "properties": {
-                        "linked":      { "type": "integer", "description": "Number of player-game links written in this batch", "example": 8742 },
-                        "skipped":     { "type": "integer", "description": "Number of games whose players could not be resolved to a FIDE ID", "example": 312 },
-                        "next_cursor": { "type": "string",  "nullable": true, "description": "Hex cursor to resume from on the next call; absent when the scan has reached the end of the database", "example": "0000deadbeef" }
+                        "linked":           { "type": "integer", "description": "Number of player-game links written in this batch", "example": 8742 },
+                        "skipped":          { "type": "integer", "description": "Number of games skipped (both sides already linked or game body missing)", "example": 312 },
+                        "tier_sorted":      { "type": "integer", "description": "Links resolved via sorted-token normalisation (handles name-order / case differences)", "example": 7500 },
+                        "tier_exact_lower": { "type": "integer", "description": "Links resolved via exact case-insensitive match (same format as FIDE)", "example": 900 },
+                        "tier_last_name":   { "type": "integer", "description": "Links resolved via last-name-only fallback (for abbreviated first names like 'Carlsen, M.')", "example": 342 },
+                        "next_cursor":      { "type": "string",  "nullable": true, "description": "Hex cursor to resume from on the next call; absent when the scan has reached the end of the database", "example": "0000deadbeef" }
                     },
-                    "required": ["linked", "skipped"]
+                    "required": ["linked", "skipped", "tier_sorted", "tier_exact_lower", "tier_last_name"]
                 },
 
                 "FideImportBatch": {

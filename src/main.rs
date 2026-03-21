@@ -1993,8 +1993,16 @@ struct FideLinkRequest {
 /// Response from the FIDE re-linking endpoint.
 #[derive(serde::Serialize)]
 struct FideLinkResponse {
+    /// Total player-game links written in this batch (white + black combined).
     linked: u64,
+    /// Games skipped (both sides already linked, or game body not found).
     skipped: u64,
+    /// Games where at least one side was resolved via tier-1 (sorted-token normalisation).
+    tier_sorted: u64,
+    /// Games where at least one side was resolved via tier-2 (exact case-insensitive).
+    tier_exact_lower: u64,
+    /// Games where at least one side was resolved via tier-3 (last-name-only fallback).
+    tier_last_name: u64,
     /// Cursor for the next batch, or null when done.
     next_cursor: Option<String>,
 }
@@ -2029,6 +2037,9 @@ async fn caissify_fide_link(
 
         let mut linked = 0u64;
         let mut skipped = 0u64;
+        let mut tier_sorted = 0u64;
+        let mut tier_exact_lower = 0u64;
+        let mut tier_last_name = 0u64;
 
         for (id, meta) in &records {
             // Skip if both sides are already linked.
@@ -2046,25 +2057,45 @@ async fn caissify_fide_link(
                 continue;
             };
 
-            let new_white = if meta.white_fide_id != 0 {
-                meta.white_fide_id
+            let (white_tier, resolved_white) = if meta.white_fide_id != 0 {
+                ("already", meta.white_fide_id)
             } else {
-                fide_index
-                    .lookup(&game.players.white.name)
-                    .unwrap_or(0)
+                let (tier, id) = fide_index.lookup_with_tier(&game.players.white.name);
+                (tier, id)
             };
-            let new_black = if meta.black_fide_id != 0 {
-                meta.black_fide_id
+            let (black_tier, resolved_black) = if meta.black_fide_id != 0 {
+                ("already", meta.black_fide_id)
             } else {
-                fide_index
-                    .lookup(&game.players.black.name)
-                    .unwrap_or(0)
+                let (tier, id) = fide_index.lookup_with_tier(&game.players.black.name);
+                (tier, id)
             };
+
+            let new_white = resolved_white;
+            let new_black = resolved_black;
 
             // Nothing new resolved — skip.
             if new_white == meta.white_fide_id && new_black == meta.black_fide_id {
                 skipped += 1;
                 continue;
+            }
+
+            // Count which tiers were used for new resolutions.
+            let mut game_used_tier = false;
+            if new_white != 0 && meta.white_fide_id == 0 {
+                match white_tier {
+                    "sorted"      => { tier_sorted      += 1; game_used_tier = true; }
+                    "exact_lower" => { tier_exact_lower += 1; game_used_tier = true; }
+                    "last_name"   => { tier_last_name   += 1; game_used_tier = true; }
+                    _ => {}
+                }
+            }
+            if new_black != 0 && meta.black_fide_id == 0 {
+                match black_tier {
+                    "sorted"      => { tier_sorted      += 1; game_used_tier = true; }
+                    "exact_lower" => { tier_exact_lower += 1; game_used_tier = true; }
+                    "last_name"   => { tier_last_name   += 1; game_used_tier = true; }
+                    _ => {}
+                }
             }
 
             let updated_meta = CaissifyGameMeta {
@@ -2097,7 +2128,9 @@ async fn caissify_fide_link(
                 );
             }
             batch.commit().expect("commit fide link batch");
-            linked += 1;
+            if game_used_tier {
+                linked += 1;
+            }
         }
 
         // Return a cursor only when there may be more records.
@@ -2110,6 +2143,9 @@ async fn caissify_fide_link(
         Ok::<_, Error>(Json(FideLinkResponse {
             linked,
             skipped,
+            tier_sorted,
+            tier_exact_lower,
+            tier_last_name,
             next_cursor,
         }))
     })
@@ -2118,6 +2154,9 @@ async fn caissify_fide_link(
         Json(FideLinkResponse {
             linked: 0,
             skipped: 0,
+            tier_sorted: 0,
+            tier_exact_lower: 0,
+            tier_last_name: 0,
             next_cursor: None,
         })
     })

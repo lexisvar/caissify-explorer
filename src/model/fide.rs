@@ -210,32 +210,60 @@ impl FideRatingKey {
 
 // ─── FideNameIndex ────────────────────────────────────────────────────────────
 
-/// In-memory index from a normalised player name → FIDE ID, loaded at startup
-/// from the `fide_player` column family.
+/// In-memory index from player name → FIDE ID, loaded at startup from the
+/// `fide_player` column family.
 ///
-/// Normalisation rules (applied to both sides at build and lookup time):
-/// - Split on any non-alphabetic character.
-/// - Drop tokens whose length ≤ 1 (single initials like "M.").
-/// - Lowercase every token.
-/// - Sort tokens alphabetically and join with a space.
+/// Three independent sub-indexes are maintained, tried in order during
+/// `lookup` until a match is found:
 ///
-/// This makes "Carlsen, Magnus", "Magnus Carlsen", and "CARLSEN Magnus" all
-/// map to the same key `"carlsen magnus"`.  Single-initial abbreviations such
-/// as "M. Carlsen" drop to `"carlsen"` — a weaker key, still useful as a
-/// fallback.
+/// 1. **Sorted-token** (`by_sorted`): split on non-alpha, drop tokens ≤ 1 char,
+///    lowercase, sort alphabetically, join.  
+///    → `"Carlsen, Magnus"` and `"Magnus Carlsen"` both → `"carlsen magnus"`.
+///    Handles different name orderings and case differences.
 ///
-/// When two different FIDE players normalise to the identical string the slot
-/// is set to `None` (collision) and `lookup` returns `None` for safety.
+/// 2. **Exact-lowercase** (`by_exact_lower`): just `name.to_lowercase()`.  
+///    → `"Carlsen, Magnus"` → `"carlsen, magnus"`.  
+///    Catches cases where the PGN name exactly matches FIDE format but with
+///    different casing.
+///
+/// 3. **Last-name-only** (`by_last_name`): everything before the first comma
+///    (if any), lowercased; entry is kept only when it is **unambiguous**
+///    (exactly one FIDE player has that last name).  
+///    → `"Carlsen, Magnus"` → `"carlsen"`.  
+///    Resolves abbreviated PGN names like `"Carlsen, M."` where the initial
+///    is dropped by strategy 1.
+///
+/// All three sub-indexes mark collisions as `None` — when two players share
+/// the same key the slot is a tombstone and `lookup` skips to the next tier.
 pub struct FideNameIndex {
-    inner: HashMap<String, Option<u32>>,
+    /// Sorted-token normalised key → FIDE ID
+    by_sorted: HashMap<String, Option<u32>>,
+    /// Raw lowercase key → FIDE ID
+    by_exact_lower: HashMap<String, Option<u32>>,
+    /// Last-name-only key → FIDE ID (only unambiguous entries kept)
+    by_last_name: HashMap<String, Option<u32>>,
 }
 
 impl Default for FideNameIndex {
     fn default() -> Self {
         FideNameIndex {
-            inner: HashMap::new(),
+            by_sorted: HashMap::new(),
+            by_exact_lower: HashMap::new(),
+            by_last_name: HashMap::new(),
         }
     }
+}
+
+/// Extract the "last name" component from a FIDE-format name like
+/// `"Carlsen, Magnus"`.  Returns the part before the first comma,
+/// trimmed and lowercased.  Falls back to the whole string lowercased when
+/// there is no comma.
+fn last_name_key(name: &str) -> String {
+    name.split(',')
+        .next()
+        .unwrap_or(name)
+        .trim()
+        .to_lowercase()
 }
 
 impl FideNameIndex {
@@ -243,55 +271,93 @@ impl FideNameIndex {
         FideNameIndex::default()
     }
 
-    /// Insert one FIDE player into the index.
-    ///
-    /// Both the full name and the "last-name-only" partial key are stored so
-    /// that a PGN entry like `"Carlsen"` can still resolve to the correct ID
-    /// when there is no ambiguity.
+    /// Insert one FIDE player into all three sub-indexes.
     pub fn insert(&mut self, player: &FidePlayer) {
-        let full_key = normalize_name(&player.name);
-        if full_key.is_empty() {
-            return;
+        let id = player.fide_id;
+
+        // 1. Sorted-token key
+        let sorted_key = normalize_name(&player.name);
+        if !sorted_key.is_empty() {
+            let slot = self.by_sorted.entry(sorted_key).or_insert(Some(id));
+            if *slot != Some(id) {
+                *slot = None;
+            }
         }
-        // Insert full key, marking collisions.
-        let slot = self.inner.entry(full_key).or_insert(Some(player.fide_id));
-        if *slot != Some(player.fide_id) {
-            *slot = None; // collision
+
+        // 2. Exact-lowercase key
+        let exact_key = player.name.to_lowercase();
+        if !exact_key.is_empty() {
+            let slot = self.by_exact_lower.entry(exact_key).or_insert(Some(id));
+            if *slot != Some(id) {
+                *slot = None;
+            }
+        }
+
+        // 3. Last-name-only key
+        let ln_key = last_name_key(&player.name);
+        if !ln_key.is_empty() {
+            let slot = self.by_last_name.entry(ln_key).or_insert(Some(id));
+            if *slot != Some(id) {
+                *slot = None; // collision — two players share this last name
+            }
         }
     }
 
-    /// Look up a FIDE ID by raw player name (normalised internally).
+    /// Look up a FIDE ID by raw player name.
     ///
-    /// Returns `None` when unknown or when multiple players share the same
-    /// normalised name (collision).
+    /// Tries the three tiers in order; returns the first unambiguous match.
+    /// Returns `None` when no tier produces a match.
     pub fn lookup(&self, name: &str) -> Option<u32> {
-        let key = normalize_name(name);
-        self.inner.get(&key).and_then(|v| *v)
+        // Tier 1: sorted-token normalisation (handles order/case differences)
+        if let Some(&Some(id)) = self.by_sorted.get(&normalize_name(name)) {
+            return Some(id);
+        }
+        // Tier 2: exact lowercase (same format, case-insensitive)
+        if let Some(&Some(id)) = self.by_exact_lower.get(&name.to_lowercase()) {
+            return Some(id);
+        }
+        // Tier 3: last-name-only fallback (handles abbreviated first names)
+        if let Some(&Some(id)) = self.by_last_name.get(&last_name_key(name)) {
+            return Some(id);
+        }
+        None
     }
 
-    /// Number of unique (non-collision) names in the index.
+    /// Same as `lookup` but also returns a label for the matching tier.
+    ///
+    /// Returns `("sorted" | "exact_lower" | "last_name", fide_id)` or
+    /// `("none", 0)` when unresolved.
+    pub fn lookup_with_tier(&self, name: &str) -> (&'static str, u32) {
+        if let Some(&Some(id)) = self.by_sorted.get(&normalize_name(name)) {
+            return ("sorted", id);
+        }
+        if let Some(&Some(id)) = self.by_exact_lower.get(&name.to_lowercase()) {
+            return ("exact_lower", id);
+        }
+        if let Some(&Some(id)) = self.by_last_name.get(&last_name_key(name)) {
+            return ("last_name", id);
+        }
+        ("none", 0)
+    }
+
+    /// Number of unique (non-collision) entries in the primary (sorted) index.
     pub fn len(&self) -> usize {
-        self.inner.values().filter(|v| v.is_some()).count()
+        self.by_sorted.values().filter(|v| v.is_some()).count()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Return up to `limit` FIDE IDs whose normalised name starts with
-    /// `normalize_name(query)`.
-    ///
-    /// This is an O(N) scan of the hash map — acceptable because the search
-    /// endpoint has its own rate-limit and the map fits in ~50 MB of RAM.
-    /// For a sub-millisecond prefix search over 1M names a BTreeMap or a
-    /// dedicated prefix trie (e.g. `fst`) could replace this, but the O(N)
-    /// scan completes in < 30 ms on any modern CPU.
+    /// Return up to `limit` FIDE IDs whose sorted-token normalised name starts
+    /// with `normalize_name(query)`.  O(N) scan — acceptable for the search
+    /// endpoint (< 30 ms for 1 M entries on any modern CPU).
     pub fn search_prefix(&self, query: &str, limit: usize) -> Vec<u32> {
         let prefix = normalize_name(query);
         if prefix.is_empty() {
             return vec![];
         }
-        self.inner
+        self.by_sorted
             .iter()
             .filter(|(k, v)| v.is_some() && k.starts_with(&prefix))
             .take(limit)
