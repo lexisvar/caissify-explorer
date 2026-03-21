@@ -8,11 +8,7 @@
 /// Usage:
 ///   import-fide --endpoint http://localhost:9002 --month 2026-03
 ///   import-fide --endpoint http://localhost:9002  # defaults to current month
-use std::{
-    io::{BufRead, Read},
-    str::FromStr,
-    time::Duration,
-};
+use std::{io::Read, time::Duration};
 
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -155,7 +151,8 @@ fn parse_xml(xml: &[u8]) -> Vec<PlayerRecord> {
                 }
             }
             Ok(Event::End(e)) => {
-                let tag = std::str::from_utf8(e.name().as_ref()).unwrap_or("");
+                let name = e.name();
+                let tag = std::str::from_utf8(name.as_ref()).unwrap_or("");
                 if tag == "player" {
                     if let Some(player) = current.take() {
                         if player.fide_id > 0 {
