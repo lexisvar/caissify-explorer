@@ -223,8 +223,10 @@ struct RawGame {
     round: Option<String>,
     white_name: String,
     white_rating: u16,
+    white_fide_id: u32,
     black_name: String,
     black_rating: u16,
+    black_fide_id: u32,
     winner: Option<Option<Color>>, // None = result tag missing / invalid
     fen: Option<String>,
     sans: Vec<SanPlus>,
@@ -269,6 +271,12 @@ impl Visitor for PgnVisitor {
                         .unwrap_or(0);
                 }
             }
+            b"WhiteFideId" => {
+                g.white_fide_id = std::str::from_utf8(value.as_bytes())
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+            }
             b"BlackElo" => {
                 if value.as_bytes() != b"?" {
                     g.black_rating = std::str::from_utf8(value.as_bytes())
@@ -276,6 +284,12 @@ impl Visitor for PgnVisitor {
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(0);
                 }
+            }
+            b"BlackFideId" => {
+                g.black_fide_id = std::str::from_utf8(value.as_bytes())
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
             }
             b"Result" => match KnownOutcome::from_ascii(value.as_bytes()) {
                 Ok(outcome) => g.winner = Some(outcome.winner()),
@@ -369,6 +383,8 @@ fn convert_raw_game(g: RawGame) -> Option<MastersGameWithId> {
 
     Some(MastersGameWithId {
         id,
+        white_fide_id: g.white_fide_id,
+        black_fide_id: g.black_fide_id,
         game: MastersGame {
             event: g.event.unwrap_or_default(),
             site: g.site.unwrap_or_default(),

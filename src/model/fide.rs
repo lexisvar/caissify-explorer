@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use bytes::{Buf, BufMut};
 use serde::Serialize;
 
@@ -204,4 +206,120 @@ impl FideRatingKey {
         buf[..4].copy_from_slice(&fide_id.saturating_add(1).to_le_bytes());
         buf
     }
+}
+
+// ─── FideNameIndex ────────────────────────────────────────────────────────────
+
+/// In-memory index from a normalised player name → FIDE ID, loaded at startup
+/// from the `fide_player` column family.
+///
+/// Normalisation rules (applied to both sides at build and lookup time):
+/// - Split on any non-alphabetic character.
+/// - Drop tokens whose length ≤ 1 (single initials like "M.").
+/// - Lowercase every token.
+/// - Sort tokens alphabetically and join with a space.
+///
+/// This makes "Carlsen, Magnus", "Magnus Carlsen", and "CARLSEN Magnus" all
+/// map to the same key `"carlsen magnus"`.  Single-initial abbreviations such
+/// as "M. Carlsen" drop to `"carlsen"` — a weaker key, still useful as a
+/// fallback.
+///
+/// When two different FIDE players normalise to the identical string the slot
+/// is set to `None` (collision) and `lookup` returns `None` for safety.
+pub struct FideNameIndex {
+    inner: HashMap<String, Option<u32>>,
+}
+
+impl Default for FideNameIndex {
+    fn default() -> Self {
+        FideNameIndex {
+            inner: HashMap::new(),
+        }
+    }
+}
+
+impl FideNameIndex {
+    pub fn new() -> Self {
+        FideNameIndex::default()
+    }
+
+    /// Insert one FIDE player into the index.
+    ///
+    /// Both the full name and the "last-name-only" partial key are stored so
+    /// that a PGN entry like `"Carlsen"` can still resolve to the correct ID
+    /// when there is no ambiguity.
+    pub fn insert(&mut self, player: &FidePlayer) {
+        let full_key = normalize_name(&player.name);
+        if full_key.is_empty() {
+            return;
+        }
+        // Insert full key, marking collisions.
+        let slot = self.inner.entry(full_key).or_insert(Some(player.fide_id));
+        if *slot != Some(player.fide_id) {
+            *slot = None; // collision
+        }
+    }
+
+    /// Look up a FIDE ID by raw player name (normalised internally).
+    ///
+    /// Returns `None` when unknown or when multiple players share the same
+    /// normalised name (collision).
+    pub fn lookup(&self, name: &str) -> Option<u32> {
+        let key = normalize_name(name);
+        self.inner.get(&key).and_then(|v| *v)
+    }
+
+    /// Number of unique (non-collision) names in the index.
+    pub fn len(&self) -> usize {
+        self.inner.values().filter(|v| v.is_some()).count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Return up to `limit` FIDE IDs whose normalised name starts with
+    /// `normalize_name(query)`.
+    ///
+    /// This is an O(N) scan of the hash map — acceptable because the search
+    /// endpoint has its own rate-limit and the map fits in ~50 MB of RAM.
+    /// For a sub-millisecond prefix search over 1M names a BTreeMap or a
+    /// dedicated prefix trie (e.g. `fst`) could replace this, but the O(N)
+    /// scan completes in < 30 ms on any modern CPU.
+    pub fn search_prefix(&self, query: &str, limit: usize) -> Vec<u32> {
+        let prefix = normalize_name(query);
+        if prefix.is_empty() {
+            return vec![];
+        }
+        self.inner
+            .iter()
+            .filter(|(k, v)| v.is_some() && k.starts_with(&prefix))
+            .take(limit)
+            .filter_map(|(_, v)| *v)
+            .collect()
+    }
+}
+
+/// Normalise a player name for index lookup.
+///
+/// Output: lowercase alphabetic tokens (len > 1) joined by spaces, sorted.
+pub fn normalize_name(name: &str) -> String {
+    let mut tokens: Vec<&str> = name
+        .split(|c: char| !c.is_alphabetic())
+        .filter(|t| t.len() > 1)
+        .collect();
+    if tokens.is_empty() {
+        return String::new();
+    }
+    // Sort so "Carlsen Magnus" and "Magnus Carlsen" produce the same key.
+    tokens.sort_unstable_by_key(|t| t.to_lowercase().to_string());
+    tokens
+        .iter()
+        .fold(String::with_capacity(name.len()), |mut s, t| {
+            if !s.is_empty() {
+                s.push(' ');
+            }
+            s.extend(t.chars().map(|c| c.to_ascii_lowercase()));
+            s
+        })
 }

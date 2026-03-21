@@ -30,6 +30,14 @@ pub struct MastersGameWithId {
     pub id: GameId,
     #[serde(flatten)]
     pub game: MastersGame,
+    /// Optional FIDE ID for White from the PGN `WhiteFideId` tag.
+    /// 0 (default) = unknown; the server will attempt a name-based match.
+    #[serde(default)]
+    pub white_fide_id: u32,
+    /// Optional FIDE ID for Black from the PGN `BlackFideId` tag.
+    /// 0 (default) = unknown; the server will attempt a name-based match.
+    #[serde(default)]
+    pub black_fide_id: u32,
 }
 
 #[serde_as]

@@ -473,16 +473,16 @@ These are non-breaking internal changes that all subsequent features depend on.
 
 ### Phase 3 — FIDE Player ↔ Game Linking (~3–4 days)
 
-- [ ] Load `FideNameIndex` (`HashMap<NormalizedName, u32>`) into `AppState` at startup from the `fide_player` CF.
-- [ ] Extend caissify importer: after writing the game, attempt name match and write FIDE IDs to `caissify_game_meta` + `caissify_game_by_fide` CF.
-- [ ] Implement `caissify_game_by_fide` CF.
-- [ ] `GET /caissify/games?fide_id=INT` on the existing paginated endpoint (uses the new CF).
-- [ ] `POST /import/caissify/fide-link` background re-linking pass for existing games.
+- [x] Load `FideNameIndex` (`HashMap<NormalizedName, u32>`) into `AppState` at startup from the `fide_player` CF. ✅ 2026-03-21
+- [x] Extend caissify importer: after writing the game, attempt name match and write FIDE IDs to `caissify_game_meta` + `caissify_game_by_fide` CF. ✅ 2026-03-21
+- [x] Implement `caissify_game_by_fide` CF. ✅ 2026-03-21
+- [x] `GET /caissify/games?fide_id=INT` on the existing paginated endpoint (uses the new CF). ✅ 2026-03-21
+- [x] `POST /import/caissify/fide-link` background re-linking pass for existing games. ✅ 2026-03-21
 - [ ] Add FIDE-linked player counts to `/monitor` metrics.
 
 ### Phase 4 — FIDE Player Search (~1–2 days)
 
-- [ ] `GET /fide/search?name=STRING` using `FideNameIndex` in-memory exact/prefix match.
+- [x] `GET /fide/search?name=STRING` using `FideNameIndex` in-memory exact/prefix match. ✅ 2026-03-21
 - [ ] Decision: accept limitation of exact/prefix only, or integrate Tantivy for fuzzy.
 - [ ] If Tantivy: add `tantivy` dependency, build index alongside `fide_player` CF, update in background on FIDE refresh.
 

@@ -60,8 +60,9 @@ use crate::{
     lila::{Lila, LilaOpt},
     metrics::Metrics,
     model::{
-        CaissifyByDateKey, CaissifyGameMeta, GameId, GameResult, KeyBuilder, KeyPrefix,
-        MastersGame, MastersGameWithId, Month, PreparedMove, UserId, UserName, Year,
+        CaissifyByDateKey, CaissifyByFideKey, CaissifyGameMeta, FideNameIndex, GameId, GameResult,
+        KeyBuilder, KeyPrefix, MastersGame, MastersGameWithId, Month, PreparedMove, UserId,
+        UserName, Year,
     },
     opening::{Opening, Openings},
     util::{DedupStreamExt as _, ply, spawn_blocking},
@@ -113,6 +114,8 @@ struct AppState {
     pgn_url_importer: PgnUrlImporter,
     player_indexer: PlayerIndexerStub,
     semaphore: &'static Semaphore,
+    /// In-memory FIDE name → ID lookup index (built at startup, refreshed periodically).
+    fide_index: Arc<FideNameIndex>,
 }
 
 fn main() {
@@ -150,6 +153,21 @@ async fn serve() {
     let player_indexer =
         PlayerIndexerStub::spawn(&mut join_set, Arc::clone(&db), opt.player_indexer, opt.lila);
 
+    // Build the FIDE name index from the fide_player CF.  This is an O(N)
+    // scan of ~1 M records taking ~200 ms on a warm SSD.  It runs inside
+    // block_in_place so the executor is not stalled.
+    let fide_index: Arc<FideNameIndex> = Arc::new(task::block_in_place(|| {
+        db.fide()
+            .build_name_index()
+            .expect("build fide name index")
+    }));
+    log::info!(
+        "fide name index ready: {} entries",
+        fide_index.len()
+    );
+    // Keep a shared reference in a static so the periodic updater can swap it.
+    let fide_index_state = Arc::clone(&fide_index);
+
     let app = Router::new()
         .route("/api-docs/openapi.json", get(openapi_json))
         .route("/api-docs", get(openapi_ui))
@@ -163,6 +181,7 @@ async fn serve() {
         .route("/import/caissify/pgn-url", post(caissify_pgn_url_import))
         .route("/import/caissify/pgn-url/status", get(caissify_pgn_url_status))
         .route("/import/caissify/reindex", post(caissify_reindex))
+        .route("/import/caissify/fide-link", post(caissify_fide_link))
         .route("/import/fide", put(fide_import))
         .route("/import/fide/refresh", post(fide_refresh))
         .route("/import/openings", post(openings_import))
@@ -174,6 +193,7 @@ async fn serve() {
         .route("/caissify/games/{id}", get(caissify_game_meta_endpoint))
         .route("/fide/player/{fide_id}", get(fide_player))
         .route("/fide/player/{fide_id}/ratings", get(fide_player_ratings))
+        .route("/fide/search", get(fide_search))
         .route("/lichess", get(lichess))
         .route("/lichess/history", get(lichess_history)) // bc
         .route("/player", get(player))
@@ -201,11 +221,18 @@ async fn serve() {
             metrics: Box::leak(Box::default()),
             lichess_importer: LichessImporter::new(Arc::clone(&db)),
             masters_importer: MastersImporter::new(Arc::clone(&db)),
-            caissify_importer: CaissifyImporter::new(Arc::clone(&db)),
-            pgn_url_importer: PgnUrlImporter::new(CaissifyImporter::new(Arc::clone(&db))),
+            caissify_importer: CaissifyImporter::new(
+                Arc::clone(&db),
+                Arc::clone(&fide_index_state),
+            ),
+            pgn_url_importer: PgnUrlImporter::new(CaissifyImporter::new(
+                Arc::clone(&db),
+                Arc::clone(&fide_index_state),
+            )),
             player_indexer,
             db,
             semaphore: Box::leak(Box::new(Semaphore::new(128))),
+            fide_index: fide_index_state,
         });
 
     let app = if opt.cors {
@@ -1320,6 +1347,31 @@ fn decode_page_token(s: &str) -> Option<CaissifyByDateKey> {
     Some(CaissifyByDateKey::read(&mut bytes.as_slice()))
 }
 
+/// Encode a 12-byte CaissifyByFideKey as a 24-char lowercase hex string.
+fn encode_fide_page_token(key: CaissifyByFideKey) -> String {
+    let bytes = key.into_bytes();
+    bytes.iter().fold(String::with_capacity(24), |mut s, b| {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// Decode a 24-char FIDE page token.  Validates that the embedded FIDE ID
+/// matches `expected_fide_id` to prevent cross-player token reuse.
+fn decode_fide_page_token(s: &str, expected_fide_id: u32) -> Option<CaissifyByFideKey> {
+    if s.len() != 24 {
+        return None;
+    }
+    let mut bytes = [0u8; 12];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        let hex_str = std::str::from_utf8(chunk).ok()?;
+        bytes[i] = u8::from_str_radix(hex_str, 16).ok()?;
+    }
+    let key = CaissifyByFideKey::read(&mut bytes.as_slice());
+    (key.fide_id == expected_fide_id).then_some(key)
+}
+
 /// Serialised entry in the paginated game list.
 #[derive(serde::Serialize)]
 struct CaissifyGameListEntry {
@@ -1365,6 +1417,13 @@ struct CaissifyGamesQuery {
     min_rating: Option<u16>,
     /// Maximum rating of either player.
     max_rating: Option<u16>,
+    /// Filter to games by a specific FIDE player (FIDE ID integer).
+    /// When set the `caissify_game_by_fide` secondary index is used — O(limit)
+    /// regardless of how many games exist in the database.
+    fide_id: Option<u32>,
+    /// Combined with `fide_id`: restrict to games where the player was
+    /// `"white"` or `"black"`.  Omit for both colours.
+    color: Option<String>,
     /// Optional position filter: FEN + UCI moves to play. When provided the
     /// response is drawn from the position index (up to 15 top games) instead
     /// of the date index, and `next_page_token` is never returned.
@@ -1474,6 +1533,109 @@ async fn caissify_games(
             return Ok(Json(CaissifyGameListResponse {
                 games,
                 next_page_token: None,
+            }));
+        }
+
+        // ── FIDE player filter path (cursor-paginated via caissify_game_by_fide) ──
+        if let Some(fide_id) = q.fide_id {
+            // Parse optional color restriction.
+            let color_filter: Option<bool> = match q.color.as_deref() {
+                Some("white") => Some(false), // is_black = false
+                Some("black") => Some(true),  // is_black = true
+                _ => None,
+            };
+
+            let cursor = q
+                .page_token
+                .as_deref()
+                .and_then(|s| decode_fide_page_token(s, fide_id));
+
+            let scan_size = limit + 1; // +1 for has-more detection
+
+            let fide_keys = caissify_db
+                .iter_by_fide(
+                    fide_id,
+                    since,
+                    until,
+                    color_filter,
+                    cursor,
+                    scan_size,
+                    reverse,
+                )
+                .expect("iter caissify by fide");
+
+            let has_more = fide_keys.len() > limit;
+            let page_pairs = &fide_keys[..fide_keys.len().min(limit)];
+
+            let full_games = caissify_db
+                .games(page_pairs.iter().map(|(k, _)| k.id))
+                .expect("batch fetch caissify games for fide player");
+
+            let meta_passes = |meta: &CaissifyGameMeta| -> bool {
+                if let Some(rf) = q.result {
+                    if meta.result != rf {
+                        return false;
+                    }
+                }
+                let max_r = meta.white_rating.max(meta.black_rating);
+                if q.min_rating.is_some_and(|m| max_r < m) {
+                    return false;
+                }
+                if q.max_rating.is_some_and(|m| max_r > m) {
+                    return false;
+                }
+                true
+            };
+
+            let mut games: Vec<CaissifyGameListEntry> = Vec::with_capacity(limit);
+            for ((key, _is_black), maybe_game) in page_pairs.iter().zip(full_games.iter()) {
+                let Some(meta) = caissify_db
+                    .game_meta(key.id)
+                    .expect("get caissify game meta for fide player")
+                else {
+                    continue;
+                };
+                let Some(game) = maybe_game.as_ref() else {
+                    continue;
+                };
+                if !meta_passes(&meta) {
+                    continue;
+                }
+                games.push(CaissifyGameListEntry {
+                    id: key.id.to_string(),
+                    white: game.players.white.name.clone(),
+                    white_rating: meta.white_rating,
+                    black: game.players.black.name.clone(),
+                    black_rating: meta.black_rating,
+                    event: game.event.clone(),
+                    site: game.site.clone(),
+                    date: game.date.to_string(),
+                    round: game.round.clone(),
+                    result: meta.result,
+                    white_fide_id: if meta.white_fide_id == 0 {
+                        None
+                    } else {
+                        Some(meta.white_fide_id)
+                    },
+                    black_fide_id: if meta.black_fide_id == 0 {
+                        None
+                    } else {
+                        Some(meta.black_fide_id)
+                    },
+                });
+            }
+
+            let next_page_token = if has_more {
+                page_pairs
+                    .last()
+                    .map(|(k, _)| encode_fide_page_token(*k))
+            } else {
+                None
+            };
+
+            return Ok(Json(CaissifyGameListResponse {
+                games,
+                next_page_token,
             }));
         }
 
@@ -1761,6 +1923,204 @@ async fn lichess_history(
         Query(with_source),
     )
     .await
+}
+
+// ─── FIDE player search ───────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct FideSearchQuery {
+    /// Partial or full player name (case-insensitive prefix match).
+    name: String,
+    /// Maximum results to return. Default 10, max 50.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(serde::Serialize)]
+struct FideSearchEntry {
+    fide_id: u32,
+    name: String,
+    country: String,
+    title: String,
+}
+
+#[axum::debug_handler(state = AppState)]
+async fn fide_search(
+    Query(q): Query<FideSearchQuery>,
+    State(db): State<Arc<Database>>,
+    State(fide_index): State<Arc<FideNameIndex>>,
+    State(semaphore): State<&'static Semaphore>,
+) -> Json<Vec<FideSearchEntry>> {
+    let limit = q.limit.unwrap_or(10).min(50);
+    let name_query = q.name.clone();
+    spawn_blocking(semaphore, move || {
+        // First try exact normalized match (O(1)).
+        let exact_matches: Vec<u32> = fide_index.search_prefix(&name_query, limit);
+
+        let fide_db = db.fide();
+        let entries = exact_matches
+            .into_iter()
+            .filter_map(|fide_id| {
+                fide_db
+                    .get_player(fide_id)
+                    .expect("get fide player for search")
+                    .map(|p| FideSearchEntry {
+                        fide_id: p.fide_id,
+                        name: p.name,
+                        country: p.country,
+                        title: p.title,
+                    })
+            })
+            .collect();
+        Ok::<_, Error>(Json(entries))
+    })
+    .await
+    .unwrap_or_else(|_| Json(vec![]))
+}
+
+// ─── FIDE ↔ game background re-linking ───────────────────────────────────────
+
+/// Request body for `POST /import/caissify/fide-link`.
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct FideLinkRequest {
+    /// Maximum games to process per call.  Defaults to 5000.
+    batch: Option<usize>,
+    /// Opaque cursor from a previous response (GameId hex string).
+    cursor: Option<String>,
+}
+
+/// Response from the FIDE re-linking endpoint.
+#[derive(serde::Serialize)]
+struct FideLinkResponse {
+    linked: u64,
+    skipped: u64,
+    /// Cursor for the next batch, or null when done.
+    next_cursor: Option<String>,
+}
+
+/// Background pass that iterates all `caissify_game_meta` records and:
+/// 1. Skips games that are already fully linked (both FIDE IDs set).
+/// 2. Attempts name-based resolution from the `FideNameIndex`.
+/// 3. Writes `caissify_game_meta` with resolved IDs + `caissify_game_by_fide` entries.
+///
+/// The pass is **idempotent** and can be resumed via the returned `next_cursor`.
+#[axum::debug_handler(state = AppState)]
+async fn caissify_fide_link(
+    State(db): State<Arc<Database>>,
+    State(fide_index): State<Arc<FideNameIndex>>,
+    State(semaphore): State<&'static Semaphore>,
+    body: Option<Json<FideLinkRequest>>,
+) -> Json<FideLinkResponse> {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let batch_size = req.batch.unwrap_or(5000).min(50_000);
+
+    // Decode the resumption cursor (optional).
+    let cursor: Option<GameId> = req.cursor.as_deref().and_then(|s| s.parse().ok());
+
+    spawn_blocking(semaphore, move || {
+        let caissify_db = db.caissify();
+        let records = caissify_db
+            .iter_meta_from(cursor, batch_size)
+            .expect("iter meta for fide link");
+
+        let last_id = records.last().map(|(id, _)| *id);
+        let total_scanned = records.len();
+
+        let mut linked = 0u64;
+        let mut skipped = 0u64;
+
+        for (id, meta) in &records {
+            // Skip if both sides are already linked.
+            if meta.white_fide_id != 0 && meta.black_fide_id != 0 {
+                skipped += 1;
+                continue;
+            }
+
+            // Fetch the full game to get player names for name-based resolution.
+            let Some(game) = caissify_db
+                .game(*id)
+                .expect("fetch game for fide link")
+            else {
+                skipped += 1;
+                continue;
+            };
+
+            let new_white = if meta.white_fide_id != 0 {
+                meta.white_fide_id
+            } else {
+                fide_index
+                    .lookup(&game.players.white.name)
+                    .unwrap_or(0)
+            };
+            let new_black = if meta.black_fide_id != 0 {
+                meta.black_fide_id
+            } else {
+                fide_index
+                    .lookup(&game.players.black.name)
+                    .unwrap_or(0)
+            };
+
+            // Nothing new resolved — skip.
+            if new_white == meta.white_fide_id && new_black == meta.black_fide_id {
+                skipped += 1;
+                continue;
+            }
+
+            let updated_meta = CaissifyGameMeta {
+                white_fide_id: new_white,
+                black_fide_id: new_black,
+                ..*meta
+            };
+
+            let mut batch = caissify_db.batch();
+            batch.update_meta_fide_ids(*id, &updated_meta);
+
+            if new_white != 0 && meta.white_fide_id == 0 {
+                batch.put_by_fide(
+                    CaissifyByFideKey {
+                        fide_id: new_white,
+                        year: meta.year,
+                        id: *id,
+                    },
+                    false,
+                );
+            }
+            if new_black != 0 && meta.black_fide_id == 0 {
+                batch.put_by_fide(
+                    CaissifyByFideKey {
+                        fide_id: new_black,
+                        year: meta.year,
+                        id: *id,
+                    },
+                    true,
+                );
+            }
+            batch.commit().expect("commit fide link batch");
+            linked += 1;
+        }
+
+        // Return a cursor only when there may be more records.
+        let next_cursor = if total_scanned == batch_size {
+            last_id.map(|id| id.to_string())
+        } else {
+            None
+        };
+
+        Ok::<_, Error>(Json(FideLinkResponse {
+            linked,
+            skipped,
+            next_cursor,
+        }))
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Json(FideLinkResponse {
+            linked: 0,
+            skipped: 0,
+            next_cursor: None,
+        })
+    })
 }
 
 async fn openapi_json() -> impl axum::response::IntoResponse {

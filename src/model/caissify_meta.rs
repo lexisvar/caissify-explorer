@@ -121,3 +121,65 @@ impl CaissifyByDateKey {
         .into_bytes()
     }
 }
+
+// ─── CaissifyByFideKey ────────────────────────────────────────────────────────
+
+/// Key for the `caissify_game_by_fide` column family.
+///
+/// Layout (12 bytes): [4-byte FIDE ID LE][2-byte Year LE][6-byte GameId LE]
+///
+/// Prefix extractor: 4 bytes (FIDE ID). Enables bloom-filter-accelerated
+/// per-player scans, year-range filtering within a player (seek to
+/// `[fide_id][since_year][GameId::MIN]`), and cursor-based pagination.
+///
+/// Value: 1 byte — `0` = player was White, `1` = player was Black.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaissifyByFideKey {
+    pub fide_id: u32,
+    pub year: u16,
+    pub id: GameId,
+}
+
+impl CaissifyByFideKey {
+    pub const SIZE: usize = 4 + 2 + GameId::SIZE; // 12
+
+    pub fn write<B: BufMut>(&self, buf: &mut B) {
+        buf.put_u32_le(self.fide_id);
+        buf.put_u16_le(self.year);
+        self.id.write(buf);
+    }
+
+    pub fn into_bytes(self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        self.write(&mut &mut buf[..]);
+        buf
+    }
+
+    pub fn read<B: Buf>(buf: &mut B) -> CaissifyByFideKey {
+        let fide_id = buf.get_u32_le();
+        let year = buf.get_u16_le();
+        let id = GameId::read(buf);
+        CaissifyByFideKey { fide_id, year, id }
+    }
+
+    /// First key for this FIDE ID at or after `since_year`.
+    pub fn lower_bound(fide_id: u32, since_year: u16) -> [u8; Self::SIZE] {
+        CaissifyByFideKey {
+            fide_id,
+            year: since_year,
+            id: GameId::MIN,
+        }
+        .into_bytes()
+    }
+
+    /// Exclusive upper-bound sentinel for all keys with FIDE ID ≤ `until_year`.
+    /// Used for `seek_for_prev` to land on the actual last entry in range.
+    pub fn upper_bound_sentinel(fide_id: u32, until_year: u16) -> [u8; Self::SIZE] {
+        CaissifyByFideKey {
+            fide_id,
+            year: until_year.saturating_add(1),
+            id: GameId::MIN,
+        }
+        .into_bytes()
+    }
+}

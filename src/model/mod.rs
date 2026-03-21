@@ -15,9 +15,9 @@ mod uci;
 mod uint;
 mod user;
 
-pub use caissify_meta::{CaissifyByDateKey, CaissifyGameMeta, GameResult};
+pub use caissify_meta::{CaissifyByDateKey, CaissifyByFideKey, CaissifyGameMeta, GameResult};
 pub use date::{InvalidDate, LaxDate, Month, Year};
-pub use fide::{FideFlag, FidePlayer, FideRatingKey, FideRatingSnapshot};
+pub use fide::{FideFlag, FideNameIndex, FidePlayer, FideRatingKey, FideRatingSnapshot, normalize_name};
 pub use game_id::{GameId, InvalidGameId};
 pub use history::{History, HistoryBuilder, HistorySegment};
 pub use key::{Key, KeyBuilder, KeyPrefix};

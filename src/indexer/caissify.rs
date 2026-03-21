@@ -10,8 +10,8 @@ use crate::{
     api::Error,
     db::Database,
     model::{
-        CaissifyByDateKey, CaissifyGameMeta, GameResult, KeyBuilder, LaxDate, MastersEntry,
-        MastersGameWithId,
+        CaissifyByDateKey, CaissifyByFideKey, CaissifyGameMeta, FideNameIndex, GameResult,
+        KeyBuilder, LaxDate, MastersEntry, MastersGameWithId,
     },
     zobrist::StableZobrist128,
 };
@@ -20,13 +20,15 @@ use crate::{
 pub struct CaissifyImporter {
     db: Arc<Database>,
     mutex: Arc<Mutex<()>>,
+    fide_index: Arc<FideNameIndex>,
 }
 
 impl CaissifyImporter {
-    pub fn new(db: Arc<Database>) -> CaissifyImporter {
+    pub fn new(db: Arc<Database>, fide_index: Arc<FideNameIndex>) -> CaissifyImporter {
         CaissifyImporter {
             db,
             mutex: Arc::new(Mutex::new(())),
+            fide_index,
         }
     }
 
@@ -74,23 +76,61 @@ impl CaissifyImporter {
             return Err(Error::DuplicateGame { id: body.id });
         }
 
+        // ── FIDE ID resolution ───────────────────────────────────────────────
+        // 1. Use the explicit FIDE IDs passed in the request body (from PGN
+        //    header tags like WhiteFideId / BlackFideId) when non-zero.
+        // 2. Fall back to an in-memory name-based lookup against FideNameIndex.
+        let white_fide_id = if body.white_fide_id != 0 {
+            body.white_fide_id
+        } else {
+            self.fide_index
+                .lookup(&body.game.players.white.name)
+                .unwrap_or(0)
+        };
+        let black_fide_id = if body.black_fide_id != 0 {
+            body.black_fide_id
+        } else {
+            self.fide_index
+                .lookup(&body.game.players.black.name)
+                .unwrap_or(0)
+        };
+
         let mut batch = caissify_db.batch();
         batch.put_game(body.id, &body.game);
 
-        // Write compact metadata and date index (Phase 0 — foundation CFs).
+        let year = u16::from(body.game.date.year());
         let meta = CaissifyGameMeta {
-            year: u16::from(body.game.date.year()),
+            year,
             white_rating: body.game.players.white.rating,
             black_rating: body.game.players.black.rating,
             result: GameResult::from_winner(body.game.winner),
-            white_fide_id: 0, // unlinked until Phase 3
-            black_fide_id: 0,
+            white_fide_id,
+            black_fide_id,
         };
         batch.put_game_meta(body.id, &meta);
-        batch.put_by_date(CaissifyByDateKey {
-            year: meta.year,
-            id: body.id,
-        });
+        batch.put_by_date(CaissifyByDateKey { year, id: body.id });
+
+        // Write FIDE secondary index entries when IDs were resolved.
+        if white_fide_id != 0 {
+            batch.put_by_fide(
+                CaissifyByFideKey {
+                    fide_id: white_fide_id,
+                    year,
+                    id: body.id,
+                },
+                false, // is_black = false → White
+            );
+        }
+        if black_fide_id != 0 {
+            batch.put_by_fide(
+                CaissifyByFideKey {
+                    fide_id: black_fide_id,
+                    year,
+                    id: body.id,
+                },
+                true, // is_black = true → Black
+            );
+        }
 
         for (key, (uci, turn)) in without_loops {
             batch.merge(

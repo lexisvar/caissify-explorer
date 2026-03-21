@@ -73,6 +73,8 @@ pub fn spec() -> Value {
                         param("result",      false, "string",  Some("Filter by game result: white, draw, or black"), Some(json!("white"))),
                         param("min_rating",  false, "integer", Some("Minimum max(white_rating, black_rating)"), Some(json!(2700))),
                         param("max_rating",  false, "integer", Some("Maximum max(white_rating, black_rating)"), Some(json!(3000))),
+                        param("fide_id",     false, "integer", Some("Filter by FIDE player ID. When set, games are returned from the caissify_game_by_fide index instead of the date index. Cannot be combined with fen/play."), None),
+                        param("color",       false, "string",  Some("Filter by colour the FIDE player played (white or black). Only used when fide_id is set."), None),
                     ],
                     "responses": {
                         "200": {
@@ -348,6 +350,33 @@ pub fn spec() -> Value {
                 }
             },
 
+            "/fide/search": {
+                "get": {
+                    "tags": ["FIDE"],
+                    "summary": "Search FIDE players by name",
+                    "description": "Prefix-match search over the in-memory FIDE name index. Returns up to `limit` matching player profiles. Normalised tokens are used so \"Carlsen\" matches \"Carlsen, Magnus\" and vice-versa.",
+                    "operationId": "searchFidePlayers",
+                    "parameters": [
+                        param("name",  true,  "string",  Some("Name prefix to search for (case-insensitive)"), None),
+                        param("limit", false, "integer", Some("Maximum results to return (default 10, max 50)"), Some(json!(10)))
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Matching FIDE players",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "array",
+                                        "items": { "$ref": "#/components/schemas/FideSearchEntry" }
+                                    }
+                                }
+                            }
+                        },
+                        "400": bad_request_response()
+                    }
+                }
+            },
+
             // ── Import ────────────────────────────────────────────────────
             "/import/fide": {
                 "put": {
@@ -396,6 +425,30 @@ pub fn spec() -> Value {
                     "responses": {
                         "200": { "description": "Number of games reindexed" },
                         "500": { "description": "Reindex failed — check server logs" }
+                    }
+                }
+            },
+
+            "/import/caissify/fide-link": {
+                "post": {
+                    "tags": ["Import"],
+                    "summary": "Batch-link games to FIDE player IDs",
+                    "description": "Scans existing Caissify games in order and writes entries into the `caissify_game_by_fide` index for any game whose players match a known FIDE profile.\n\nThe scan is cursor-resumable: pass the `next_cursor` from the previous response to continue where you left off after a restart or partial run.\n\nSafe to call multiple times; already-linked entries are overwritten with the same value.",
+                    "operationId": "caissifyFideLink",
+                    "parameters": [
+                        param("batch",  false, "integer", Some("Number of games to process per call (default 5000, max 100000)"), Some(json!(5000))),
+                        param("cursor", false, "string",  Some("Opaque hex cursor from a previous response to resume from a specific position"), None)
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Link pass result",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/FideLinkResponse" }
+                                }
+                            }
+                        },
+                        "500": { "description": "Link pass failed — check server logs" }
                     }
                 }
             },
@@ -671,6 +724,30 @@ pub fn spec() -> Value {
                         "blitz":     { "type": "integer", "nullable": true, "example": 2886 }
                     },
                     "required": ["month"]
+                },
+
+                "FideSearchEntry": {
+                    "type": "object",
+                    "description": "A single FIDE player match returned by GET /fide/search",
+                    "properties": {
+                        "fide_id":  { "type": "integer", "example": 1503014 },
+                        "name":     { "type": "string",  "example": "Carlsen, Magnus" },
+                        "country": { "type": "string",  "example": "NOR" },
+                        "title":   { "type": "string",  "example": "GM", "description": "Highest open title; empty string when none" },
+                        "rating":  { "type": "integer", "nullable": true, "example": 2833, "description": "Most recent standard rating; absent when unrated" }
+                    },
+                    "required": ["fide_id", "name", "country"]
+                },
+
+                "FideLinkResponse": {
+                    "type": "object",
+                    "description": "Result of a POST /import/caissify/fide-link batch run",
+                    "properties": {
+                        "linked":      { "type": "integer", "description": "Number of player-game links written in this batch", "example": 8742 },
+                        "skipped":     { "type": "integer", "description": "Number of games whose players could not be resolved to a FIDE ID", "example": 312 },
+                        "next_cursor": { "type": "string",  "nullable": true, "description": "Hex cursor to resume from on the next call; absent when the scan has reached the end of the database", "example": "0000deadbeef" }
+                    },
+                    "required": ["linked", "skipped"]
                 },
 
                 "FideImportBatch": {

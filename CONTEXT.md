@@ -448,6 +448,8 @@ Paginated list of games with compact metadata. Cursor-based pagination via `page
 | `result` | `"white"` \| `"draw"` \| `"black"` | — | Filter by result |
 | `min_rating` | u16 | — | Min max(white_rating, black_rating) |
 | `max_rating` | u16 | — | Max max(white_rating, black_rating) |
+| `fide_id` | u32 | — | Filter to all games by this FIDE player (uses `caissify_game_by_fide` CF — O(limit), cursor-paginated) |
+| `color` | `"white"` \| `"black"` | — | Combined with `fide_id`: restrict to games as that colour |
 
 **Response:**
 
@@ -480,6 +482,42 @@ curl http://localhost:9002/caissify/games/AbCd1234
 ```
 
 **Response:** `CaissifyGameMeta` JSON object with `year`, `white_rating`, `black_rating`, `result`, `white_fide_id`, `black_fide_id`.
+
+---
+
+### `GET /fide/search`
+
+Search FIDE players by name using the in-memory `FideNameIndex` (prefix match on normalised tokens).
+
+**Query Parameters:**
+
+| Param | Type | Description |
+|---|---|---|
+| `name` | string | Name query (exact or prefix; normalised as sorted lowercase tokens) |
+| `limit` | integer | Results to return (default 10, max 50) |
+
+```bash
+curl "http://localhost:9002/fide/search?name=Carlsen"
+```
+
+**Response:** JSON array of `FidePlayer` objects (with latest rating snapshot added).
+
+---
+
+### `POST /import/caissify/fide-link`
+
+Background re-linking pass: iterates `caissify_game_meta` records with unresolved FIDE IDs and attempts name-based resolution from `FideNameIndex`. Idempotent and cursor-resumable.
+
+```bash
+curl -X POST http://localhost:9002/import/caissify/fide-link \
+  -H 'Content-Type: application/json' \
+  -d '{"batch": 5000}'
+# Resume from a previous run:
+curl -X POST http://localhost:9002/import/caissify/fide-link \
+  -d '{"batch": 5000, "cursor": "AbCd1234"}'
+```
+
+**Response:** `{ "linked": N, "skipped": M, "next_cursor": "..." }` — call again with `next_cursor` until it is `null`.
 
 ---
 
@@ -603,7 +641,7 @@ curl http://localhost:9002/monitor/cf/lichess/rocksdb.stats
 curl http://localhost:9002/monitor/cf/masters/rocksdb.estimate-live-data-size
 ```
 
-Column families: `masters`, `masters_game`, `lichess`, `lichess_game`, `player`, `player_status`, `caissify`, `caissify_game`, `caissify_game_meta`, `caissify_game_by_date`, `fide_player`, `fide_rating_history`
+Column families: `masters`, `masters_game`, `lichess`, `lichess_game`, `player`, `player_status`, `caissify`, `caissify_game`, `caissify_game_meta`, `caissify_game_by_date`, `caissify_game_by_fide`, `fide_player`, `fide_rating_history`
 
 ---
 
@@ -715,6 +753,7 @@ curl -X PUT http://localhost:9002/import/caissify \
 | `caissify_game` | `GameId(6)` | `MastersGame` | Full game record for PGN generation |
 | `caissify_game_meta` | `GameId(6)` | `CaissifyGameMeta` (15 bytes) | Compact metadata: year, ratings, result, FIDE IDs |
 | `caissify_game_by_date` | `Year(2) + GameId(6)` | `[]` (empty) | Secondary date index for paginated game listing |
+| `caissify_game_by_fide` | `FideId(4) + Year(2) + GameId(6)` | `color(1)` | Secondary FIDE-player index; prefix=4 bytes; value 0=White 1=Black |
 | `fide_player` | `FideId(4)` | `FidePlayer` (variable) | FIDE player profile: name, country, title, birth year |
 | `fide_rating_history` | `FideId(4) + Month(2)` | `FideRatingSnapshot` (9 bytes) | Monthly standard/rapid/blitz rating snapshot per player |
 
@@ -969,3 +1008,4 @@ Two periodic goroutines run in the background alongside the main server:
 |---|---|---|
 | `periodic_openings_import` | ~167 minutes | Re-fetches TSV files from chess-openings repo |
 | `periodic_blacklist_update` | ~173 minutes | Fetches mod-marked accounts from Lichess API; skips their games |
+| `periodic_fide_ratings_update` | ~32 days | Downloads FIDE monthly XML, upserts `fide_player` + `fide_rating_history` CFs |
