@@ -2003,6 +2003,8 @@ struct FideLinkResponse {
     tier_exact_lower: u64,
     /// Games where at least one side was resolved via tier-3 (last-name-only fallback).
     tier_last_name: u64,
+    /// Games where at least one side was resolved via tier-4 (abbreviated compound surname).
+    tier_abbreviated: u64,
     /// Cursor for the next batch, or null when done.
     next_cursor: Option<String>,
 }
@@ -2040,6 +2042,7 @@ async fn caissify_fide_link(
         let mut tier_sorted = 0u64;
         let mut tier_exact_lower = 0u64;
         let mut tier_last_name = 0u64;
+        let mut tier_abbreviated = 0u64;
 
         for (id, meta) in &records {
             // Skip if both sides are already linked.
@@ -2086,6 +2089,7 @@ async fn caissify_fide_link(
                     "sorted"      => { tier_sorted      += 1; game_used_tier = true; }
                     "exact_lower" => { tier_exact_lower += 1; game_used_tier = true; }
                     "last_name"   => { tier_last_name   += 1; game_used_tier = true; }
+                    "abbreviated" => { tier_abbreviated += 1; game_used_tier = true; }
                     _ => {}
                 }
             }
@@ -2094,6 +2098,7 @@ async fn caissify_fide_link(
                     "sorted"      => { tier_sorted      += 1; game_used_tier = true; }
                     "exact_lower" => { tier_exact_lower += 1; game_used_tier = true; }
                     "last_name"   => { tier_last_name   += 1; game_used_tier = true; }
+                    "abbreviated" => { tier_abbreviated += 1; game_used_tier = true; }
                     _ => {}
                 }
             }
@@ -2146,6 +2151,7 @@ async fn caissify_fide_link(
             tier_sorted,
             tier_exact_lower,
             tier_last_name,
+            tier_abbreviated,
             next_cursor,
         }))
     })
@@ -2157,6 +2163,7 @@ async fn caissify_fide_link(
             tier_sorted: 0,
             tier_exact_lower: 0,
             tier_last_name: 0,
+            tier_abbreviated: 0,
             next_cursor: None,
         })
     })

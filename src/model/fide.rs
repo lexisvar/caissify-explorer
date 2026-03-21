@@ -213,28 +213,31 @@ impl FideRatingKey {
 /// In-memory index from player name → FIDE ID, loaded at startup from the
 /// `fide_player` column family.
 ///
-/// Three independent sub-indexes are maintained, tried in order during
+/// Four independent sub-indexes are maintained, tried in order during
 /// `lookup` until a match is found:
 ///
 /// 1. **Sorted-token** (`by_sorted`): split on non-alpha, drop tokens ≤ 1 char,
 ///    lowercase, sort alphabetically, join.  
 ///    → `"Carlsen, Magnus"` and `"Magnus Carlsen"` both → `"carlsen magnus"`.
-///    Handles different name orderings and case differences.
 ///
 /// 2. **Exact-lowercase** (`by_exact_lower`): just `name.to_lowercase()`.  
-///    → `"Carlsen, Magnus"` → `"carlsen, magnus"`.  
-///    Catches cases where the PGN name exactly matches FIDE format but with
-///    different casing.
+///    → `"Carlsen, Magnus"` → `"carlsen, magnus"`.
 ///
-/// 3. **Last-name-only** (`by_last_name`): everything before the first comma
-///    (if any), lowercased; entry is kept only when it is **unambiguous**
-///    (exactly one FIDE player has that last name).  
+/// 3. **Last-name-only** (`by_last_name`): everything before the first comma,
+///    lowercased; kept only when it is **unambiguous** (exactly one player has
+///    that surname cluster).  
 ///    → `"Carlsen, Magnus"` → `"carlsen"`.  
-///    Resolves abbreviated PGN names like `"Carlsen, M."` where the initial
-///    is dropped by strategy 1.
+///    Catches abbreviated first names like `"Carlsen, M."`.
 ///
-/// All three sub-indexes mark collisions as `None` — when two players share
-/// the same key the slot is a tombstone and `lookup` skips to the next tier.
+/// 4. **Abbreviated compound surname** (`by_abbreviated`): for players with a
+///    multi-word surname, stores a key built from just the *first* surname
+///    component plus the full given name, sorted and normalised.  
+///    → `"Vargas Arteaga, Alexis"` also stores key `"alexis vargas"`.  
+///    This lets PGN names like `"Vargas, Alexis"` (which drop the second
+///    surname component) resolve to the correct FIDE ID.
+///
+/// All sub-indexes mark collisions as `None` — when two players share the
+/// same key the slot is a tombstone and `lookup` skips to the next tier.
 pub struct FideNameIndex {
     /// Sorted-token normalised key → FIDE ID
     by_sorted: HashMap<String, Option<u32>>,
@@ -242,6 +245,8 @@ pub struct FideNameIndex {
     by_exact_lower: HashMap<String, Option<u32>>,
     /// Last-name-only key → FIDE ID (only unambiguous entries kept)
     by_last_name: HashMap<String, Option<u32>>,
+    /// Abbreviated compound-surname key → FIDE ID
+    by_abbreviated: HashMap<String, Option<u32>>,
 }
 
 impl Default for FideNameIndex {
@@ -250,6 +255,7 @@ impl Default for FideNameIndex {
             by_sorted: HashMap::new(),
             by_exact_lower: HashMap::new(),
             by_last_name: HashMap::new(),
+            by_abbreviated: HashMap::new(),
         }
     }
 }
@@ -266,12 +272,42 @@ fn last_name_key(name: &str) -> String {
         .to_lowercase()
 }
 
+/// Build a "first-surname-component + first-name" abbreviated key for
+/// players with compound surnames.
+///
+/// `"Vargas Arteaga, Alexis"` → surname part = `"Vargas Arteaga"`,
+/// first component = `"Vargas"`, first name = `"Alexis"` →
+/// sorted key `"alexis vargas"`.
+///
+/// Returns `None` when the name has no comma (can't split surname/given),
+/// when the surname has only one component (no abbreviation possible), or
+/// when the result is identical to the full sorted-token key (no benefit).
+fn abbreviated_compound_key(name: &str) -> Option<String> {
+    let mut parts = name.splitn(2, ',');
+    let surname_full = parts.next()?.trim();
+    let given = parts.next()?.trim();
+
+    // Only meaningful if surname has at least two space-separated words.
+    let first_surname_component = surname_full.split_whitespace().next()?;
+    if surname_full.split_whitespace().count() < 2 {
+        return None; // single-word surname — tier 1 already covers this
+    }
+
+    // Build a sorted-token key from just the first surname component + given name.
+    let abbreviated = format!("{} {}", first_surname_component, given);
+    let key = normalize_name(&abbreviated);
+    if key.is_empty() {
+        return None;
+    }
+    Some(key)
+}
+
 impl FideNameIndex {
     pub fn new() -> Self {
         FideNameIndex::default()
     }
 
-    /// Insert one FIDE player into all three sub-indexes.
+    /// Insert one FIDE player into all four sub-indexes.
     pub fn insert(&mut self, player: &FidePlayer) {
         let id = player.fide_id;
 
@@ -301,11 +337,19 @@ impl FideNameIndex {
                 *slot = None; // collision — two players share this last name
             }
         }
+
+        // 4. Abbreviated compound-surname key (e.g. "Vargas Arteaga, Alexis" → "alexis vargas")
+        if let Some(abbrev_key) = abbreviated_compound_key(&player.name) {
+            let slot = self.by_abbreviated.entry(abbrev_key).or_insert(Some(id));
+            if *slot != Some(id) {
+                *slot = None;
+            }
+        }
     }
 
     /// Look up a FIDE ID by raw player name.
     ///
-    /// Tries the three tiers in order; returns the first unambiguous match.
+    /// Tries the four tiers in order; returns the first unambiguous match.
     /// Returns `None` when no tier produces a match.
     pub fn lookup(&self, name: &str) -> Option<u32> {
         // Tier 1: sorted-token normalisation (handles order/case differences)
@@ -320,13 +364,19 @@ impl FideNameIndex {
         if let Some(&Some(id)) = self.by_last_name.get(&last_name_key(name)) {
             return Some(id);
         }
+        // Tier 4: abbreviated compound surname ("Vargas, Alexis" → "alexis vargas")
+        // The incoming PGN name is treated as if it might be an abbreviated compound
+        // surname, so we look it up in the by_abbreviated index using its sorted key.
+        if let Some(&Some(id)) = self.by_abbreviated.get(&normalize_name(name)) {
+            return Some(id);
+        }
         None
     }
 
     /// Same as `lookup` but also returns a label for the matching tier.
     ///
-    /// Returns `("sorted" | "exact_lower" | "last_name", fide_id)` or
-    /// `("none", 0)` when unresolved.
+    /// Returns `("sorted" | "exact_lower" | "last_name" | "abbreviated", fide_id)`
+    /// or `("none", 0)` when unresolved.
     pub fn lookup_with_tier(&self, name: &str) -> (&'static str, u32) {
         if let Some(&Some(id)) = self.by_sorted.get(&normalize_name(name)) {
             return ("sorted", id);
@@ -336,6 +386,9 @@ impl FideNameIndex {
         }
         if let Some(&Some(id)) = self.by_last_name.get(&last_name_key(name)) {
             return ("last_name", id);
+        }
+        if let Some(&Some(id)) = self.by_abbreviated.get(&normalize_name(name)) {
+            return ("abbreviated", id);
         }
         ("none", 0)
     }

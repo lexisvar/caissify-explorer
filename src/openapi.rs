@@ -748,9 +748,10 @@ pub fn spec() -> Value {
                         "tier_sorted":      { "type": "integer", "description": "Links resolved via sorted-token normalisation (handles name-order / case differences)", "example": 7500 },
                         "tier_exact_lower": { "type": "integer", "description": "Links resolved via exact case-insensitive match (same format as FIDE)", "example": 900 },
                         "tier_last_name":   { "type": "integer", "description": "Links resolved via last-name-only fallback (for abbreviated first names like 'Carlsen, M.')", "example": 342 },
+                        "tier_abbreviated": { "type": "integer", "description": "Links resolved via abbreviated compound-surname fallback (e.g. 'Vargas, Alexis' → 'Vargas Arteaga, Alexis')", "example": 85 },
                         "next_cursor":      { "type": "string",  "nullable": true, "description": "Hex cursor to resume from on the next call; absent when the scan has reached the end of the database", "example": "0000deadbeef" }
                     },
-                    "required": ["linked", "skipped", "tier_sorted", "tier_exact_lower", "tier_last_name"]
+                    "required": ["linked", "skipped", "tier_sorted", "tier_exact_lower", "tier_last_name", "tier_abbreviated"]
                 },
 
                 "FideImportBatch": {
