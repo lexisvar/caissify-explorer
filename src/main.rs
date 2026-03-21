@@ -1097,106 +1097,99 @@ async fn caissify_reindex(
     .await
 }
 
-/// Request body for `POST /import/caissify/reindex-position`.
-#[derive(serde::Deserialize, Default)]
-#[serde(default)]
-struct ReindexPositionRequest {
-    /// Maximum games to process per call. Defaults to 2000.
-    batch: Option<usize>,
-    /// Opaque cursor from a previous response (GameId hex string).
-    cursor: Option<String>,
-}
-
 /// Response from `POST /import/caissify/reindex-position`.
 #[derive(serde::Serialize)]
 struct ReindexPositionResponse {
-    /// Number of games processed in this batch.
+    /// Total games processed.
     processed: u64,
-    /// Total position index entries written in this batch.
+    /// Total position index entries written.
     entries_written: u64,
-    /// Cursor for the next batch, or null when complete.
-    next_cursor: Option<String>,
 }
 
-/// Backfill pass for the `caissify_game_by_position` CF.
+/// Full backfill pass for the `caissify_game_by_position` CF.
 ///
-/// Iterates games in `caissify_game`, replays moves to collect all unique
-/// positions, and writes one `CaissifyByPositionKey` entry per unique position
-/// per game. Safe to run multiple times (puts are idempotent).
+/// Iterates every game in `caissify_game`, replays its moves to collect all
+/// unique Zobrist positions, and writes one `CaissifyByPositionKey` entry per
+/// unique position per game.  Commits every `CHUNK` games to bound memory use.
 ///
-/// Returns a cursor so the pass can be resumed in subsequent HTTP calls.
+/// Safe to call multiple times — puts are idempotent. Runs entirely inside a
+/// single HTTP request; no pagination required.
 #[axum::debug_handler(state = AppState)]
 async fn caissify_reindex_position(
     State(db): State<Arc<Database>>,
     State(semaphore): State<&'static Semaphore>,
-    body: Option<Json<ReindexPositionRequest>>,
-) -> Json<ReindexPositionResponse> {
-    let req = body.map(|Json(b)| b).unwrap_or_default();
-    let batch_size = req.batch.unwrap_or(2000).min(20_000);
-    let cursor: Option<GameId> = req.cursor.as_deref().and_then(|s| s.parse().ok());
-
+) -> Result<Json<ReindexPositionResponse>, StatusCode> {
     spawn_blocking(semaphore, move || {
+        const CHUNK: usize = 2_000; // games per RocksDB write batch
+
         let caissify_db = db.caissify();
-        let games = caissify_db
-            .iter_games_from(cursor, batch_size)
-            .expect("iter games for position reindex");
+        let mut cursor: Option<GameId> = None;
+        let mut total_processed = 0u64;
+        let mut total_entries = 0u64;
 
-        let last_id = games.last().map(|(id, _)| *id);
-        let total = games.len();
-        let mut entries_written = 0u64;
+        loop {
+            let games = caissify_db
+                .iter_games_from(cursor, CHUNK)
+                .expect("iter games for position reindex");
 
-        for (id, game) in &games {
-            let year = u16::from(game.date.year());
-            let mut pos = Chess::default();
-            let mut seen: std::collections::HashSet<[u8; 12]> =
-                std::collections::HashSet::with_capacity(64);
+            if games.is_empty() {
+                break;
+            }
+
+            cursor = games.last().map(|(id, _)| *id);
+            let chunk_len = games.len();
 
             let mut batch = caissify_db.batch();
+            let mut chunk_entries = 0u64;
 
-            for uci in &game.moves {
-                let zobrist = pos.zobrist_hash(EnPassantMode::Legal);
-                let key_prefix =
-                    KeyBuilder::caissify().with_zobrist(Variant::Chess, zobrist);
-                let prefix_bytes = key_prefix.key_bytes();
+            for (id, game) in &games {
+                let year = u16::from(game.date.year());
+                let mut pos = Chess::default();
+                let mut seen: std::collections::HashSet<[u8; 12]> =
+                    std::collections::HashSet::with_capacity(64);
 
-                if seen.insert(prefix_bytes) {
-                    batch.put_by_position(CaissifyByPositionKey {
-                        prefix: prefix_bytes,
-                        year,
-                        id: *id,
-                    });
-                    entries_written += 1;
-                }
+                for uci in &game.moves {
+                    let zobrist = pos.zobrist_hash(EnPassantMode::Legal);
+                    let prefix_bytes = KeyBuilder::caissify()
+                        .with_zobrist(Variant::Chess, zobrist)
+                        .key_bytes();
 
-                match uci.to_move(&pos) {
-                    Ok(m) => pos.play_unchecked(m),
-                    Err(_) => break, // malformed move — stop replaying this game
+                    if seen.insert(prefix_bytes) {
+                        batch.put_by_position(CaissifyByPositionKey {
+                            prefix: prefix_bytes,
+                            year,
+                            id: *id,
+                        });
+                        chunk_entries += 1;
+                    }
+
+                    match uci.to_move(&pos) {
+                        Ok(m) => pos.play_unchecked(m),
+                        Err(_) => break,
+                    }
                 }
             }
 
             batch.commit().expect("commit position reindex batch");
+            total_processed += chunk_len as u64;
+            total_entries += chunk_entries;
+
+            log::info!(
+                "position reindex: {total_processed} games processed, \
+                 {total_entries} entries written"
+            );
+
+            if chunk_len < CHUNK {
+                break; // last chunk — we're done
+            }
         }
 
-        let next_cursor = if total == batch_size {
-            last_id.map(|id| id.to_string())
-        } else {
-            None
-        };
-
-        Ok::<_, Error>(Json(ReindexPositionResponse {
-            processed: total as u64,
-            entries_written,
-            next_cursor,
+        Ok(Json(ReindexPositionResponse {
+            processed: total_processed,
+            entries_written: total_entries,
         }))
     })
     .await
-    .unwrap_or_else(|_| {
-        Json(ReindexPositionResponse {
-            processed: 0,
-            entries_written: 0,
-            next_cursor: None,
-        })
-    })
 }
 
 // ─── FIDE endpoints ───────────────────────────────────────────────────────────

@@ -433,33 +433,18 @@ pub fn spec() -> Value {
                 "post": {
                     "tags": ["Import"],
                     "summary": "Backfill the position → game index",
-                    "description": "Cursor-resumable backfill for the `caissify_game_by_position` column family.\n\nReplays all existing Caissify games to write one entry per unique position visited per game. Required once after upgrading to Phase 6 so that `GET /caissify/games?fen=` can return fully paginated results.\n\nSafe to run multiple times (puts are idempotent). Pass `next_cursor` from the response to continue the pass in subsequent calls.",
+                    "description": "Full one-shot backfill for the `caissify_game_by_position` column family.\n\nReplays every existing Caissify game and writes one index entry per unique position visited per game. Commits every 2,000 games internally — no pagination needed. Just call it once and wait.\n\nSafe to run multiple times (puts are idempotent). Logs progress server-side every 2,000 games.",
                     "operationId": "caissifyReindexPosition",
-                    "requestBody": {
-                        "required": false,
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "batch": { "type": "integer", "description": "Games to process per call (default 2000, max 20000)", "example": 2000 },
-                                        "cursor": { "type": "string", "description": "Opaque cursor from a previous response to resume the pass" }
-                                    }
-                                }
-                            }
-                        }
-                    },
                     "responses": {
                         "200": {
-                            "description": "Batch result",
+                            "description": "Backfill complete",
                             "content": {
                                 "application/json": {
                                     "schema": {
                                         "type": "object",
                                         "properties": {
-                                            "processed":      { "type": "integer", "description": "Games processed in this batch" },
-                                            "entries_written": { "type": "integer", "description": "Position index entries written" },
-                                            "next_cursor":    { "type": "string", "nullable": true, "description": "Cursor for the next batch; null when complete" }
+                                            "processed":       { "type": "integer", "description": "Total games processed" },
+                                            "entries_written": { "type": "integer", "description": "Total position index entries written" }
                                         }
                                     }
                                 }
