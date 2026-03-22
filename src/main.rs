@@ -36,6 +36,7 @@ use shakmaty::{
     uci::UciMove,
     variant::{Variant, VariantPosition},
 };
+use sha1::{Digest, Sha1};
 use tikv_jemallocator::Jemalloc;
 use tokio::{
     net::TcpListener,
@@ -54,8 +55,8 @@ use crate::{
     },
     db::{CacheHint, Database, DbOpt, LichessDatabase},
     indexer::{
-        CaissifyImporter, ImportStatus, LichessGameImport, LichessImporter, MastersImporter,
-        PlayerIndexerOpt, PlayerIndexerStub, PgnUrlImporter, QueueFull, Ticket,
+        BroadcastImporter, CaissifyImporter, ImportStatus, LichessGameImport, LichessImporter,
+        MastersImporter, PlayerIndexerOpt, PlayerIndexerStub, PgnUrlImporter, QueueFull, Ticket,
     },
     lila::{Lila, LilaOpt},
     metrics::Metrics,
@@ -112,6 +113,7 @@ struct AppState {
     masters_importer: MastersImporter,
     caissify_importer: CaissifyImporter,
     pgn_url_importer: PgnUrlImporter,
+    broadcast_importer: BroadcastImporter,
     player_indexer: PlayerIndexerStub,
     semaphore: &'static Semaphore,
     /// In-memory FIDE name → ID lookup index (built at startup, refreshed periodically).
@@ -180,8 +182,11 @@ async fn serve() {
         .route("/import/caissify", put(caissify_import))
         .route("/import/caissify/pgn-url", post(caissify_pgn_url_import))
         .route("/import/caissify/pgn-url/status", get(caissify_pgn_url_status))
+        .route("/import/caissify/broadcast", post(caissify_broadcast_import))
+        .route("/import/caissify/broadcast/status", get(caissify_broadcast_status))
         .route("/import/caissify/reindex", post(caissify_reindex))
         .route("/import/caissify/reindex-position", post(caissify_reindex_position))
+        .route("/import/caissify/reindex-moves", post(caissify_reindex_moves))
         .route("/import/caissify/fide-link", post(caissify_fide_link))
         .route("/import/fide", put(fide_import))
         .route("/import/fide/refresh", post(fide_refresh))
@@ -227,6 +232,10 @@ async fn serve() {
                 Arc::clone(&fide_index_state),
             ),
             pgn_url_importer: PgnUrlImporter::new(CaissifyImporter::new(
+                Arc::clone(&db),
+                Arc::clone(&fide_index_state),
+            )),
+            broadcast_importer: BroadcastImporter::new(CaissifyImporter::new(
                 Arc::clone(&db),
                 Arc::clone(&fide_index_state),
             )),
@@ -1077,6 +1086,46 @@ async fn caissify_pgn_url_status(
     axum::Json(importer.status())
 }
 
+// ── Broadcast import ──────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct BroadcastImportRequest {
+    year: i32,
+    month: u8,
+}
+
+#[axum::debug_handler(state = AppState)]
+async fn caissify_broadcast_import(
+    State(importer): State<BroadcastImporter>,
+    Json(body): Json<BroadcastImportRequest>,
+) -> impl axum::response::IntoResponse {
+    if importer.start(body.year, body.month) {
+        (
+            axum::http::StatusCode::ACCEPTED,
+            axum::Json(serde_json::json!({
+                "message": format!(
+                    "Broadcast import for {}-{:02} started in the background",
+                    body.year, body.month
+                ),
+            })),
+        )
+    } else {
+        (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({
+                "message": "An import is already running — check /import/caissify/broadcast/status",
+            })),
+        )
+    }
+}
+
+#[axum::debug_handler(state = AppState)]
+async fn caissify_broadcast_status(
+    State(importer): State<BroadcastImporter>,
+) -> axum::Json<ImportStatus> {
+    axum::Json(importer.status())
+}
+
 /// Backfill `caissify_game_meta` and `caissify_game_by_date` for historical
 /// games imported before Phase 0. Idempotent — already-indexed games are
 /// skipped. Can be slow on large databases; run during a maintenance window.
@@ -1187,6 +1236,90 @@ async fn caissify_reindex_position(
         Ok(Json(ReindexPositionResponse {
             processed: total_processed,
             entries_written: total_entries,
+        }))
+    })
+    .await
+}
+
+/// Response from `POST /import/caissify/reindex-moves`.
+#[derive(serde::Serialize)]
+struct ReindexMovesResponse {
+    /// Total games processed.
+    processed: u64,
+    /// Total move-fingerprint entries written to `caissify_game_by_moves`.
+    entries_written: u64,
+}
+
+/// Backfill (or repair) the `caissify_game_by_moves` column family.
+///
+/// Iterates every game in `caissify_game` and writes one SHA-1 entry per game
+/// into `caissify_game_by_moves`. Existing entries are overwritten with the
+/// same value (idempotent — SHA-1 is deterministic). Games with no moves are
+/// skipped.
+///
+/// This is the server-side half of Phase 7 deduplication: after running this
+/// once, any future import of a duplicate game (even with a different player
+/// name) will be rejected via the `has_by_moves` check in `CaissifyImporter`.
+#[axum::debug_handler(state = AppState)]
+async fn caissify_reindex_moves(
+    State(db): State<Arc<Database>>,
+    State(semaphore): State<&'static Semaphore>,
+) -> Result<Json<ReindexMovesResponse>, StatusCode> {
+    spawn_blocking(semaphore, move || {
+        const CHUNK: usize = 2_000;
+
+        let caissify_db = db.caissify();
+        let mut cursor: Option<GameId> = None;
+        let mut total_processed = 0u64;
+        let mut total_written = 0u64;
+
+        loop {
+            let games = caissify_db
+                .iter_games_from(cursor, CHUNK)
+                .expect("iter games for moves reindex");
+
+            if games.is_empty() {
+                break;
+            }
+
+            cursor = games.last().map(|(id, _)| *id);
+            let chunk_len = games.len();
+
+            let mut batch = caissify_db.batch();
+            let mut chunk_written = 0u64;
+
+            for (id, game) in &games {
+                if game.moves.is_empty() {
+                    continue;
+                }
+                let moves_str = game
+                    .moves
+                    .iter()
+                    .map(|m| m.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let fingerprint: [u8; 20] = Sha1::digest(moves_str.as_bytes()).into();
+                batch.put_by_moves(fingerprint, *id);
+                chunk_written += 1;
+            }
+
+            batch.commit().expect("commit moves reindex batch");
+            total_processed += chunk_len as u64;
+            total_written += chunk_written;
+
+            log::info!(
+                "moves reindex: {total_processed} games processed, \
+                 {total_written} fingerprints written"
+            );
+
+            if chunk_len < CHUNK {
+                break;
+            }
+        }
+
+        Ok(Json(ReindexMovesResponse {
+            processed: total_processed,
+            entries_written: total_written,
         }))
     })
     .await

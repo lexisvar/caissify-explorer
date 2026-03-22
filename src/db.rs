@@ -292,6 +292,17 @@ impl Database {
                     cache: &cache,
                 }
                 .descriptor(),
+                // Content-based deduplication index
+                // Key:   [20-byte SHA-1 of space-separated UCI move string]
+                // Value: [6-byte GameId] — the game already stored for these moves
+                // Allows cross-source dedup regardless of player name formatting.
+                Column {
+                    name: "caissify_game_by_moves",
+                    prefix: None, // whole-key bloom filter
+                    merge: None,
+                    cache: &cache,
+                }
+                .descriptor(),
                 // FIDE player database
                 Column {
                     name: "fide_player",
@@ -398,6 +409,10 @@ impl Database {
                 .inner
                 .cf_handle("caissify_game_by_position")
                 .expect("cf caissify_game_by_position"),
+            cf_caissify_game_by_moves: self
+                .inner
+                .cf_handle("caissify_game_by_moves")
+                .expect("cf caissify_game_by_moves"),
         }
     }
 }
@@ -553,6 +568,7 @@ pub struct CaissifyDatabase<'a> {
     cf_caissify_game_by_date: &'a ColumnFamily,
     cf_caissify_game_by_fide: &'a ColumnFamily,
     cf_caissify_game_by_position: &'a ColumnFamily,
+    cf_caissify_game_by_moves: &'a ColumnFamily,
 }
 
 pub struct CaissifyMetrics {
@@ -562,6 +578,7 @@ pub struct CaissifyMetrics {
     num_caissify_game_by_date: u64,
     pub num_caissify_game_by_fide: u64,
     pub num_caissify_game_by_position: u64,
+    pub num_caissify_game_by_moves: u64,
 }
 
 impl CaissifyMetrics {
@@ -575,6 +592,10 @@ impl CaissifyMetrics {
             format!(
                 "caissify_game_by_position={}u",
                 self.num_caissify_game_by_position
+            ),
+            format!(
+                "caissify_game_by_moves={}u",
+                self.num_caissify_game_by_moves
             ),
         ]
         .join(",")
@@ -595,6 +616,8 @@ impl CaissifyDatabase<'_> {
         compact_column(self.inner, self.cf_caissify_game_by_fide);
         log::info!("running manual compaction for caissify_game_by_position ...");
         compact_column(self.inner, self.cf_caissify_game_by_position);
+        log::info!("running manual compaction for caissify_game_by_moves ...");
+        compact_column(self.inner, self.cf_caissify_game_by_moves);
     }
 
     pub fn estimate_metrics(&self) -> Result<CaissifyMetrics, rocksdb::Error> {
@@ -623,12 +646,25 @@ impl CaissifyDatabase<'_> {
                 .inner
                 .property_int_value_cf(self.cf_caissify_game_by_position, ESTIMATE_NUM_KEYS)?
                 .unwrap_or(0),
+            num_caissify_game_by_moves: self
+                .inner
+                .property_int_value_cf(self.cf_caissify_game_by_moves, ESTIMATE_NUM_KEYS)?
+                .unwrap_or(0),
         })
     }
 
     pub fn has_game(&self, id: GameId) -> Result<bool, rocksdb::Error> {
         self.inner
             .get_pinned_cf(self.cf_caissify_game, id.to_bytes())
+            .map(|maybe_entry| maybe_entry.is_some())
+    }
+
+    /// Return true if a game with the given SHA-1 move-sequence fingerprint is
+    /// already stored. Used for cross-source deduplication independent of
+    /// player name formatting.
+    pub fn has_by_moves(&self, fingerprint: &[u8; 20]) -> Result<bool, rocksdb::Error> {
+        self.inner
+            .get_pinned_cf(self.cf_caissify_game_by_moves, fingerprint)
             .map(|maybe_entry| maybe_entry.is_some())
     }
 
@@ -1193,6 +1229,19 @@ impl CaissifyBatch<'_> {
             self.db.cf_caissify_game_by_position,
             key.into_bytes(),
             [],
+        );
+    }
+
+    /// Write a move-sequence fingerprint → GameId deduplication entry.
+    ///
+    /// `fingerprint` is the 20-byte SHA-1 of the space-separated UCI move
+    /// string. `id` is the GameId being inserted, stored as the value so
+    /// callers can identify the earlier duplicate when needed.
+    pub fn put_by_moves(&mut self, fingerprint: [u8; 20], id: GameId) {
+        self.batch.put_cf(
+            self.db.cf_caissify_game_by_moves,
+            fingerprint,
+            id.to_bytes(),
         );
     }
 

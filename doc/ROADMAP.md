@@ -20,6 +20,7 @@ Comprehensive technical analysis and implementation roadmap for extending `caiss
 6. [Performance Impact Analysis](#6-performance-impact-analysis)
 7. [Service Architecture — API vs. Worker Split](#7-service-architecture--api-vs-worker-split)
 8. [Implementation Roadmap](#8-implementation-roadmap)
+9. [Feature 7 — Lichess Broadcast Importer & Content-Based Deduplication](#9-feature-7--lichess-broadcast-importer--content-based-deduplication)
 
 ---
 
@@ -444,6 +445,52 @@ Both services are built from the same Dockerfile; the entrypoint binary differs.
 
 ---
 
+## 9. Feature 7 — Lichess Broadcast Importer & Content-Based Deduplication
+
+### 9.1 Problem
+
+Lichess normalises player names differently from existing sources. A game imported from a PGN file may have `"Vargas Arteaga, Alexis"` as White, while the same game in a broadcast archive appears as `"Alexis Vargas"`. The current SHA-1 game ID (derived from `event + white_name + black_name + date + round`) produces two different IDs for the same physical game, silently inserting a duplicate.
+
+This problem exists for any cross-source import: broadcasts, classic PGN archives, direct FIDE game feeds. The fix must be applied at the infrastructure level so that all future importers benefit automatically.
+
+### 9.2 Solution: Move-Sequence Fingerprint
+
+Compute SHA-1 over the complete space-separated UCI move string (`"e2e4 e7e5 g1f3 …"`). Two chess games with identical UCI move sequences are the same game. Store one entry in a new `caissify_game_by_moves` CF:
+
+```
+CF: caissify_game_by_moves
+Key:   [20-byte SHA-1 of UCI moves string]
+Value: [6-byte GameId]   ← which game already holds this move-sequence
+```
+
+Before any new game is committed, `has_by_moves(fingerprint)` is checked **after** the existing `has_game(id)` check. If found → return `DuplicateGame` regardless of player names or metadata. If not found → write the game and add the fingerprint entry to the batch.
+
+### 9.3 Lichess Broadcast Importer
+
+Archives are published at:
+```
+https://database.lichess.org/broadcast/lichess_db_broadcast_YYYY-MM.pgn.zst
+```
+
+Each file is a zstd-compressed PGN containing all official broadcast games for that month. Lichess provides `WhiteFideId`/`BlackFideId` PGN tags and a unique `GameURL` tag per game \u2014 both of which this codebase already supports.
+
+The `import-lichess-broadcast` binary extends the existing `import-caissify` visitor loop with:
+- **`GameURL` tag**: used as the primary hash seed for the stable 8-char `GameId` (no player name in the hash \u2014 the URL uniquely identifies the game)
+- **`WhiteFideId` / `BlackFideId` tags**: forwarded in JSON payload to skip name-based FIDE matching
+- **Month-range argument** (`--since YYYY-MM --until YYYY-MM`): enables one-command historical backfill
+- **Local cache**: archives already downloaded are skipped on re-run
+
+### 9.4 Performance
+
+| Operation | Cost |
+|---|---|
+| `has_by_moves` point-get per import | < 0.1 ms (20-byte exact key lookup) |
+| `put_by_moves` per import | O(1) — single put, ~26 bytes |
+| Disk overhead for 1M games | ~26 MB raw, ~15 MB compressed |
+| Broadcast archive download (monthly, ~150 MB) | Background, rate-limited |
+
+---
+
 ## 8. Implementation Roadmap
 
 ### Phase 0 — Foundation (prerequisite, ~1–2 days)
@@ -571,6 +618,65 @@ One-time cost for 500K games: approximately 20–60 minutes of CPU on Railway.
 - [ ] Update OpenAPI spec
 - [ ] Update `CONTEXT.md`
 
+### Phase 7 — Lichess Broadcast Importer & Content-Based Deduplication (~2–3 days)
+
+**Problem**: The current game ID is a SHA-1 of `event + white_name + black_name + date + round`. When Lichess normalises a player name differently from the existing record (e.g. `"Alexis Vargas"` vs `"Vargas Arteaga, Alexis"`), the SHA-1 differs and a duplicate is silently inserted.
+
+**Solution**: A content-based fingerprint keyed on the move sequence. Two games with identical UCI moves can never be the same physical game with different notation styles — if the moves match, the game is a duplicate regardless of metadata.
+
+#### Storage Design
+
+```
+CF: caissify_game_by_moves
+Key:   [20-byte SHA-1 of space-separated UCI moves string]
+Value: [6-byte GameId]  ← the game already stored under this move-sequence
+Prefix extractor: none (whole-key)
+```
+
+Size: ~26 bytes per game × 1M games = **~26 MB** total — negligible.
+
+#### Deduplication Hierarchy (at import time)
+
+1. **GameId exact match** — `has_game(id)` — catches same-source duplicates (already implemented).
+2. **Move-sequence SHA-1** — `has_by_moves(fingerprint)` — catches cross-source duplicates with any name variation. **New.**
+3. **Final-position Zobrist check** — existing fallback for games that happen to share an end position.
+
+The SHA-1 fingerprint is computed over the complete space-separated UCI move string (`"e2e4 e7e5 g1f3 …"`). Practically zero false-positive rate for chess games with ≥ 10 moves.
+
+#### New binary: `import-lichess-broadcast`
+
+```
+import-lichess-broadcast \
+  --endpoint http://localhost:9002 \
+  --since 2024-01              # download archives from this month
+  --until 2026-03              # inclusive, defaults to current month
+  --data-dir /tmp/broadcasts   # local cache — skips already-downloaded archives
+  --batch-size 100
+```
+
+Downloads `https://database.lichess.org/broadcast/lichess_db_broadcast_YYYY-MM.pgn.zst`, decompresses on-the-fly with `zstd::Decoder` (same code path as `import-caissify`), and parses PGN with two extra visitor tags:
+
+- `GameURL` → unique per-game Lichess URL, used as the primary hash seed for `GameId`
+- `WhiteFideId` / `BlackFideId` → forwarded directly in the JSON payload to skip name-based matching
+
+#### Implementation checklist
+
+- [x] Add `caissify_game_by_moves` CF descriptor in `src/db.rs` (key = 20-byte SHA-1, value = 6-byte GameId, no prefix extractor) ✅ 2026-03-22
+- [x] Add `cf_caissify_game_by_moves` field to `CaissifyDatabase` and `CaissifyBatch` ✅ 2026-03-22
+- [x] Add `has_by_moves(fingerprint: [u8; 20])` to `CaissifyDatabase` ✅ 2026-03-22
+- [x] Add `put_by_moves(fingerprint: [u8; 20], id: GameId)` to `CaissifyBatch` ✅ 2026-03-22
+- [x] Add `num_caissify_game_by_moves` to `CaissifyMetrics` ✅ 2026-03-22
+- [x] Update `CaissifyImporter::import`: compute SHA-1 of UCI moves, call `has_by_moves` before inserting, write to `caissify_game_by_moves` in batch ✅ 2026-03-22
+- [x] Create `import-pgn/src/bin/import-lichess-broadcast.rs` binary (download + stream-decompress + PGN visitor with `GameURL`/`WhiteFideId`/`BlackFideId` tags + HTTP batch post) ✅ 2026-03-22
+- [x] Add `caissify_game_by_moves` to `compact()` in db.rs ✅ 2026-03-22
+- [x] Add backfill endpoint `POST /import/caissify/reindex-moves` for existing games (populates the CF from stored game move lists) ✅ 2026-03-22
+- [x] Add server-side HTTP endpoint `POST /import/caissify/broadcast` (accepts `{ year, month }`, constructs archive URL, downloads + decompresses + imports in the background via `BroadcastImporter`) ✅ 2026-03-22
+- [x] Add `GET /import/caissify/broadcast/status` endpoint to poll background job status ✅ 2026-03-22
+- [x] Update OpenAPI spec (`/import/caissify/broadcast`, `/import/caissify/broadcast/status`, `BroadcastImportRequest` schema, `/import/caissify/reindex-moves`) ✅ 2026-03-22
+- [ ] Update `CONTEXT.md`
+
+---
+
 ### Total Estimated Effort
 
 | Phase | Effort | Risk |
@@ -582,6 +688,7 @@ One-time cost for 500K games: approximately 20–60 minutes of CPU on Railway.
 | Phase 4 — Player search | 1–2 days | Low (if prefix only), Medium (if Tantivy) |
 | Phase 5 — Hardening | 1–2 days | Low |
 | Phase 6 — Position-based game list | 2–3 days | Low |
-| **Total** | **13–20 days** | |
+| Phase 7 — Lichess broadcast importer | 2–3 days | Low |
+| **Total** | **15–23 days** | |
 
 

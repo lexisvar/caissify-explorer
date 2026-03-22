@@ -242,6 +242,51 @@ pub fn spec() -> Value {
                 }
             },
 
+            // ── /import/caissify/broadcast ─────────────────────────────────
+            "/import/caissify/broadcast": {
+                "post": {
+                    "tags": ["Import"],
+                    "summary": "Trigger Lichess broadcast archive import",
+                    "description": "Instructs the server to download the monthly Lichess broadcast archive for the given year and month, decompress it and import all games into the Caissify database in the background.\n\nThe archive is fetched from `https://database.lichess.org/broadcast/lichess_db_broadcast_{year}-{month}.pgn.zst`.\n\nReturns immediately with `202 Accepted`. Poll `/import/caissify/broadcast/status` to track progress.\n\nOnly one broadcast import job can run at a time.",
+                    "operationId": "importCaissifyBroadcast",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/BroadcastImportRequest" },
+                                "example": {
+                                    "year": 2025,
+                                    "month": 1
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "202": { "description": "Broadcast import job started in the background" },
+                        "409": { "description": "An import is already running" }
+                    }
+                }
+            },
+
+            "/import/caissify/broadcast/status": {
+                "get": {
+                    "tags": ["Import"],
+                    "summary": "Check broadcast import status",
+                    "description": "Returns the current status of the background Lichess broadcast import job.",
+                    "operationId": "getCaissifyBroadcastImportStatus",
+                    "responses": {
+                        "200": {
+                            "description": "Broadcast import status",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/ImportStatus" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+
             "/import/caissify": {
                 "put": {
                     "tags": ["Import"],
@@ -450,6 +495,32 @@ pub fn spec() -> Value {
                                 }
                             }
                         }
+                    }
+                }
+            },
+
+            "/import/caissify/reindex-moves": {
+                "post": {
+                    "tags": ["Import"],
+                    "summary": "Backfill the move-fingerprint deduplication index",
+                    "description": "Populates (or repairs) the `caissify_game_by_moves` column family.\n\nFor every game in `caissify_game` it computes a SHA-1 fingerprint of the UCI move sequence and writes one entry to `caissify_game_by_moves`. This powers cross-source deduplication: once this is run, any future import of a game that has the same moves as an existing entry (regardless of player name formatting) will be rejected as a duplicate.\n\n**Idempotent** — the SHA-1 of a game's moves is deterministic, so re-runs simply overwrite the same value. Games with no recorded moves are skipped.\n\nRun this once after upgrading from a build that predates Phase 7.",
+                    "operationId": "caissifyReindexMoves",
+                    "responses": {
+                        "200": {
+                            "description": "Backfill complete",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "processed":       { "type": "integer", "description": "Total games scanned" },
+                                            "entries_written": { "type": "integer", "description": "Total fingerprint entries written" }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "500": { "description": "Backfill failed — check server logs" }
                     }
                 }
             },
@@ -666,6 +737,16 @@ pub fn spec() -> Value {
                         "cookie": { "type": "string", "description": "Cookie header value to send with the download request (e.g. for Sync.com authenticated links)" }
                     },
                     "required": ["url", "cookie"]
+                },
+
+                "BroadcastImportRequest": {
+                    "type": "object",
+                    "description": "Year and month of the Lichess broadcast monthly archive to import",
+                    "properties": {
+                        "year":  { "type": "integer", "description": "Calendar year of the broadcast archive", "example": 2025 },
+                        "month": { "type": "integer", "minimum": 1, "maximum": 12, "description": "Calendar month (1–12)", "example": 1 }
+                    },
+                    "required": ["year", "month"]
                 },
 
                 "CaissifyGameMeta": {

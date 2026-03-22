@@ -171,6 +171,170 @@ impl PgnUrlImporter {
     }
 }
 
+// ── BroadcastImporter ─────────────────────────────────────────────────────────
+
+/// Background importer for monthly Lichess broadcast archives.
+///
+/// Archives are fetched from:
+/// `https://database.lichess.org/broadcast/lichess_db_broadcast_{YYYY}-{MM:02}.pgn.zst`
+#[derive(Clone)]
+pub struct BroadcastImporter {
+    caissify: CaissifyImporter,
+    state: State,
+}
+
+impl BroadcastImporter {
+    pub fn new(caissify: CaissifyImporter) -> Self {
+        BroadcastImporter {
+            caissify,
+            state: Arc::new(Mutex::new((ImportStatus::Idle, None))),
+        }
+    }
+
+    pub fn status(&self) -> ImportStatus {
+        self.state.lock().expect("lock broadcast state").0.clone()
+    }
+
+    /// Starts a background import for the given year + month.
+    /// Returns `false` (and does nothing) if an import is already running.
+    pub fn start(&self, year: i32, month: u8) -> bool {
+        {
+            let mut guard = self.state.lock().expect("lock broadcast state");
+            if matches!(guard.0, ImportStatus::Running { .. }) {
+                return false;
+            }
+            guard.0 = ImportStatus::Running {
+                games_imported: 0,
+                games_skipped: 0,
+                bytes_downloaded: 0,
+            };
+            guard.1 = Some(Instant::now());
+        }
+
+        let me = self.clone();
+        tokio::spawn(async move {
+            let url = format!(
+                "https://database.lichess.org/broadcast/lichess_db_broadcast_{year}-{month:02}.pgn.zst"
+            );
+            let result = me.run(url).await;
+            let mut guard = me.state.lock().expect("lock broadcast state");
+            let elapsed = guard.1.map_or(0.0, |t| t.elapsed().as_secs_f64());
+            guard.0 = match result {
+                Ok((imported, skipped)) => ImportStatus::Done {
+                    games_imported: imported,
+                    games_skipped: skipped,
+                    elapsed_secs: elapsed,
+                },
+                Err(e) => ImportStatus::Failed {
+                    error: e.to_string(),
+                },
+            };
+        });
+
+        true
+    }
+
+    async fn run(
+        &self,
+        url: String,
+    ) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
+        // ── Download compressed archive to a temp file ───────────────────────
+        let client = reqwest::Client::new();
+        let response = client
+            .get(&url)
+            .header("User-Agent", "caissify-explorer/1.0 (https://caissify.com)")
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(
+                format!("Broadcast download failed with HTTP {}", response.status()).into(),
+            );
+        }
+
+        let tmp_path = std::env::temp_dir().join("caissify_broadcast_import.pgn.zst");
+        {
+            let mut file = tokio::fs::File::create(&tmp_path).await?;
+            let mut bytes_downloaded: u64 = 0;
+            let mut stream = response.bytes_stream();
+
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                bytes_downloaded += chunk.len() as u64;
+                file.write_all(&chunk).await?;
+
+                let mut guard = self.state.lock().expect("lock broadcast state");
+                if let ImportStatus::Running {
+                    bytes_downloaded: bd,
+                    ..
+                } = &mut guard.0
+                {
+                    *bd = bytes_downloaded;
+                }
+            }
+            file.flush().await?;
+
+            log::info!(
+                "Broadcast download complete: {} MB, decompressing and importing",
+                bytes_downloaded / 1_048_576
+            );
+        }
+
+        // ── Decompress + parse + import on a blocking thread ─────────────────
+        let caissify = self.caissify.clone();
+        let state = Arc::clone(&self.state);
+        let path = tmp_path.clone();
+
+        let (imported, skipped) = tokio::task::spawn_blocking(move || {
+            parse_and_import_zstd(path, caissify, state)
+        })
+        .await??;
+
+        tokio::fs::remove_file(&tmp_path).await.ok();
+        Ok((imported, skipped))
+    }
+}
+
+fn parse_and_import_zstd(
+    path: std::path::PathBuf,
+    caissify: CaissifyImporter,
+    state: State,
+) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
+    let file = std::fs::File::open(&path)?;
+    let decoder = zstd::Decoder::new(file)?;
+    let mut visitor = PgnVisitor {
+        caissify,
+        state: Arc::clone(&state),
+        imported: 0,
+        skipped: 0,
+    };
+
+    Reader::new(decoder).visit_all_games(&mut visitor)?;
+
+    let imported = visitor.imported;
+    let skipped = visitor.skipped;
+
+    {
+        let mut guard = state.lock().expect("lock broadcast state");
+        if let ImportStatus::Running {
+            games_imported,
+            games_skipped,
+            ..
+        } = &mut guard.0
+        {
+            *games_imported = imported;
+            *games_skipped = skipped;
+        }
+    }
+
+    log::info!(
+        "Broadcast import finished: {} imported, {} skipped",
+        imported,
+        skipped
+    );
+    Ok((imported, skipped))
+}
+
 // ── PGN parsing + import ──────────────────────────────────────────────────────
 
 fn parse_and_import(

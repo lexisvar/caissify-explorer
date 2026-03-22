@@ -6,6 +6,8 @@ use std::{
 use nohash_hasher::IntMap;
 use shakmaty::{Chess, Color, EnPassantMode, KnownOutcome, Position, uci::UciMove, variant::Variant};
 
+use sha1::{Digest, Sha1};
+
 use crate::{
     api::Error,
     db::Database,
@@ -47,6 +49,29 @@ impl CaissifyImporter {
         if caissify_db
             .has_game(body.id)
             .expect("check for caissify game")
+        {
+            return Err(Error::DuplicateGame { id: body.id });
+        }
+
+        // ── Move-sequence fingerprint (cross-source deduplication) ───────────
+        // SHA-1 of the space-separated UCI move string is content-addressable:
+        // two games with the same moves are the same game, regardless of how
+        // the player names happen to be formatted in this import's source.
+        let moves_fingerprint: [u8; 20] = {
+            let moves_str = body
+                .game
+                .moves
+                .iter()
+                .map(|m| m.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            Sha1::digest(moves_str.as_bytes()).into()
+        };
+
+        if !body.game.moves.is_empty()
+            && caissify_db
+                .has_by_moves(&moves_fingerprint)
+                .expect("check for caissify moves duplicate")
         {
             return Err(Error::DuplicateGame { id: body.id });
         }
@@ -109,6 +134,11 @@ impl CaissifyImporter {
         };
         batch.put_game_meta(body.id, &meta);
         batch.put_by_date(CaissifyByDateKey { year, id: body.id });
+
+        // Write the move-sequence fingerprint for future cross-source dedup.
+        if !body.game.moves.is_empty() {
+            batch.put_by_moves(moves_fingerprint, body.id);
+        }
 
         // Write FIDE secondary index entries when IDs were resolved.
         if white_fide_id != 0 {
