@@ -10,10 +10,10 @@ use rocksdb::{
 use crate::{
     api::{HistoryWanted, LichessQueryFilter, Limits},
     model::{
-        CaissifyByDateKey, CaissifyByFideKey, CaissifyByPositionKey, CaissifyGameMeta,
-        FideNameIndex, FidePlayer, FideRatingKey, FideRatingSnapshot, GameId, History,
-        HistoryBuilder, Key, KeyPrefix, LichessEntry, LichessGame, MastersEntry, MastersGame,
-        Month, PlayerEntry, PlayerStatus, PreparedResponse, UserId, Year,
+        CaissifyByDateKey, CaissifyByFideKey, CaissifyByPlayerKey, CaissifyByPositionKey,
+        CaissifyGameMeta, FideNameIndex, FidePlayer, FideRatingKey, FideRatingSnapshot, GameId,
+        History, HistoryBuilder, Key, KeyPrefix, LichessEntry, LichessGame, MastersEntry,
+        MastersGame, Month, PlayerEntry, PlayerStatus, PreparedResponse, UserId, Year,
     },
 };
 // Re-export so callers don't need to import from model
@@ -280,6 +280,18 @@ impl Database {
                     cache: &cache,
                 }
                 .descriptor(),
+                // Primary name-based player → games index (100 % coverage).
+                // Key: [8-byte FNV-1a hash of normalised name LE][2-byte Year LE][6-byte GameId]
+                // Value: [1-byte color: 0=white 1=black]
+                // Written at import time for every game regardless of FIDE data.
+                // Prefix extractor: 8 bytes (player hash).
+                Column {
+                    name: "caissify_game_by_player",
+                    prefix: Some(8), // 8-byte player-name hash prefix
+                    merge: None,
+                    cache: &cache,
+                }
+                .descriptor(),
                 // Secondary index: position → games
                 // Key: [12-byte KeyPrefix][2-byte Year LE][6-byte GameId]
                 // Value: empty (GameId is embedded in the key)
@@ -405,6 +417,10 @@ impl Database {
                 .inner
                 .cf_handle("caissify_game_by_fide")
                 .expect("cf caissify_game_by_fide"),
+            cf_caissify_game_by_player: self
+                .inner
+                .cf_handle("caissify_game_by_player")
+                .expect("cf caissify_game_by_player"),
             cf_caissify_game_by_position: self
                 .inner
                 .cf_handle("caissify_game_by_position")
@@ -567,6 +583,7 @@ pub struct CaissifyDatabase<'a> {
     cf_caissify_game_meta: &'a ColumnFamily,
     cf_caissify_game_by_date: &'a ColumnFamily,
     cf_caissify_game_by_fide: &'a ColumnFamily,
+    cf_caissify_game_by_player: &'a ColumnFamily,
     cf_caissify_game_by_position: &'a ColumnFamily,
     cf_caissify_game_by_moves: &'a ColumnFamily,
 }
@@ -577,6 +594,7 @@ pub struct CaissifyMetrics {
     num_caissify_game_meta: u64,
     num_caissify_game_by_date: u64,
     pub num_caissify_game_by_fide: u64,
+    pub num_caissify_game_by_player: u64,
     pub num_caissify_game_by_position: u64,
     pub num_caissify_game_by_moves: u64,
 }
@@ -589,6 +607,7 @@ impl CaissifyMetrics {
             format!("caissify_game_meta={}u", self.num_caissify_game_meta),
             format!("caissify_game_by_date={}u", self.num_caissify_game_by_date),
             format!("caissify_game_by_fide={}u", self.num_caissify_game_by_fide),
+            format!("caissify_game_by_player={}u", self.num_caissify_game_by_player),
             format!(
                 "caissify_game_by_position={}u",
                 self.num_caissify_game_by_position
@@ -614,6 +633,8 @@ impl CaissifyDatabase<'_> {
         compact_column(self.inner, self.cf_caissify_game_by_date);
         log::info!("running manual compaction for caissify_game_by_fide ...");
         compact_column(self.inner, self.cf_caissify_game_by_fide);
+        log::info!("running manual compaction for caissify_game_by_player ...");
+        compact_column(self.inner, self.cf_caissify_game_by_player);
         log::info!("running manual compaction for caissify_game_by_position ...");
         compact_column(self.inner, self.cf_caissify_game_by_position);
         log::info!("running manual compaction for caissify_game_by_moves ...");
@@ -641,6 +662,10 @@ impl CaissifyDatabase<'_> {
             num_caissify_game_by_fide: self
                 .inner
                 .property_int_value_cf(self.cf_caissify_game_by_fide, ESTIMATE_NUM_KEYS)?
+                .unwrap_or(0),
+            num_caissify_game_by_player: self
+                .inner
+                .property_int_value_cf(self.cf_caissify_game_by_player, ESTIMATE_NUM_KEYS)?
                 .unwrap_or(0),
             num_caissify_game_by_position: self
                 .inner
@@ -990,6 +1015,88 @@ impl CaissifyDatabase<'_> {
         iter.status().map(|_| results)
     }
 
+    /// Iterate games for a specific player (by normalised name hash), sorted
+    /// by (year, GameId). 100 % coverage — written unconditionally for every
+    /// imported game, independent of FIDE data.
+    ///
+    /// Returns up to `limit + 1` `(CaissifyByPlayerKey, is_black)` pairs after
+    /// applying optional `color_filter`.  The `+ 1` sentinel lets the caller
+    /// detect whether a next page exists.
+    pub fn iter_by_player(
+        &self,
+        hash: u64,
+        since_year: u16,
+        until_year: u16,
+        color_filter: Option<bool>,
+        cursor: Option<CaissifyByPlayerKey>,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<(CaissifyByPlayerKey, bool)>, rocksdb::Error> {
+        let want = limit + 1;
+        let raw_budget = if color_filter.is_some() { want * 8 } else { want };
+
+        let mut opt = ReadOptions::default();
+        opt.fill_cache(true);
+        let mut iter = self
+            .inner
+            .raw_iterator_cf_opt(self.cf_caissify_game_by_player, opt);
+
+        if reverse {
+            match cursor {
+                Some(c) => {
+                    iter.seek_for_prev(c.into_bytes());
+                    if iter.valid() { iter.prev(); }
+                }
+                None => {
+                    iter.seek_for_prev(CaissifyByPlayerKey::upper_bound_sentinel(hash, until_year));
+                }
+            }
+        } else {
+            match cursor {
+                Some(c) => {
+                    iter.seek(c.into_bytes());
+                    if iter.valid() { iter.next(); }
+                }
+                None => {
+                    iter.seek(CaissifyByPlayerKey::lower_bound(hash, since_year));
+                }
+            }
+        }
+
+        let mut results = Vec::with_capacity(want);
+        let mut scanned = 0usize;
+
+        loop {
+            if results.len() >= want || scanned >= raw_budget { break; }
+            let Some(key_bytes) = iter.key() else { break; };
+            if key_bytes.len() < CaissifyByPlayerKey::SIZE { break; }
+            let entry = CaissifyByPlayerKey::read(&mut &key_bytes[..]);
+            if entry.hash != hash { break; }
+            let is_black = iter.value().is_some_and(|v| v.first() == Some(&1));
+            scanned += 1;
+
+            if reverse {
+                if entry.year < since_year { break; }
+                if entry.year <= until_year
+                    && color_filter.map_or(true, |b| b == is_black)
+                {
+                    results.push((entry, is_black));
+                }
+                iter.prev();
+            } else {
+                if entry.year > until_year { break; }
+                if entry.year >= since_year
+                    && color_filter.map_or(true, |b| b == is_black)
+                {
+                    results.push((entry, is_black));
+                }
+                iter.next();
+            }
+        }
+
+        iter.status().map(|_| results)
+    }
+
     /// Iterate games through a specific position, sorted by (year, GameId).
     ///
     /// Returns up to `limit + 1` `CaissifyByPositionKey` entries (the `+ 1`
@@ -1215,6 +1322,19 @@ impl CaissifyBatch<'_> {
     pub fn put_by_fide(&mut self, key: CaissifyByFideKey, is_black: bool) {
         self.batch.put_cf(
             self.db.cf_caissify_game_by_fide,
+            key.into_bytes(),
+            [is_black as u8],
+        );
+    }
+
+    /// Write a player-name-hash → game secondary index entry.
+    ///
+    /// Called for both White and Black on every import.  Guarantees 100 %
+    /// coverage regardless of FIDE data availability.
+    /// `is_black`: true if the player was Black in this game.
+    pub fn put_by_player(&mut self, key: CaissifyByPlayerKey, is_black: bool) {
+        self.batch.put_cf(
+            self.db.cf_caissify_game_by_player,
             key.into_bytes(),
             [is_black as u8],
         );

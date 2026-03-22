@@ -68,13 +68,14 @@ pub fn spec() -> Value {
                         param("limit",       false, "integer", Some("Results per page (default 50, max 200)"), Some(json!(50))),
                         param("since",       false, "integer", Some("Earliest year to include (inclusive)"), Some(json!(2020))),
                         param("until",       false, "integer", Some("Latest year to include (inclusive)"), Some(json!(2026))),
-                        param("page_token",  false, "string",  Some("Opaque cursor from a previous response. Supported for all three query paths (date, fide, and position)."), None),
+                        param("page_token",  false, "string",  Some("Opaque cursor from a previous response. Supported for all query paths (date, player, fide, and position)."), None),
                         param("reverse",     false, "boolean", Some("Return newest games first (default true)"), Some(json!(true))),
                         param("result",      false, "string",  Some("Filter by game result: white, draw, or black"), Some(json!("white"))),
                         param("min_rating",  false, "integer", Some("Minimum max(white_rating, black_rating)"), Some(json!(2700))),
                         param("max_rating",  false, "integer", Some("Maximum max(white_rating, black_rating)"), Some(json!(3000))),
-                        param("fide_id",     false, "integer", Some("Filter by FIDE player ID. When set, games are returned from the caissify_game_by_fide index instead of the date index. Cannot be combined with fen/play."), None),
-                        param("color",       false, "string",  Some("Filter by colour the FIDE player played (white or black). Only used when fide_id is set."), None),
+                        param("player",      false, "string",  Some("Filter by player name. Any formatting variant is accepted — the name is normalised (sorted tokens, lowercase) and hashed before lookup, so \"Carlsen, Magnus\", \"Magnus Carlsen\", and \"CARLSEN Magnus\" all map to the same results. Uses the `caissify_game_by_player` index which has 100 % coverage for every imported game. Cannot be combined with fen/play."), None),
+                        param("fide_id",     false, "integer", Some("Filter by FIDE player ID. When set, games are returned from the caissify_game_by_fide index instead of the date index. Cannot be combined with fen/play or player."), None),
+                        param("color",       false, "string",  Some("Filter by colour the player played (white or black). Used together with player or fide_id."), None),
                     ],
                     "responses": {
                         "200": {
@@ -515,6 +516,32 @@ pub fn spec() -> Value {
                                         "properties": {
                                             "processed":       { "type": "integer", "description": "Total games scanned" },
                                             "entries_written": { "type": "integer", "description": "Total fingerprint entries written" }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "500": { "description": "Backfill failed — check server logs" }
+                    }
+                }
+            },
+
+            "/import/caissify/reindex-player": {
+                "post": {
+                    "tags": ["Import"],
+                    "summary": "Backfill the player-name → game index",
+                    "description": "Populates the `caissify_game_by_player` column family for all existing games.\n\nFor each game in `caissify_game` it computes a FNV-1a hash of the normalised player name (sorted tokens, lowercase) for both White and Black and writes one index entry per player per game.\n\nThis enables `GET /caissify/games?player=<name>` with **100 % coverage** — every game is findable regardless of whether FIDE data is present.\n\n**Run this once** after deploying this feature. New imports are indexed automatically. Safe to re-run — puts are idempotent.",
+                    "operationId": "caissifyReindexPlayer",
+                    "responses": {
+                        "200": {
+                            "description": "Backfill complete",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "processed":       { "type": "integer", "description": "Total games processed" },
+                                            "entries_written": { "type": "integer", "description": "Total player index entries written (2× games: one per colour)" }
                                         }
                                     }
                                 }

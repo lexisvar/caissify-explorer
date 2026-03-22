@@ -184,6 +184,68 @@ impl CaissifyByFideKey {
     }
 }
 
+// ─── CaissifyByPlayerKey ─────────────────────────────────────────────────────
+
+/// Key for the `caissify_game_by_player` column family.
+///
+/// Layout (16 bytes): [8-byte player-name hash LE][2-byte Year LE][6-byte GameId LE]
+///
+/// The player-name hash is `player_name_hash(name)` from `model::fide` — a
+/// FNV-1a hash of the sorted-token normalised name.  Any formatting variant of
+/// the same name (FIDE comma form, Western space form, all-caps, etc.) produces
+/// the same hash, giving 100 % coverage independent of FIDE data.
+///
+/// Prefix extractor: 8 bytes (player hash).  Enables bloom-filter-accelerated
+/// per-player prefix scans, year-range filtering, and cursor pagination.
+///
+/// Value: 1 byte — `0` = player was White, `1` = player was Black.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaissifyByPlayerKey {
+    /// FNV-1a hash of normalised player name.
+    pub hash: u64,
+    pub year: u16,
+    pub id: GameId,
+}
+
+impl CaissifyByPlayerKey {
+    pub const SIZE: usize = 8 + 2 + GameId::SIZE; // 16
+
+    pub fn write<B: BufMut>(&self, buf: &mut B) {
+        buf.put_u64_le(self.hash);
+        buf.put_u16_le(self.year);
+        self.id.write(buf);
+    }
+
+    pub fn into_bytes(self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        self.write(&mut &mut buf[..]);
+        buf
+    }
+
+    pub fn read<B: Buf>(buf: &mut B) -> CaissifyByPlayerKey {
+        let hash = buf.get_u64_le();
+        let year = buf.get_u16_le();
+        let id = GameId::read(buf);
+        CaissifyByPlayerKey { hash, year, id }
+    }
+
+    /// First key for this player hash at or after `since_year`.
+    pub fn lower_bound(hash: u64, since_year: u16) -> [u8; Self::SIZE] {
+        CaissifyByPlayerKey { hash, year: since_year, id: GameId::MIN }.into_bytes()
+    }
+
+    /// Exclusive upper-bound sentinel for all keys with this hash and
+    /// year ≤ `until_year`.
+    pub fn upper_bound_sentinel(hash: u64, until_year: u16) -> [u8; Self::SIZE] {
+        CaissifyByPlayerKey {
+            hash,
+            year: until_year.saturating_add(1),
+            id: GameId::MIN,
+        }
+        .into_bytes()
+    }
+}
+
 // ─── CaissifyByPositionKey ────────────────────────────────────────────────────
 
 /// Key for the `caissify_game_by_position` column family.

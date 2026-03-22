@@ -61,9 +61,9 @@ use crate::{
     lila::{Lila, LilaOpt},
     metrics::Metrics,
     model::{
-        CaissifyByDateKey, CaissifyByFideKey, CaissifyByPositionKey, CaissifyGameMeta,
-        FideNameIndex, GameId, GameResult, KeyBuilder, KeyPrefix, MastersGame, MastersGameWithId,
-        Month, PreparedMove, UserId, UserName,
+        CaissifyByDateKey, CaissifyByFideKey, CaissifyByPlayerKey, CaissifyByPositionKey,
+        CaissifyGameMeta, FideNameIndex, GameId, GameResult, KeyBuilder, KeyPrefix, MastersGame,
+        MastersGameWithId, Month, PreparedMove, UserId, UserName, player_name_hash,
     },
     opening::{Opening, Openings},
     util::{DedupStreamExt as _, ply, spawn_blocking},
@@ -187,6 +187,7 @@ async fn serve() {
         .route("/import/caissify/reindex", post(caissify_reindex))
         .route("/import/caissify/reindex-position", post(caissify_reindex_position))
         .route("/import/caissify/reindex-moves", post(caissify_reindex_moves))
+        .route("/import/caissify/reindex-player", post(caissify_reindex_player))
         .route("/import/caissify/fide-link", post(caissify_fide_link))
         .route("/import/fide", put(fide_import))
         .route("/import/fide/refresh", post(fide_refresh))
@@ -1325,6 +1326,89 @@ async fn caissify_reindex_moves(
     .await
 }
 
+/// Response from `POST /import/caissify/reindex-player`.
+#[derive(serde::Serialize)]
+struct ReindexPlayerResponse {
+    processed: u64,
+    entries_written: u64,
+}
+
+/// Full backfill pass for the `caissify_game_by_player` CF.
+///
+/// Iterates every game in `caissify_game`, computes `player_name_hash` for the
+/// White and Black player names, and writes one entry per player per game.
+/// Safe to call multiple times \u2014 puts are idempotent.
+#[axum::debug_handler(state = AppState)]
+async fn caissify_reindex_player(
+    State(db): State<Arc<Database>>,
+    State(semaphore): State<&'static Semaphore>,
+) -> Result<Json<ReindexPlayerResponse>, StatusCode> {
+    spawn_blocking(semaphore, move || {
+        const CHUNK: usize = 2_000;
+
+        let caissify_db = db.caissify();
+        let mut cursor: Option<GameId> = None;
+        let mut total_processed = 0u64;
+        let mut total_written = 0u64;
+
+        loop {
+            let games = caissify_db
+                .iter_games_from(cursor, CHUNK)
+                .expect("iter games for player reindex");
+
+            if games.is_empty() {
+                break;
+            }
+
+            cursor = games.last().map(|(id, _)| *id);
+            let chunk_len = games.len();
+            let mut batch = caissify_db.batch();
+            let mut chunk_written = 0u64;
+
+            for (id, game) in &games {
+                let year = u16::from(game.date.year());
+
+                batch.put_by_player(
+                    CaissifyByPlayerKey {
+                        hash: player_name_hash(&game.players.white.name),
+                        year,
+                        id: *id,
+                    },
+                    false,
+                );
+                batch.put_by_player(
+                    CaissifyByPlayerKey {
+                        hash: player_name_hash(&game.players.black.name),
+                        year,
+                        id: *id,
+                    },
+                    true,
+                );
+                chunk_written += 2;
+            }
+
+            batch.commit().expect("commit player reindex batch");
+            total_processed += chunk_len as u64;
+            total_written += chunk_written;
+
+            log::info!(
+                "player reindex: {total_processed} games processed, \
+                 {total_written} index entries written"
+            );
+
+            if chunk_len < CHUNK {
+                break;
+            }
+        }
+
+        Ok(Json(ReindexPlayerResponse {
+            processed: total_processed,
+            entries_written: total_written,
+        }))
+    })
+    .await
+}
+
 // ─── FIDE endpoints ───────────────────────────────────────────────────────────
 
 #[axum::debug_handler(state = AppState)]
@@ -1581,6 +1665,31 @@ fn decode_position_page_token(
     (&key.prefix == expected_prefix).then_some(key)
 }
 
+/// Encode a 16-byte CaissifyByPlayerKey as a 32-char lowercase hex string.
+fn encode_player_page_token(key: CaissifyByPlayerKey) -> String {
+    let bytes = key.into_bytes();
+    bytes.iter().fold(String::with_capacity(32), |mut s, b| {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// Decode a 32-char player page token.  Validates that the embedded hash
+/// matches `expected_hash` to prevent cross-player token reuse.
+fn decode_player_page_token(s: &str, expected_hash: u64) -> Option<CaissifyByPlayerKey> {
+    if s.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        let hex_str = std::str::from_utf8(chunk).ok()?;
+        bytes[i] = u8::from_str_radix(hex_str, 16).ok()?;
+    }
+    let key = CaissifyByPlayerKey::read(&mut bytes.as_slice());
+    (key.hash == expected_hash).then_some(key)
+}
+
 /// Encode an 8-byte CaissifyByDateKey as a 16-char lowercase hex string.
 fn encode_page_token(key: CaissifyByDateKey) -> String {
     let bytes = key.into_bytes();
@@ -1678,8 +1787,12 @@ struct CaissifyGamesQuery {
     /// When set the `caissify_game_by_fide` secondary index is used — O(limit)
     /// regardless of how many games exist in the database.
     fide_id: Option<u32>,
-    /// Combined with `fide_id`: restrict to games where the player was
-    /// `"white"` or `"black"`.  Omit for both colours.
+    /// Filter to games by player name (any formatting variant is accepted —
+    /// the name is normalised and hashed before lookup).  Uses the
+    /// `caissify_game_by_player` index, which has 100 % coverage.
+    player: Option<String>,
+    /// Combined with `fide_id` or `player`: restrict to games where the player
+    /// was `"white"` or `"black"`.  Omit for both colours.
     color: Option<String>,
     /// Optional position filter: FEN + UCI moves to play. When provided the
     /// response uses the `caissify_game_by_position` CF for full paginated
@@ -1800,6 +1913,79 @@ async fn caissify_games(
                 games,
                 next_page_token,
             }));
+        }
+
+        // ── Player-name filter path (cursor-paginated via caissify_game_by_player) ──
+        // Uses a normalised-name hash for 100 % coverage: every imported game is
+        // written to this index regardless of whether FIDE data is available.
+        if let Some(ref player_name) = q.player {
+            let hash = player_name_hash(player_name);
+
+            let color_filter: Option<bool> = match q.color.as_deref() {
+                Some("white") => Some(false), // is_black = false
+                Some("black") => Some(true),  // is_black = true
+                _ => None,
+            };
+
+            let cursor = q
+                .page_token
+                .as_deref()
+                .and_then(|s| decode_player_page_token(s, hash));
+
+            let scan_size = limit + 1;
+
+            let player_keys = caissify_db
+                .iter_by_player(hash, since, until, color_filter, cursor, scan_size, reverse)
+                .expect("iter caissify by player");
+
+            let has_more = player_keys.len() > limit;
+            let page_pairs = &player_keys[..player_keys.len().min(limit)];
+
+            let full_games = caissify_db
+                .games(page_pairs.iter().map(|(k, _)| k.id))
+                .expect("batch fetch caissify games for player");
+
+            let meta_passes = |meta: &CaissifyGameMeta| -> bool {
+                if let Some(rf) = q.result {
+                    if meta.result != rf { return false; }
+                }
+                let max_r = meta.white_rating.max(meta.black_rating);
+                if q.min_rating.is_some_and(|m| max_r < m) { return false; }
+                if q.max_rating.is_some_and(|m| max_r > m) { return false; }
+                true
+            };
+
+            let mut games: Vec<CaissifyGameListEntry> = Vec::with_capacity(limit);
+            for ((key, _is_black), maybe_game) in page_pairs.iter().zip(full_games.iter()) {
+                let Some(meta) = caissify_db
+                    .game_meta(key.id)
+                    .expect("get caissify game meta for player")
+                else { continue; };
+                let Some(game) = maybe_game.as_ref() else { continue; };
+                if !meta_passes(&meta) { continue; }
+                games.push(CaissifyGameListEntry {
+                    id: key.id.to_string(),
+                    white: game.players.white.name.clone(),
+                    white_rating: meta.white_rating,
+                    black: game.players.black.name.clone(),
+                    black_rating: meta.black_rating,
+                    event: game.event.clone(),
+                    site: game.site.clone(),
+                    date: game.date.to_string(),
+                    round: game.round.clone(),
+                    result: meta.result,
+                    white_fide_id: (meta.white_fide_id != 0).then_some(meta.white_fide_id),
+                    black_fide_id: (meta.black_fide_id != 0).then_some(meta.black_fide_id),
+                });
+            }
+
+            let next_page_token = if has_more {
+                page_pairs.last().map(|(k, _)| encode_player_page_token(*k))
+            } else {
+                None
+            };
+
+            return Ok(Json(CaissifyGameListResponse { games, next_page_token }));
         }
 
         // ── FIDE player filter path (cursor-paginated via caissify_game_by_fide) ──

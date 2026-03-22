@@ -16,10 +16,11 @@ mod uint;
 mod user;
 
 pub use caissify_meta::{
-    CaissifyByDateKey, CaissifyByFideKey, CaissifyByPositionKey, CaissifyGameMeta, GameResult,
+    CaissifyByDateKey, CaissifyByFideKey, CaissifyByPlayerKey, CaissifyByPositionKey,
+    CaissifyGameMeta, GameResult,
 };
 pub use date::{InvalidDate, LaxDate, Month, Year};
-pub use fide::{FideFlag, FideNameIndex, FidePlayer, FideRatingKey, FideRatingSnapshot, normalize_name};
+pub use fide::{FideFlag, FideNameIndex, FidePlayer, FideRatingKey, FideRatingSnapshot, normalize_name, player_name_hash};
 pub use game_id::{GameId, InvalidGameId};
 pub use history::{History, HistoryBuilder, HistorySegment};
 pub use key::{Key, KeyBuilder, KeyPrefix};

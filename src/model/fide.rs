@@ -118,6 +118,28 @@ impl FidePlayer {
     }
 }
 
+/// Compute a stable 64-bit FNV-1a hash of the normalised form of `name`.
+///
+/// Used as the 8-byte prefix for `caissify_game_by_player` keys so that
+/// any formatting variant of the same player name (comma-separated FIDE,
+/// space-separated Western, all-caps, etc.) maps to the same bucket.
+/// The hash is deterministic and version-independent.
+pub fn player_name_hash(name: &str) -> u64 {
+    let normalized = normalize_name(name);
+    fnv64(normalized.as_bytes())
+}
+
+fn fnv64(data: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+    let mut h = FNV_OFFSET;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
 fn read_string<B: Buf>(buf: &mut B, len: usize) -> String {
     let mut bytes = vec![0u8; len];
     buf.copy_to_slice(&mut bytes);

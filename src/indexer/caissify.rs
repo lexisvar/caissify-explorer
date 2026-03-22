@@ -12,8 +12,9 @@ use crate::{
     api::Error,
     db::Database,
     model::{
-        CaissifyByDateKey, CaissifyByFideKey, CaissifyByPositionKey, CaissifyGameMeta,
-        FideNameIndex, GameResult, KeyBuilder, LaxDate, MastersEntry, MastersGameWithId,
+        CaissifyByDateKey, CaissifyByFideKey, CaissifyByPlayerKey, CaissifyByPositionKey,
+        CaissifyGameMeta, FideNameIndex, GameResult, KeyBuilder, LaxDate, MastersEntry,
+        MastersGameWithId, player_name_hash,
     },
     zobrist::StableZobrist128,
 };
@@ -161,6 +162,24 @@ impl CaissifyImporter {
                 true, // is_black = true → Black
             );
         }
+
+        // Write the name-hash player index — 100 % coverage unconditionally.
+        batch.put_by_player(
+            CaissifyByPlayerKey {
+                hash: player_name_hash(&body.game.players.white.name),
+                year,
+                id: body.id,
+            },
+            false, // White
+        );
+        batch.put_by_player(
+            CaissifyByPlayerKey {
+                hash: player_name_hash(&body.game.players.black.name),
+                year,
+                id: body.id,
+            },
+            true, // Black
+        );
 
         for (key, (uci, turn)) in without_loops {
             let key_prefix = KeyBuilder::caissify().with_zobrist(Variant::Chess, key);
