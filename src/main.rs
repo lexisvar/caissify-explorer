@@ -1816,10 +1816,21 @@ async fn caissify_games(
         let position_filter = q.position_filter;
         let caissify_db = db.caissify();
 
+        // Pre-compute optional player hash and color filter once — used in
+        // both the position path (post-filter) and the dedicated player path.
+        let player_hash: Option<u64> = q.player.as_deref().map(player_name_hash);
+        let color_filter: Option<bool> = match q.color.as_deref() {
+            Some("white") => Some(false), // is_black = false
+            Some("black") => Some(true),  // is_black = true
+            _ => None,
+        };
+
         // ── Position (FEN) filter path ───────────────────────────────────────
         // When a FEN or play sequence is provided, look up all games through
         // that position using the `caissify_game_by_position` CF.  This gives
         // fully paginated results (no 15-game cap) with cursor support.
+        // `player`, `fide_id`, and `color` are applied as cheap post-filters
+        // on each fetched game so all combinations are supported.
         if position_filter.fen.is_some() || !position_filter.play.is_empty() {
             let openings_guard = openings.read().expect("read openings");
             let PlayPosition { pos, .. } = position_filter.position(&openings_guard)?;
@@ -1863,6 +1874,19 @@ async fn caissify_games(
                 true
             };
 
+            // Player-name post-filter on the full game (zero extra DB calls —
+            // full games are already fetched above for the position path).
+            let game_passes_player = |game: &MastersGame| -> bool {
+                let Some(hash) = player_hash else { return true; };
+                let white_match = player_name_hash(&game.players.white.name) == hash;
+                let black_match = player_name_hash(&game.players.black.name) == hash;
+                match color_filter {
+                    Some(false) => white_match,
+                    Some(true)  => black_match,
+                    None        => white_match || black_match,
+                }
+            };
+
             let mut games: Vec<CaissifyGameListEntry> = Vec::with_capacity(limit);
             for (key, maybe_game) in page_keys.iter().zip(full_games.iter()) {
                 let Some(meta) = caissify_db
@@ -1875,6 +1899,9 @@ async fn caissify_games(
                     continue;
                 };
                 if !meta_passes(&meta) {
+                    continue;
+                }
+                if !game_passes_player(game) {
                     continue;
                 }
                 games.push(CaissifyGameListEntry {
@@ -1918,14 +1945,7 @@ async fn caissify_games(
         // ── Player-name filter path (cursor-paginated via caissify_game_by_player) ──
         // Uses a normalised-name hash for 100 % coverage: every imported game is
         // written to this index regardless of whether FIDE data is available.
-        if let Some(ref player_name) = q.player {
-            let hash = player_name_hash(player_name);
-
-            let color_filter: Option<bool> = match q.color.as_deref() {
-                Some("white") => Some(false), // is_black = false
-                Some("black") => Some(true),  // is_black = true
-                _ => None,
-            };
+        if let Some(hash) = player_hash {
 
             let cursor = q
                 .page_token
@@ -1990,12 +2010,7 @@ async fn caissify_games(
 
         // ── FIDE player filter path (cursor-paginated via caissify_game_by_fide) ──
         if let Some(fide_id) = q.fide_id {
-            // Parse optional color restriction.
-            let color_filter: Option<bool> = match q.color.as_deref() {
-                Some("white") => Some(false), // is_black = false
-                Some("black") => Some(true),  // is_black = true
-                _ => None,
-            };
+            // color_filter already computed above.
 
             let cursor = q
                 .page_token
