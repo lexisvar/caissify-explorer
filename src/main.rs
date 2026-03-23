@@ -1826,12 +1826,20 @@ async fn caissify_games(
         };
 
         // ── Position (FEN) filter path ───────────────────────────────────────
-        // When a FEN or play sequence is provided, look up all games through
-        // that position using the `caissify_game_by_position` CF.  This gives
-        // fully paginated results (no 15-game cap) with cursor support.
-        // `player`, `fide_id`, and `color` are applied as cheap post-filters
-        // on each fetched game so all combinations are supported.
-        if position_filter.fen.is_some() || !position_filter.play.is_empty() {
+        // When a FEN or play sequence is provided (without a player filter),
+        // look up all games through that position using the
+        // `caissify_game_by_position` CF.  This gives fully paginated results
+        // with cursor support.  `fide_id` and `color` are applied as cheap
+        // post-filters.
+        //
+        // When a player filter is ALSO present we fall through to the player
+        // path instead: the player index is the primary scan and each result
+        // gets an O(1) position membership check.  This is far more efficient
+        // than post-filtering a position scan when the position matches many
+        // games (e.g. the initial position matches *all* games, so the first
+        // page of the position scan would almost never contain the player's
+        // games).
+        if (position_filter.fen.is_some() || !position_filter.play.is_empty()) && player_hash.is_none() {
             let openings_guard = openings.read().expect("read openings");
             let PlayPosition { pos, .. } = position_filter.position(&openings_guard)?;
             drop(openings_guard);
@@ -1945,7 +1953,23 @@ async fn caissify_games(
         // ── Player-name filter path (cursor-paginated via caissify_game_by_player) ──
         // Uses a normalised-name hash for 100 % coverage: every imported game is
         // written to this index regardless of whether FIDE data is available.
+        // When a position (FEN/play) is also supplied, this path is *still*
+        // used as the primary scan and each game gets an O(1) membership check
+        // against the position CF — see comment on position path above.
         if let Some(hash) = player_hash {
+            // Compute position prefix here when fen/play is also provided, so
+            // we can filter by position while scanning the player index.
+            let position_prefix: Option<[u8; 12]> =
+                if position_filter.fen.is_some() || !position_filter.play.is_empty() {
+                    let openings_guard = openings.read().expect("read openings");
+                    let PlayPosition { pos, .. } = position_filter.position(&openings_guard)?;
+                    drop(openings_guard);
+                    let kp = KeyBuilder::caissify()
+                        .with_zobrist(pos.variant(), pos.zobrist_hash(EnPassantMode::Legal));
+                    Some(kp.key_bytes())
+                } else {
+                    None
+                };
 
             let cursor = q
                 .page_token
@@ -1977,6 +2001,13 @@ async fn caissify_games(
 
             let mut games: Vec<CaissifyGameListEntry> = Vec::with_capacity(limit);
             for ((key, _is_black), maybe_game) in page_pairs.iter().zip(full_games.iter()) {
+                // Position membership check — O(1) point lookup, skips games
+                // that didn't reach the requested position.
+                if let Some(prefix) = position_prefix {
+                    if !caissify_db.game_at_position(prefix, key.year, key.id) {
+                        continue;
+                    }
+                }
                 let Some(meta) = caissify_db
                     .game_meta(key.id)
                     .expect("get caissify game meta for player")

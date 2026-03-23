@@ -1185,6 +1185,16 @@ impl CaissifyDatabase<'_> {
         iter.status().map(|_| results)
     }
 
+    /// Returns `true` when the given game is recorded as having reached the
+    /// position identified by `prefix` (O(1) point lookup — no scan).
+    pub fn game_at_position(&self, prefix: [u8; 12], year: u16, id: GameId) -> bool {
+        let key = CaissifyByPositionKey { prefix, year, id }.into_bytes();
+        self.inner
+            .get_cf(self.cf_caissify_game_by_position, key)
+            .expect("game_at_position lookup")
+            .is_some()
+    }
+
     /// Cursor-paginated scan over the raw game store (`caissify_game` CF).
     ///
     /// Returns up to `limit` `(GameId, MastersGame)` pairs starting
