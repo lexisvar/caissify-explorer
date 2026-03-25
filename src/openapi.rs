@@ -73,9 +73,9 @@ pub fn spec() -> Value {
                         param("result",        false, "string",  Some("Filter by game result: white, draw, or black"), Some(json!("white"))),
                         param("min_rating",    false, "integer", Some("Minimum max(white_rating, black_rating)"), Some(json!(2700))),
                         param("max_rating",    false, "integer", Some("Maximum max(white_rating, black_rating)"), Some(json!(3000))),
-                        param("min_moves",     false, "integer", Some("Minimum half-move count. Games with move_count=0 (pre-Phase 8, run /import/caissify/reindex-meta to backfill) always pass through."), None),
+                        param("min_moves",     false, "integer", Some("Minimum half-move count. Games with move_count=0 (pre-Phase 8, run /import/caissify/reindex-meta to upgrade) always pass through."), None),
                         param("max_moves",     false, "integer", Some("Maximum half-move count. Same caveat as min_moves."), None),
-                        param("sort_by",       false, "string",  Some("Sort dimension: \"date\" (default) or \"rating\". Rating sort uses max(white_rating, black_rating). Changing sort invalidates any existing page_token."), Some(json!("date"))),
+                        param("sort_by",       false, "string",  Some("Sort dimension: \"date\" (default) or \"rating\". Date sort orders by year descending, then month descending within the same year (month=0 for games with unknown month sorts last). Rating sort uses max(white_rating, black_rating) descending. Changing sort invalidates any existing page_token."), Some(json!("date"))),
                         param("player",        false, "string",  Some("Filter by player name (any formatting variant accepted). Cannot be combined with fide_id."), None),
                         param("fide_id",       false, "integer", Some("Filter by FIDE player ID. Cannot be combined with player."), None),
                         param("color",         false, "string",  Some("Filter by colour the player played (white or black). Used together with player or fide_id."), None),
@@ -484,8 +484,8 @@ pub fn spec() -> Value {
             "/import/caissify/reindex-meta": {
                 "post": {
                     "tags": ["Import"],
-                    "summary": "Cursor-resumable meta + rating index backfill (Phase 8)",
-                    "description": "Upgrades meta records to v2 (adds `move_count`) and populates the `caissify_game_by_rating` column family for any game that is still on v1 (`move_count = 0`).\n\nCall repeatedly, passing `cursor` from each response, until `done: true`. Each call is bounded by `chunk` (default 2000, max 10000) so the HTTP request stays short.",
+                    "summary": "Cursor-resumable meta + date/rating index backfill (Phase 9)",
+                    "description": "Upgrades game meta records to v3 (adds `month` field and rewrites the date index key to include month) and ensures `caissify_game_by_rating` entries exist.\n\n- **v1** (15 bytes, no `move_count`) → upgraded to v3\n- **v2** (16 bytes, no `month`) → upgraded to v3\n- **v3** (17 bytes) → skipped\n\nFor each upgraded game the old 8-byte date key is deleted and a new 9-byte date key (year + month + GameId) is written, enabling month-level sub-sort within a year.\n\nCall repeatedly, passing `cursor` from each response, until `done: true`. Each call is bounded by `chunk` (default 2000, max 10000) so the HTTP request stays short.",
                     "operationId": "caissifyReindexMeta",
                     "parameters": [
                         param("cursor", false, "string",  Some("Opaque cursor from a previous response. Omit to start from the beginning."), None),
@@ -844,7 +844,7 @@ pub fn spec() -> Value {
                         "result":        { "type": "string",  "enum": ["white", "draw", "black"], "description": "Game result from White's perspective" },
                         "white_fide_id": { "type": "integer", "nullable": true, "description": "White player FIDE ID (absent if unlinked)" },
                         "black_fide_id": { "type": "integer", "nullable": true, "description": "Black player FIDE ID (absent if unlinked)" },
-                        "move_count":    { "type": "integer", "description": "Half-move (ply) count. 0 means unknown (game imported before Phase 8 — run POST /import/caissify/reindex-meta to backfill).", "example": 82 }
+                        "move_count":    { "type": "integer", "description": "Half-move (ply) count. 0 means unknown (game imported before Phase 8, or month data not yet backfilled — run POST /import/caissify/reindex-meta to upgrade).", "example": 82 }
                     },
                     "required": ["id", "white", "white_rating", "black", "black_rating", "event", "site", "date", "round", "result", "move_count"]
                 },
