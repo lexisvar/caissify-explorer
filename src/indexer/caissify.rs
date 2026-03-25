@@ -125,18 +125,21 @@ impl CaissifyImporter {
         batch.put_game(body.id, &body.game);
 
         let year = u16::from(body.game.date.year());
+        let month = body.game.date.month_u8();
         let move_count = (body.game.moves.len() as u64).min(u8::MAX as u64) as u8;
         let meta = CaissifyGameMeta {
             year,
+            month,
             white_rating: body.game.players.white.rating,
             black_rating: body.game.players.black.rating,
             result: GameResult::from_winner(body.game.winner),
             white_fide_id,
             black_fide_id,
             move_count,
+            is_v3: true,
         };
         batch.put_game_meta(body.id, &meta);
-        batch.put_by_date(CaissifyByDateKey { year, id: body.id });
+        batch.put_by_date(CaissifyByDateKey { year, month, id: body.id });
         batch.put_by_rating(CaissifyByRatingKey {
             max_rating: meta.white_rating.max(meta.black_rating),
             year,

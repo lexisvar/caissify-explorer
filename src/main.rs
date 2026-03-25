@@ -1773,8 +1773,8 @@ fn decode_player_page_token(s: &str, expected_hash: u64) -> Option<CaissifyByPla
     (key.hash == expected_hash).then_some(key)
 }
 
-/// Encode an 8-byte CaissifyByDateKey as an 18-char lowercase hex string
-/// (1-byte sort tag `01` + 8 data bytes).
+/// Encode a 9-byte CaissifyByDateKey as a 20-char lowercase hex string
+/// (sort tag `01` + 9 key bytes = 2 + 18 hex chars).
 fn encode_page_token(key: CaissifyByDateKey) -> String {
     let bytes = key.into_bytes();
     bytes.iter().fold(String::from("01"), |mut s, b| {
@@ -1784,13 +1784,13 @@ fn encode_page_token(key: CaissifyByDateKey) -> String {
     })
 }
 
-/// Decode an 18-char hex date page token.  Validates the `01` sort tag.
+/// Decode a 20-char hex date page token.  Validates the `01` sort tag.
 fn decode_page_token(s: &str) -> Option<CaissifyByDateKey> {
-    if s.len() != 18 || !s.starts_with("01") {
+    if s.len() != 20 || !s.starts_with("01") {
         return None;
     }
     let s = &s[2..];
-    let mut bytes = [0u8; 8];
+    let mut bytes = [0u8; 9];
     for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
         let hex_str = std::str::from_utf8(chunk).ok()?;
         bytes[i] = u8::from_str_radix(hex_str, 16).ok()?;

@@ -793,9 +793,10 @@ impl CaissifyDatabase<'_> {
     /// `caissify_game_by_rating` for any game that was imported before Phase 0
     /// or Phase 8 respectively. Safe to run multiple times:
     /// - Games whose meta record is missing are fully indexed.
-    /// - Games with a 15-byte (v1) meta record are upgraded to v2 (adds
-    ///   `move_count`) and also get a `caissify_game_by_rating` entry.
-    /// - Games with a 16-byte (v2) meta record are skipped (already current).
+    /// - Games with a v1 (15-byte) or v2 (16-byte) meta record are upgraded
+    ///   to v3 (adds `month`) and also get a `caissify_game_by_date` / rating
+    ///   entry with the new 9-byte date key (old 8-byte key is deleted).
+    /// - Games with a v3 (17-byte) meta record are skipped (already current).
     ///
     /// Returns the number of records written/updated.
     pub fn reindex_meta(&self) -> Result<u64, rocksdb::Error> {
@@ -816,9 +817,9 @@ impl CaissifyDatabase<'_> {
                     .map(|buf| CaissifyGameMeta::read(&mut &buf[..]));
 
                 let needs_write = match &existing_meta {
-                    None => true,          // missing entirely
-                    Some(m) if m.move_count == 0 => true, // v1 or not-yet-populated
-                    _ => false,             // v2 with real move_count — skip
+                    None => true,            // missing entirely
+                    Some(m) if !m.is_v3 => true, // v1 or v2: upgrade to v3
+                    _ => false,              // v3 — skip
                 };
 
                 if needs_write {
@@ -826,6 +827,7 @@ impl CaissifyDatabase<'_> {
                         serde_json::from_slice(value_bytes).expect("deserialize caissify game");
 
                     let year = u16::from(game.date.year());
+                    let month = game.date.month_u8();
                     let move_count = (game.moves.len() as u64).min(u8::MAX as u64) as u8;
                     // Preserve any FIDE IDs already linked by the fide-link pass.
                     let (white_fide_id, black_fide_id) = existing_meta
@@ -834,12 +836,14 @@ impl CaissifyDatabase<'_> {
                         .unwrap_or((0, 0));
                     let meta = CaissifyGameMeta {
                         year,
+                        month,
                         white_rating: game.players.white.rating,
                         black_rating: game.players.black.rating,
                         result: crate::model::GameResult::from_winner(game.winner),
                         white_fide_id,
                         black_fide_id,
                         move_count,
+                        is_v3: true,
                     };
 
                     let max_rating = meta.white_rating.max(meta.black_rating);
@@ -850,9 +854,17 @@ impl CaissifyDatabase<'_> {
                     meta.write(&mut meta_buf);
                     batch.put_cf(self.cf_caissify_game_meta, id.to_bytes(), meta_buf);
 
+                    // Delete the legacy 8-byte date key (no-op when absent).
+                    let old_date_key = {
+                        let mut k = [0u8; CaissifyByDateKey::SIZE_V1];
+                        k[0..2].copy_from_slice(&year.to_le_bytes());
+                        k[2..].copy_from_slice(&id.to_bytes());
+                        k
+                    };
+                    batch.delete_cf(self.cf_caissify_game_by_date, old_date_key);
                     batch.put_cf(
                         self.cf_caissify_game_by_date,
-                        CaissifyByDateKey { year, id }.into_bytes(),
+                        CaissifyByDateKey { year, month, id }.into_bytes(),
                         [],
                     );
 
@@ -921,7 +933,7 @@ impl CaissifyDatabase<'_> {
 
             let needs_write = match &existing_meta {
                 None => true,
-                Some(m) if m.move_count == 0 => true,
+                Some(m) if !m.is_v3 => true, // v1 or v2: upgrade to v3
                 _ => false,
             };
 
@@ -929,6 +941,7 @@ impl CaissifyDatabase<'_> {
                 let game: MastersGame =
                     serde_json::from_slice(value_bytes).expect("deserialize caissify game");
                 let year = u16::from(game.date.year());
+                let month = game.date.month_u8();
                 let move_count = (game.moves.len() as u64).min(u8::MAX as u64) as u8;
                 let (white_fide_id, black_fide_id) = existing_meta
                     .as_ref()
@@ -936,21 +949,31 @@ impl CaissifyDatabase<'_> {
                     .unwrap_or((0, 0));
                 let meta = CaissifyGameMeta {
                     year,
+                    month,
                     white_rating: game.players.white.rating,
                     black_rating: game.players.black.rating,
                     result: crate::model::GameResult::from_winner(game.winner),
                     white_fide_id,
                     black_fide_id,
                     move_count,
+                    is_v3: true,
                 };
                 let max_rating = meta.white_rating.max(meta.black_rating);
                 let mut batch = WriteBatch::default();
                 let mut meta_buf = Vec::with_capacity(CaissifyGameMeta::SIZE);
                 meta.write(&mut meta_buf);
                 batch.put_cf(self.cf_caissify_game_meta, id.to_bytes(), meta_buf);
+                // Delete the legacy 8-byte date key (no-op when absent).
+                let old_date_key = {
+                    let mut k = [0u8; CaissifyByDateKey::SIZE_V1];
+                    k[0..2].copy_from_slice(&year.to_le_bytes());
+                    k[2..].copy_from_slice(&id.to_bytes());
+                    k
+                };
+                batch.delete_cf(self.cf_caissify_game_by_date, old_date_key);
                 batch.put_cf(
                     self.cf_caissify_game_by_date,
-                    CaissifyByDateKey { year, id }.into_bytes(),
+                    CaissifyByDateKey { year, month, id }.into_bytes(),
                     [],
                 );
                 batch.put_cf(
@@ -1032,8 +1055,7 @@ impl CaissifyDatabase<'_> {
             let Some(key_bytes) = iter.key() else {
                 break;
             };
-            if key_bytes.len() >= CaissifyByDateKey::SIZE {
-                let entry = CaissifyByDateKey::read(&mut &key_bytes[..]);
+            if let Some(entry) = CaissifyByDateKey::read_any(key_bytes) {
                 if reverse {
                     // Going newest→oldest: stop once we've passed the lower bound.
                     if entry.year < since_year {

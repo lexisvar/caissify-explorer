@@ -7,11 +7,13 @@ use crate::model::GameId;
 /// Compact per-game metadata stored in the `caissify_game_meta` column family.
 ///
 /// Key:   GameId (6 bytes, same as caissify_game)
-/// Value: 16 bytes (v2) — year(2) + white_rating(2) + black_rating(2) + result(1)
-///                        + white_fide_id(4) + black_fide_id(4) + move_count(1)
+/// Value: 17 bytes (v3) — year(2) + white_rating(2) + black_rating(2) + result(1)
+///                        + white_fide_id(4) + black_fide_id(4) + move_count(1) + month(1)
 ///
-/// Legacy v1 records are 15 bytes (no move_count field). They decode cleanly
-/// with `move_count = 0` (meaning "unknown"). New writes always produce v2.
+/// Version history:
+///   v1 — 15 bytes: no move_count  → decoded with move_count = 0
+///   v2 — 16 bytes: adds move_count → decoded with month = 0, is_v3 = false
+///   v3 — 17 bytes: adds month     → current format, is_v3 = true
 #[derive(Debug, Clone, Serialize)]
 pub struct CaissifyGameMeta {
     pub year: u16,
@@ -25,6 +27,13 @@ pub struct CaissifyGameMeta {
     /// Total half-moves played. 0 means unknown (decoded from a v1 record).
     /// Saturating at 255 (i.e. 255 means "255 or more").
     pub move_count: u8,
+    /// Calendar month (1–12). 0 means unknown (PGN lacked a month, or decoded
+    /// from a v1/v2 record before this field was added).
+    pub month: u8,
+    /// `true` when decoded from a v3 (17-byte) record.  Not serialised.
+    /// Used by `reindex_meta` to detect v1/v2 records that need upgrading.
+    #[serde(skip)]
+    pub is_v3: bool,
 }
 
 /// Outcome from White's perspective.
@@ -50,7 +59,9 @@ impl CaissifyGameMeta {
     /// Byte size of a v1 (legacy) record.
     pub const SIZE_V1: usize = 2 + 2 + 2 + 1 + 4 + 4; // 15
     /// Byte size of a v2 record (adds move_count).
-    pub const SIZE: usize = Self::SIZE_V1 + 1; // 16
+    pub const SIZE_V2: usize = Self::SIZE_V1 + 1; // 16
+    /// Byte size of a v3 record (adds month). Current format.
+    pub const SIZE: usize = Self::SIZE_V2 + 1; // 17
 
     pub fn write<B: BufMut>(&self, buf: &mut B) {
         buf.put_u16_le(self.year);
@@ -64,6 +75,7 @@ impl CaissifyGameMeta {
         buf.put_u32_le(self.white_fide_id);
         buf.put_u32_le(self.black_fide_id);
         buf.put_u8(self.move_count); // v2
+        buf.put_u8(self.month);      // v3
     }
 
     /// Decode a v1 (15-byte) or v2 (16-byte) record. v1 records decode with
@@ -82,6 +94,12 @@ impl CaissifyGameMeta {
         let black_fide_id = buf.get_u32_le();
         // v2 adds move_count; v1 records have nothing left — treat as unknown.
         let move_count = if buf.remaining() >= 1 { buf.get_u8() } else { 0 };
+        // v3 adds month (1–12; 0 = unknown).
+        let (month, is_v3) = if buf.remaining() >= 1 {
+            (buf.get_u8(), true)
+        } else {
+            (0, false)
+        };
         CaissifyGameMeta {
             year,
             white_rating,
@@ -90,27 +108,41 @@ impl CaissifyGameMeta {
             white_fide_id,
             black_fide_id,
             move_count,
+            month,
+            is_v3,
         }
     }
 }
 
 /// Key for `caissify_game_by_date` column family.
 ///
-/// Layout (8 bytes): [2-byte Year LE][6-byte GameId LE]
+/// Layout (9 bytes): [2-byte Year LE][1-byte Month][6-byte GameId LE]
 ///
+/// `month` is 1–12; 0 means unknown and sorts before any named month.
 /// Prefix extractor: 2 bytes (year). Allows efficient year-range scans and
-/// cursor-based pagination via `seek(year, game_id)`.
+/// cursor-based pagination via `seek(year, month, game_id)`.
+///
+/// **Migration note**: records written before Phase 9 are 8 bytes (no month).
+/// `read_any` handles both lengths gracefully; `iter_by_date` uses `read_any`
+/// so old and new keys coexist until `/import/caissify/reindex-meta` upgrades
+/// them all.
 #[derive(Debug, Clone, Copy)]
 pub struct CaissifyByDateKey {
     pub year: u16,
+    /// Calendar month (1–12). 0 = unknown (legacy or month absent in PGN).
+    pub month: u8,
     pub id: GameId,
 }
 
 impl CaissifyByDateKey {
-    pub const SIZE: usize = 2 + GameId::SIZE; // 8
+    /// Byte size of current (v2) 9-byte keys.
+    pub const SIZE: usize = 2 + 1 + GameId::SIZE; // 9
+    /// Byte size of legacy (v1) 8-byte keys (no month byte).
+    pub const SIZE_V1: usize = 2 + GameId::SIZE; // 8
 
     pub fn write<B: BufMut>(&self, buf: &mut B) {
         buf.put_u16_le(self.year);
+        buf.put_u8(self.month);
         self.id.write(buf);
     }
 
@@ -122,14 +154,31 @@ impl CaissifyByDateKey {
 
     pub fn read<B: Buf>(buf: &mut B) -> CaissifyByDateKey {
         let year = buf.get_u16_le();
+        let month = buf.get_u8();
         let id = GameId::read(buf);
-        CaissifyByDateKey { year, id }
+        CaissifyByDateKey { year, month, id }
+    }
+
+    /// Read either a v1 (8-byte) or v2 (9-byte) key from a raw byte slice.
+    /// v1 keys decode with `month = 0` (unknown).
+    pub fn read_any(buf: &[u8]) -> Option<CaissifyByDateKey> {
+        if buf.len() == Self::SIZE {
+            Some(Self::read(&mut &buf[..]))
+        } else if buf.len() == Self::SIZE_V1 {
+            let mut b = &buf[..];
+            let year = b.get_u16_le();
+            let id = GameId::read(&mut b);
+            Some(CaissifyByDateKey { year, month: 0, id })
+        } else {
+            None
+        }
     }
 
     /// Exclusive upper-bound key for all games in years ≤ `year`.
     pub fn upper_bound(year: u16) -> [u8; Self::SIZE] {
         CaissifyByDateKey {
             year: year.saturating_add(1),
+            month: 0,
             id: GameId::MIN,
         }
         .into_bytes()

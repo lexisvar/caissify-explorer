@@ -34,6 +34,12 @@ impl LaxDate {
             .map(|m| Month(self.year.0 * 12 + u16::from(m.get()) - 1))
     }
 
+    /// Raw calendar month as a `u8` (1 = January … 12 = December).
+    /// Returns 0 when the month is absent from the PGN date tag.
+    pub fn month_u8(self) -> u8 {
+        self.month.map(|m| m.get()).unwrap_or(0)
+    }
+
     pub fn tomorrow() -> LaxDate {
         let utc_date = OffsetDateTime::now_utc()
             .date()
