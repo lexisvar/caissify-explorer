@@ -7,8 +7,11 @@ use crate::model::GameId;
 /// Compact per-game metadata stored in the `caissify_game_meta` column family.
 ///
 /// Key:   GameId (6 bytes, same as caissify_game)
-/// Value: 15 bytes — year(2) + white_rating(2) + black_rating(2) + result(1)
-///                   + white_fide_id(4) + black_fide_id(4)
+/// Value: 16 bytes (v2) — year(2) + white_rating(2) + black_rating(2) + result(1)
+///                        + white_fide_id(4) + black_fide_id(4) + move_count(1)
+///
+/// Legacy v1 records are 15 bytes (no move_count field). They decode cleanly
+/// with `move_count = 0` (meaning "unknown"). New writes always produce v2.
 #[derive(Debug, Clone, Serialize)]
 pub struct CaissifyGameMeta {
     pub year: u16,
@@ -19,6 +22,9 @@ pub struct CaissifyGameMeta {
     pub white_fide_id: u32,
     /// 0 = unlinked
     pub black_fide_id: u32,
+    /// Total half-moves played. 0 means unknown (decoded from a v1 record).
+    /// Saturating at 255 (i.e. 255 means "255 or more").
+    pub move_count: u8,
 }
 
 /// Outcome from White's perspective.
@@ -41,8 +47,10 @@ impl GameResult {
 }
 
 impl CaissifyGameMeta {
-    /// Byte size on disk.
-    pub const SIZE: usize = 2 + 2 + 2 + 1 + 4 + 4; // 15
+    /// Byte size of a v1 (legacy) record.
+    pub const SIZE_V1: usize = 2 + 2 + 2 + 1 + 4 + 4; // 15
+    /// Byte size of a v2 record (adds move_count).
+    pub const SIZE: usize = Self::SIZE_V1 + 1; // 16
 
     pub fn write<B: BufMut>(&self, buf: &mut B) {
         buf.put_u16_le(self.year);
@@ -55,8 +63,11 @@ impl CaissifyGameMeta {
         });
         buf.put_u32_le(self.white_fide_id);
         buf.put_u32_le(self.black_fide_id);
+        buf.put_u8(self.move_count); // v2
     }
 
+    /// Decode a v1 (15-byte) or v2 (16-byte) record. v1 records decode with
+    /// `move_count = 0` (unknown).
     pub fn read<B: Buf>(buf: &mut B) -> CaissifyGameMeta {
         let year = buf.get_u16_le();
         let white_rating = buf.get_u16_le();
@@ -69,6 +80,8 @@ impl CaissifyGameMeta {
         };
         let white_fide_id = buf.get_u32_le();
         let black_fide_id = buf.get_u32_le();
+        // v2 adds move_count; v1 records have nothing left — treat as unknown.
+        let move_count = if buf.remaining() >= 1 { buf.get_u8() } else { 0 };
         CaissifyGameMeta {
             year,
             white_rating,
@@ -76,6 +89,7 @@ impl CaissifyGameMeta {
             result,
             white_fide_id,
             black_fide_id,
+            move_count,
         }
     }
 }
@@ -305,6 +319,73 @@ impl CaissifyByPositionKey {
         CaissifyByPositionKey {
             prefix,
             year: until_year.saturating_add(1),
+            id: GameId::MIN,
+        }
+        .into_bytes()
+    }
+}
+
+// ─── CaissifyByRatingKey ──────────────────────────────────────────────────────
+
+/// Key for the `caissify_game_by_rating` column family.
+///
+/// Layout (10 bytes): [2-byte max_rating big-endian][2-byte Year LE][6-byte GameId LE]
+///
+/// `max_rating = max(white_rating, black_rating)`.
+/// Big-endian rating bytes mean higher ratings sort last in forward iteration
+/// and **first** in a reverse (`seek_for_prev`) scan — i.e. `reverse=true`
+/// returns the highest-rated games first, which is the default.
+///
+/// Year LE sub-sorts by date within the same rating band.
+///
+/// Prefix extractor: none (whole-key bloom filter).
+/// Value: empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaissifyByRatingKey {
+    /// max(white_rating, black_rating), stored big-endian in the key.
+    pub max_rating: u16,
+    pub year: u16,
+    pub id: GameId,
+}
+
+impl CaissifyByRatingKey {
+    pub const SIZE: usize = 2 + 2 + GameId::SIZE; // 10
+
+    pub fn write<B: BufMut>(&self, buf: &mut B) {
+        buf.put_u16(self.max_rating); // big-endian
+        buf.put_u16_le(self.year);
+        self.id.write(buf);
+    }
+
+    pub fn into_bytes(self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        self.write(&mut &mut buf[..]);
+        buf
+    }
+
+    pub fn read<B: Buf>(buf: &mut B) -> CaissifyByRatingKey {
+        let max_rating = buf.get_u16(); // big-endian
+        let year = buf.get_u16_le();
+        let id = GameId::read(buf);
+        CaissifyByRatingKey { max_rating, year, id }
+    }
+
+    /// First key at or below `rating_ceiling` (exclusive upper bound for year).
+    /// Used as the starting seek point for a reverse (highest-first) scan.
+    pub fn upper_bound_sentinel(rating_ceiling: u16, until_year: u16) -> [u8; Self::SIZE] {
+        CaissifyByRatingKey {
+            max_rating: rating_ceiling,
+            year: until_year.saturating_add(1),
+            id: GameId::MIN,
+        }
+        .into_bytes()
+    }
+
+    /// First key at or above `rating_floor`.
+    pub fn lower_bound(rating_floor: u16, since_year: u16) -> [u8; Self::SIZE] {
+        CaissifyByRatingKey {
+            max_rating: rating_floor,
+            year: since_year,
             id: GameId::MIN,
         }
         .into_bytes()

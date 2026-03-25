@@ -13,8 +13,8 @@ use crate::{
     db::Database,
     model::{
         CaissifyByDateKey, CaissifyByFideKey, CaissifyByPlayerKey, CaissifyByPositionKey,
-        CaissifyGameMeta, FideNameIndex, GameResult, KeyBuilder, LaxDate, MastersEntry,
-        MastersGameWithId, player_name_hash,
+        CaissifyByRatingKey, CaissifyGameMeta, FideNameIndex, GameResult, KeyBuilder, LaxDate,
+        MastersEntry, MastersGameWithId, player_name_hash,
     },
     zobrist::StableZobrist128,
 };
@@ -125,6 +125,7 @@ impl CaissifyImporter {
         batch.put_game(body.id, &body.game);
 
         let year = u16::from(body.game.date.year());
+        let move_count = (body.game.moves.len() as u64).min(u8::MAX as u64) as u8;
         let meta = CaissifyGameMeta {
             year,
             white_rating: body.game.players.white.rating,
@@ -132,9 +133,15 @@ impl CaissifyImporter {
             result: GameResult::from_winner(body.game.winner),
             white_fide_id,
             black_fide_id,
+            move_count,
         };
         batch.put_game_meta(body.id, &meta);
         batch.put_by_date(CaissifyByDateKey { year, id: body.id });
+        batch.put_by_rating(CaissifyByRatingKey {
+            max_rating: meta.white_rating.max(meta.black_rating),
+            year,
+            id: body.id,
+        });
 
         // Write the move-sequence fingerprint for future cross-source dedup.
         if !body.game.moves.is_empty() {

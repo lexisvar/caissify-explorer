@@ -17,7 +17,7 @@ mod user;
 
 pub use caissify_meta::{
     CaissifyByDateKey, CaissifyByFideKey, CaissifyByPlayerKey, CaissifyByPositionKey,
-    CaissifyGameMeta, GameResult,
+    CaissifyByRatingKey, CaissifyGameMeta, GameResult,
 };
 pub use date::{InvalidDate, LaxDate, Month, Year};
 pub use fide::{FideFlag, FideNameIndex, FidePlayer, FideRatingKey, FideRatingSnapshot, normalize_name, player_name_hash};

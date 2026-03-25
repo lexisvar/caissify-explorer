@@ -21,6 +21,7 @@ Comprehensive technical analysis and implementation roadmap for extending `caiss
 7. [Service Architecture — API vs. Worker Split](#7-service-architecture--api-vs-worker-split)
 8. [Implementation Roadmap](#8-implementation-roadmap)
 9. [Feature 7 — Lichess Broadcast Importer & Content-Based Deduplication](#9-feature-7--lichess-broadcast-importer--content-based-deduplication)
+10. [Feature 8 — Position Game List & Player-in-Position Filter](#10-feature-8--position-game-list--player-in-position-filter)
 
 ---
 
@@ -675,6 +676,30 @@ Downloads `https://database.lichess.org/broadcast/lichess_db_broadcast_YYYY-MM.p
 - [x] Update OpenAPI spec (`/import/caissify/broadcast`, `/import/caissify/broadcast/status`, `BroadcastImportRequest` schema, `/import/caissify/reindex-moves`) ✅ 2026-03-22
 - [ ] Update `CONTEXT.md`
 
+### Phase 8 — Position Game List & Player-in-Position Filter (~3–4 days)
+
+Full analysis in [§10](#10-feature-8--position-game-list--player-in-position-filter). The two concrete use cases:
+
+1. **Show all games that passed through a position** (FEN + optional UCI play) — paginated, sortable by date or rating.
+2. **Show games a specific player played through a position** — same endpoint, add `fide_id` filter.
+
+No new sort dimensions beyond `date` and `rating`. No ECO index.
+
+- [ ] Extend `CaissifyGameMeta` to v2: add `move_count: u8` at byte 15 (16 bytes total); v1 15-byte records decode with `move_count = 0`
+- [ ] Add `caissify_game_by_rating` CF: `[2-byte max_rating BE][2-byte year LE][6-byte GameId]` → `[]`; implement `iter_by_rating(since, until, cursor, limit, reverse)`
+- [ ] Update `CaissifyImporter`: write `move_count` in meta v2 (free — moves already counted); write `caissify_game_by_rating` in same batch
+- [ ] Extend Phase 6 FEN handler: add `fide_id` + `color` post-page filter via point-gets on `caissify_game_meta` per GameId
+- [ ] Add `sort_by=date|rating` to `CaissifyGamesQuery`; on FEN path with `sort_by=rating`, intersect `caissify_game_by_position` with `caissify_game_by_rating`; on non-FEN path use `caissify_game_by_rating` directly
+- [ ] Encode 1-byte sort tag in `page_token`; validate on decode → HTTP 400 on mismatch
+- [ ] Add `min_moves` / `max_moves` post-page filters using `move_count` from meta v2
+- [ ] Add `include_total` opt-in with guard: only allowed when `fide_id`, `player_name`, or `fen` present; 429 otherwise
+- [ ] **Decision: Tantivy vs. two-step FIDE UX** — Tantivy for interactive `player_name` search; defer if FIDE coverage is sufficient for the use case
+- [ ] If Tantivy: add `player_name` query param, build `PlayerNameIndex`, integrate at import + backfill
+- [ ] `POST /import/caissify/reindex-meta`: cursor-resumable backfill for `caissify_game_by_rating` + `move_count` on existing records; rebuild Tantivy index
+- [ ] Add `caissify_game_by_rating` to `compact()` in `src/db.rs`
+- [ ] Update OpenAPI spec: `player_name`, `fen`+`fide_id` combination, `sort_by` enum, error table
+- [ ] Update `CONTEXT.md`: new CF, meta v2 layout, player-in-position + player-name query patterns
+
 ---
 
 ### Total Estimated Effort
@@ -689,6 +714,244 @@ Downloads `https://database.lichess.org/broadcast/lichess_db_broadcast_YYYY-MM.p
 | Phase 5 — Hardening | 1–2 days | Low |
 | Phase 6 — Position-based game list | 2–3 days | Low |
 | Phase 7 — Lichess broadcast importer | 2–3 days | Low |
-| **Total** | **15–23 days** | |
+| Phase 8 — Position game list & player-in-position filter | 3–4 days | Low–Medium |
+| **Total** | **18–28 days** | |
 
 
+
+---
+
+## 10. Feature 8 — Position Game List & Player-in-Position Filter
+
+### 10.1 Motivation and Concrete Use Cases
+
+Two query patterns that external applications need on top of the `caissify_game_by_position` index (Phase 6):
+
+**Use case A — All games through a position:**
+
+```
+GET /caissify/games?fen=<FEN>&play=e7e5&sort_by=date&limit=50
+GET /caissify/games?fen=<FEN>&sort_by=rating&limit=50&page_token=<cursor>
+```
+
+**Use case B — Games a specific player played through a position:**
+
+```
+GET /caissify/games?fen=<FEN>&fide_id=1503014&color=white&sort_by=date&limit=50
+```
+
+Both must be **O(limit) per page** regardless of total matching games. The guiding constraint for every design decision:
+
+> **A query must always map to a bounded O(limit) RocksDB scan. No filter or sort combination may degrade into an unbounded full-table scan.**
+
+---
+
+### 10.2 How Each Use Case Maps to RocksDB
+
+#### Use case A — All games through a position
+
+Primary CF: `caissify_game_by_position` (Phase 6):
+```
+Key: [12-byte KeyPrefix][2-byte Year LE][6-byte GameId]
+```
+
+- **`sort_by=date`** (default): forward or reverse iterator on `caissify_game_by_position` with `KeyPrefix` as scan prefix. Pure O(limit) — this is exactly what Phase 6 builds.
+- **`sort_by=rating`**: the position index key encodes date, not rating. For cross-page stable rating sort, use `caissify_game_by_rating` as the primary scan and check each GameId against `caissify_game_by_position` via point-gets. Pick the smaller set as primary: if the player has few games in the DB, iterate player games; if the position has few games in the DB, iterate position games. Both are O(limit + filtered).
+
+#### Use case B — Player in a position
+
+No new CF required. The strategy:
+
+1. Primary scan: `caissify_game_by_position` with `KeyPrefix` — iterate in date order, O(limit + skipped).
+2. For each `GameId`, do a point-get on `caissify_game_meta` (16 bytes, sub-millisecond).
+3. Check `white_fide_id == fide_id || black_fide_id == fide_id`; if `color` is set, check the specific slot.
+4. Collect `limit` passing games; encode the last key as `page_token`.
+
+Match rate is naturally self-regulating: a position a player rarely reached has few total games in the index, so the absolute scan depth is always small. For pathological cases (common position, rare player), add a `scan_exhausted: true` flag in the response when the scan exceeds a server-side cap (e.g. 5000 entries) before filling a page, rather than blocking indefinitely.
+
+---
+
+### 10.3 Player Filtering — Name Search vs. FIDE ID
+
+Two different client intents require completely different technical paths.
+
+#### Intent A — Filter by FIDE ID (exact)
+
+`?fide_id=1503014`
+
+Uses **`caissify_game_by_fide`** (built in Phase 3):
+```
+Key: [4-byte FIDE ID LE][2-byte Year LE][6-byte GameId]
+Value: [1-byte color]
+```
+
+- O(limit) prefix scan — pure RocksDB, no text involved.
+- 100% precision: returns only games where that FIDE ID appears in `caissify_game_meta`. Zero false positives.
+- **This is why FIDE linking (Phase 3) matters**: unlinked games do not appear in a `fide_id` query because there is no index entry for them. The quality of the FIDE link pass directly determines the recall of this filter.
+- Combined with `fen`: post-page filter via point-gets on `caissify_game_meta` (§10.2 use case B).
+
+#### Intent B — Filter by player name string (fuzzy)
+
+`?player_name=carlsen`
+
+RocksDB cannot do fuzzy text search efficiently. Two options:
+
+**Option 1 — Tantivy embedded sidecar (recommended):**
+
+[Tantivy](https://github.com/quickwit-oss/tantivy) is a pure-Rust full-text search library, embedded in-process alongside RocksDB. No external service, no network hop.
+
+Index structure:
+- One document per unique `(normalized_player_name, game_id)` pair.
+- Fields: `name` (tokenized, stored), `game_id` (stored), optionally `color` (white=0/black=1).
+- Total index size: ~10–30 MB for 1M player-game pairs — negligible.
+
+Query path:
+1. `player_name` query hits Tantivy → returns ranked list of `GameId`s (BM25 or prefix-match).
+2. Point-gets on `caissify_game_meta` + `caissify_game` for the matched GameIds.
+3. Paginate via an offset cursor over the Tantivy result set (Tantivy results are fully materialized for a query — pagination is cheap).
+
+Index is updated incrementally at import time and rebuilt on `POST /import/caissify/reindex-meta`.
+
+**Option 2 — `/fide/search` first, then `fide_id` filter (recommended UX pattern):**
+
+For the common case — user types a player name in a UI — the correct UX is:
+1. Call `GET /fide/search?name=magnus+carlsen` → returns ranked FIDE player candidates.
+2. User selects the player → call `GET /caissify/games?fide_id=1503014`.
+
+This separates the "who is the player?" question (FIDE search, already fast) from the "show their games" question (RocksDB prefix scan). It avoids text search on the game list entirely and gives perfect precision once a FIDE ID is selected.
+
+`player_name` on `/caissify/games` is the fallback for players **without** a FIDE ID (amateur games, unlinked records). For those, Tantivy is the right tool.
+
+**Decision rule for implementation priority:**
+- If player name search on `/caissify/games` is an interactive, latency-sensitive feature: invest in Tantivy.
+- If it's only needed for admin/backfill tools, or most real-world players have FIDE IDs: defer Tantivy and use the two-step FIDE search UX.
+
+#### Summary
+
+| Filter | Parameter | Implementation | Precision | Recall |
+|---|---|---|---|---|
+| Exact player | `fide_id=<u32>` | `caissify_game_by_fide` prefix scan | 100% | Limited to linked games |
+| Fuzzy name | `player_name=<string>` | Tantivy BM25 / prefix match | Lower (fuzzy) | High (all games, linked or not) |
+| Two-step UX | `/fide/search` → `fide_id` | FIDE in-memory index + RocksDB scan | 100% | As good as FIDE linking |
+
+---
+
+### 10.4 Sort Contract
+
+Only two sort dimensions are supported on the game list. No sort-by-ECO, no sort-by-player-name, no sort-by-event.
+
+| `sort_by` | Primary CF | `fide_id` compatible? | Notes |
+|---|---|---|---|
+| `date` (default) | `caissify_game_by_position` (FEN path) or `caissify_game_by_date` (no FEN) | ✅ post-page FIDE filter | Year in key; `reverse=true` for newest first |
+| `rating` | `caissify_game_by_rating` (new) intersected with position | ✅ post-page FIDE filter | BE rating key; highest first by default |
+
+Rules:
+1. `sort_by` determines the primary scan. All other filters (`result`, `min/max_rating`, `color`, `fide_id`) are **post-page** on the returned records.
+2. The `page_token` encodes a 1-byte sort tag (`0x01=date`, `0x02=rating`) followed by the raw key bytes. Mismatched tag on decode → HTTP 400.
+3. When `fide_id` is present **without** `fen`, the existing `caissify_game_by_fide` CF is used as before (unchanged behavior); `sort_by` is ignored and documented as "always date-ordered" for this combination.
+
+---
+
+### 10.5 `caissify_game_meta` Schema Update
+
+Add one byte to the existing 15-byte layout:
+
+```
+Bytes  0– 1  year (u16 LE)
+Bytes  2– 3  white_rating (u16 LE)
+Bytes  4– 5  black_rating (u16 LE)
+Byte   6     result (u8)
+Bytes  7–10  white_fide_id (u32 LE)
+Bytes 11–14  black_fide_id (u32 LE)
+Byte  15     move_count (u8, saturating — 255 means "255 or more")   ← NEW
+```
+
+Total: 16 bytes. Existing 15-byte records decode cleanly with `move_count = 0` (unknown). No mandatory backfill. `move_count` is written free at import time — the importer already iterates every move.
+
+---
+
+### 10.6 `caissify_game_by_rating` CF
+
+```
+Key:   [2-byte max_rating big-endian][2-byte year LE][6-byte GameId]
+Value: [] (empty)
+Prefix extractor: none
+```
+
+`max_rating = max(white_rating, black_rating)`. Big-endian rating bytes mean the highest-rated games sort first with a plain forward iterator. Year LE sub-sorts by date within the same rating band.
+
+Used when:
+- `sort_by=rating` on a non-FEN game list: direct range scan.
+- `sort_by=rating` on a FEN game list: intersect with `caissify_game_by_position` — use whichever CF yields the smaller candidate set.
+
+Write cost per game: 1 plain `put` added to the existing import batch — negligible alongside the ~40 merge ops for position stats.
+
+---
+
+### 10.7 Full Query Parameter Contract
+
+```
+GET /caissify/games
+  ?fen=<FEN>                # if present: position-based query
+  &play=<UCI moves>         # optional moves from FEN to reach the target position
+  &fide_id=<u32>            # exact filter: only games where this FIDE ID appears in caissify_game_meta
+  &player_name=<string>     # fuzzy name search: uses Tantivy index; fallback for unlinked players
+  &color=white|black        # with fide_id or player_name: restrict to games as that color
+  &sort_by=date|rating      # default: date
+  &reverse=true|false       # default: true (newest / highest-rated first)
+  &since=<YYYY>             # year range (inclusive)
+  &until=<YYYY>
+  &result=white|draw|black  # post-page filter
+  &min_rating=<u16>         # post-page filter on max(white_rating, black_rating)
+  &max_rating=<u16>
+  &min_moves=<u8>           # post-page filter; requires move_count in meta v2
+  &max_moves=<u8>
+  &limit=<1–200>            # default 50
+  &page_token=<opaque>      # cursor from previous response
+  &include_total=true       # opt-in count; only allowed when fide_id or fen is present
+```
+
+**Error contract:**
+
+| Condition | Status | Body |
+|---|---|---|
+| `sort_by` value not `date` or `rating` | 400 | `{ "error": "invalid sort_by" }` |
+| `page_token` sort tag mismatches active `sort_by` | 400 | `{ "error": "page_token incompatible with sort_by" }` |
+| `color` present without `fide_id` or `player_name` | 400 | `{ "error": "color requires fide_id or player_name" }` |
+| `fide_id` and `player_name` both present | 400 | `{ "error": "fide_id and player_name are mutually exclusive" }` |
+| `include_total=true` without `fide_id`, `player_name`, or `fen` | 429 | `{ "error": "include_total requires fide_id, player_name, or fen" }` |
+| `sort_by=rating` but `caissify_game_by_rating` CF not yet populated | 400 | `{ "error": "sort_by=rating index not available" }` |
+
+**Response additions:**
+
+```json
+{
+  "games": [...],
+  "next_page_token": "01<hex key bytes>",
+  "total": 1847,            // present only when include_total=true
+  "scan_exhausted": true,   // present only when player-in-position scan hit the server cap
+  "player_name_results": 42  // present only on player_name path: total Tantivy matches before pagination
+}
+```
+
+---
+
+### 10.8 Implementation Checklist
+
+- [x] Extend `CaissifyGameMeta` in `src/model/caissify_meta.rs` to v2 (16 bytes: add `move_count: u8`); decode v1 (15-byte) records with `move_count = 0`
+- [x] Update `CaissifyImporter`: write `move_count` in meta v2 (free — moves already iterated); add `caissify_game_by_rating` put to same batch
+- [x] Add `caissify_game_by_rating` CF descriptor in `src/db.rs`; `put_by_rating` in `CaissifyBatch`; `iter_by_rating(since, until, cursor, limit, reverse)` in `CaissifyDatabase`
+- [x] Add `caissify_game_by_rating` to `compact()` in `src/db.rs`
+- [x] Extend Phase 6 FEN handler: add `fide_id` + `color` post-page filter (point-get `caissify_game_meta` per GameId; check FIDE ID slots)
+- [x] Add `sort_by=date|rating` to `CaissifyGamesQuery`; on FEN path with `sort_by=rating`, intersect `caissify_game_by_position` + `caissify_game_by_rating`; on non-FEN path scan `caissify_game_by_rating` directly
+- [x] Encode 1-byte sort tag in `page_token` (`0x01=date`, `0x02=rating`, `0x03=position`, `0x04=fide`, `0x05=player`); validate on decode → HTTP 400 on tag mismatch
+- [x] Add `min_moves` / `max_moves` post-page filters using `move_count` from meta v2
+- [x] Implement `scan_exhausted` cap on player-in-position scans (server budget = 5000 scanned entries)
+- [x] Add `include_total` opt-in with guard: allowed only when `fide_id` or `fen` is present; HTTP 429 otherwise
+- [x] `POST /import/caissify/reindex-meta`: cursor-resumable backfill — populate `caissify_game_by_rating` and `move_count` for existing games
+- [x] **Player name filter** — implemented via `player` param using FNV-1a name-hash index (`caissify_game_by_player` CF, built in Phase 5); Tantivy deferred (two-step FIDE search UX covers the interactive case)
+- [x] Update OpenAPI spec: `sort_by`, `min_moves`, `max_moves`, `include_total`, `scan_exhausted`, `player`, `move_count` in list entry, `total` in response, `/import/caissify/reindex-meta` endpoint
+- [x] Update `CONTEXT.md`: `caissify_game_by_rating` CF, meta v2 layout, all new query parameters, `scan_exhausted` behaviour, reindex endpoints
+
+**Deferred (Phase 9 candidate):**
+- [ ] Tantivy fuzzy `player_name` search — only needed for players without a FIDE ID; current `player` name-hash param covers exact normalised-name lookup

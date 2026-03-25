@@ -434,7 +434,7 @@ curl http://localhost:9002/caissify/pgn/AbCd1234
 
 ### `GET /caissify/games`
 
-Paginated list of games with compact metadata. Cursor-based pagination via `page_token` (hex-encoded `CaissifyByDateKey`).
+Paginated list of games with compact metadata. Cursor-based pagination via `page_token`. The token embeds a 1-byte sort tag — passing a token from a `sort_by=date` response to a `sort_by=rating` request returns HTTP 400.
 
 **Query Parameters:**
 
@@ -444,12 +444,32 @@ Paginated list of games with compact metadata. Cursor-based pagination via `page
 | `since` | u16 (year) | `0` | Earliest year (inclusive) |
 | `until` | u16 (year) | `65535` | Latest year (inclusive) |
 | `page_token` | string | — | Cursor from previous response |
-| `reverse` | bool | `true` | Newest first if true |
+| `reverse` | bool | `true` | Newest / highest-rated first if true |
+| `sort_by` | `"date"` \| `"rating"` | `"date"` | Primary sort dimension |
 | `result` | `"white"` \| `"draw"` \| `"black"` | — | Filter by result |
 | `min_rating` | u16 | — | Min max(white_rating, black_rating) |
 | `max_rating` | u16 | — | Max max(white_rating, black_rating) |
-| `fide_id` | u32 | — | Filter to all games by this FIDE player (uses `caissify_game_by_fide` CF — O(limit), cursor-paginated) |
-| `color` | `"white"` \| `"black"` | — | Combined with `fide_id`: restrict to games as that colour |
+| `min_moves` | u8 | — | Min half-move count (games with `move_count=0` always pass — v1 records lack this field) |
+| `max_moves` | u8 | — | Max half-move count (same caveat) |
+| `fide_id` | u32 | — | Filter to games by this FIDE player (`caissify_game_by_fide` CF — O(limit)) |
+| `color` | `"white"` \| `"black"` | — | Combined with `fide_id` or `player`: restrict to games as that colour |
+| `player` | string | — | Filter by normalised player name (FNV-1a name-hash lookup via `caissify_game_by_player` CF — 100% coverage) |
+| `fen` | string | — | Position filter: only games reaching this FEN |
+| `play` | string | — | UCI moves to play from `fen` before computing position hash |
+| `include_total` | bool | — | When `true`, include `total` count in response. Requires `fide_id` or `fen`; returns HTTP 429 otherwise |
+
+**Path routing (in priority order):**
+
+| Conditions | Primary CF | Notes |
+|---|---|---|
+| `fen` + `fide_id` | `caissify_game_by_position` | budget scan 5000; FIDE match via meta point-get |
+| `fen` + `sort_by=rating` | `caissify_game_by_rating` | budget scan 5000; position check via `game_at_position` |
+| `fen` + `player` | `caissify_game_by_player` | player index primary; position membership check |
+| `fen` (default) | `caissify_game_by_position` | pure date-ordered scan |
+| `player` | `caissify_game_by_player` | direct player prefix scan |
+| `fide_id` | `caissify_game_by_fide` | direct FIDE prefix scan |
+| `sort_by=rating` | `caissify_game_by_rating` | direct rating range scan |
+| (none) | `caissify_game_by_date` | full date-ordered fallback |
 
 **Response:**
 
@@ -458,18 +478,39 @@ Paginated list of games with compact metadata. Cursor-based pagination via `page
   "games": [
     {
       "id": "AbCd1234",
-      "year": 2024,
-      "white_rating": 2800,
-      "black_rating": 2750,
+      "white": "Carlsen, Magnus",
+      "white_rating": 2882,
+      "black": "Caruana, Fabiano",
+      "black_rating": 2818,
+      "event": "Norway Chess 2024",
+      "site": "Stavanger NOR",
+      "date": "2024.06.11",
+      "round": "5",
       "result": "white",
-      "white_fide_id": 1503014
+      "white_fide_id": 1503014,
+      "black_fide_id": 2020009,
+      "move_count": 54
     }
   ],
-  "next_page_token": "0007d00000001234"
+  "next_page_token": "020a3f...",
+  "total": 1847,
+  "scan_exhausted": true
 }
 ```
 
-Note: `white_fide_id`/`black_fide_id` are omitted when 0 (not yet linked). `next_page_token` is absent on the last page.
+- `white_fide_id` / `black_fide_id`: omitted when 0 (not yet linked).
+- `next_page_token`: absent on the last page.
+- `total`: only present when `include_total=true`.
+- `scan_exhausted`: only present (and `true`) when a position-intersect scan hit the 5000-entry server budget before filling a full page. The client should surface this to the user and offer a narrower filter.
+- `move_count`: `0` means unknown (v1 meta record imported before Phase 8).
+
+**Error responses:**
+
+| Condition | Status |
+|---|---|
+| `sort_by` not `date` or `rating` | 400 |
+| `page_token` sort tag mismatches `sort_by` | 400 |
+| `include_total=true` without `fide_id` or `fen` | 429 |
 
 ---
 
@@ -569,6 +610,41 @@ Backfill `caissify_game_meta` and `caissify_game_by_date` for all games imported
 ```bash
 curl -X POST http://localhost:9002/import/caissify/reindex
 ```
+
+---
+
+### `POST /import/caissify/reindex-meta`
+
+Cursor-resumable backfill that populates `caissify_game_by_rating` and `move_count` (meta v2) for all existing games. Run this once after upgrading to Phase 8, then after each page until `done` is `true`.
+
+**Query Parameters:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `chunk` | u64 | `10000` | Games to process per call |
+| `cursor` | string | — | `next_cursor` from the previous response |
+
+```bash
+# First call
+curl -X POST "http://localhost:9002/import/caissify/reindex-meta?chunk=5000"
+
+# Subsequent calls — pass the cursor until done=true
+curl -X POST "http://localhost:9002/import/caissify/reindex-meta?chunk=5000&cursor=<next_cursor>"
+```
+
+**Response:** `{ "processed": N, "done": true|false, "next_cursor": "..." }`
+
+---
+
+### `POST /import/caissify/reindex-position`
+
+Full backfill of the `caissify_game_by_position` CF. Replays every game's moves and writes one entry per unique position per game (~40 entries/game). Idempotent. Run once after Phase 6 upgrade or when the position CF is suspected to be incomplete.
+
+```bash
+curl -X POST http://localhost:9002/import/caissify/reindex-position
+```
+
+**Response:** `{ "processed": N, "entries_written": M }`
 
 ---
 

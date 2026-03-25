@@ -11,9 +11,10 @@ use crate::{
     api::{HistoryWanted, LichessQueryFilter, Limits},
     model::{
         CaissifyByDateKey, CaissifyByFideKey, CaissifyByPlayerKey, CaissifyByPositionKey,
-        CaissifyGameMeta, FideNameIndex, FidePlayer, FideRatingKey, FideRatingSnapshot, GameId,
-        History, HistoryBuilder, Key, KeyPrefix, LichessEntry, LichessGame, MastersEntry,
-        MastersGame, Month, PlayerEntry, PlayerStatus, PreparedResponse, UserId, Year,
+        CaissifyByRatingKey, CaissifyGameMeta, FideNameIndex, FidePlayer, FideRatingKey,
+        FideRatingSnapshot, GameId, History, HistoryBuilder, Key, KeyPrefix, LichessEntry,
+        LichessGame, MastersEntry, MastersGame, Month, PlayerEntry, PlayerStatus,
+        PreparedResponse, UserId, Year,
     },
 };
 // Re-export so callers don't need to import from model
@@ -304,6 +305,18 @@ impl Database {
                     cache: &cache,
                 }
                 .descriptor(),
+                // Secondary index: rating → games (for sort_by=rating on game list)
+                // Key: [2-byte max_rating BE][2-byte Year LE][6-byte GameId]
+                // Value: empty
+                // No prefix extractor — whole-key bloom filter.
+                // Forward iteration = ascending rating; reverse = descending (highest first).
+                Column {
+                    name: "caissify_game_by_rating",
+                    prefix: None,
+                    merge: None,
+                    cache: &cache,
+                }
+                .descriptor(),
                 // Content-based deduplication index
                 // Key:   [20-byte SHA-1 of space-separated UCI move string]
                 // Value: [6-byte GameId] — the game already stored for these moves
@@ -429,6 +442,10 @@ impl Database {
                 .inner
                 .cf_handle("caissify_game_by_moves")
                 .expect("cf caissify_game_by_moves"),
+            cf_caissify_game_by_rating: self
+                .inner
+                .cf_handle("caissify_game_by_rating")
+                .expect("cf caissify_game_by_rating"),
         }
     }
 }
@@ -586,6 +603,7 @@ pub struct CaissifyDatabase<'a> {
     cf_caissify_game_by_player: &'a ColumnFamily,
     cf_caissify_game_by_position: &'a ColumnFamily,
     cf_caissify_game_by_moves: &'a ColumnFamily,
+    cf_caissify_game_by_rating: &'a ColumnFamily,
 }
 
 pub struct CaissifyMetrics {
@@ -597,6 +615,7 @@ pub struct CaissifyMetrics {
     pub num_caissify_game_by_player: u64,
     pub num_caissify_game_by_position: u64,
     pub num_caissify_game_by_moves: u64,
+    pub num_caissify_game_by_rating: u64,
 }
 
 impl CaissifyMetrics {
@@ -615,6 +634,10 @@ impl CaissifyMetrics {
             format!(
                 "caissify_game_by_moves={}u",
                 self.num_caissify_game_by_moves
+            ),
+            format!(
+                "caissify_game_by_rating={}u",
+                self.num_caissify_game_by_rating
             ),
         ]
         .join(",")
@@ -639,6 +662,8 @@ impl CaissifyDatabase<'_> {
         compact_column(self.inner, self.cf_caissify_game_by_position);
         log::info!("running manual compaction for caissify_game_by_moves ...");
         compact_column(self.inner, self.cf_caissify_game_by_moves);
+        log::info!("running manual compaction for caissify_game_by_rating ...");
+        compact_column(self.inner, self.cf_caissify_game_by_rating);
     }
 
     pub fn estimate_metrics(&self) -> Result<CaissifyMetrics, rocksdb::Error> {
@@ -674,6 +699,10 @@ impl CaissifyDatabase<'_> {
             num_caissify_game_by_moves: self
                 .inner
                 .property_int_value_cf(self.cf_caissify_game_by_moves, ESTIMATE_NUM_KEYS)?
+                .unwrap_or(0),
+            num_caissify_game_by_rating: self
+                .inner
+                .property_int_value_cf(self.cf_caissify_game_by_rating, ESTIMATE_NUM_KEYS)?
                 .unwrap_or(0),
         })
     }
@@ -760,11 +789,15 @@ impl CaissifyDatabase<'_> {
             .map(|buf| CaissifyGameMeta::read(&mut &buf[..])))
     }
 
-    /// Backfill `caissify_game_meta` and `caissify_game_by_date` for any game
-    /// that was imported before Phase 0. Safe to run multiple times — already-
-    /// populated entries are skipped.
+    /// Backfill `caissify_game_meta`, `caissify_game_by_date`, and
+    /// `caissify_game_by_rating` for any game that was imported before Phase 0
+    /// or Phase 8 respectively. Safe to run multiple times:
+    /// - Games whose meta record is missing are fully indexed.
+    /// - Games with a 15-byte (v1) meta record are upgraded to v2 (adds
+    ///   `move_count`) and also get a `caissify_game_by_rating` entry.
+    /// - Games with a 16-byte (v2) meta record are skipped (already current).
     ///
-    /// Returns the number of records written.
+    /// Returns the number of records written/updated.
     pub fn reindex_meta(&self) -> Result<u64, rocksdb::Error> {
         let mut count = 0u64;
         let mut iter = self.inner.raw_iterator_cf(self.cf_caissify_game);
@@ -774,35 +807,61 @@ impl CaissifyDatabase<'_> {
             if key_bytes.len() == GameId::SIZE {
                 let id = GameId::read(&mut &key_bytes[..]);
 
-                // Skip if already indexed.
-                if self
+                // Check whether an up-to-date (v2) meta record already exists.
+                // Also read existing FIDE IDs so we don't overwrite them when
+                // upgrading a v1 record.
+                let existing_meta = self
                     .inner
                     .get_pinned_cf(self.cf_caissify_game_meta, id.to_bytes())?
-                    .is_none()
-                {
-                    // Deserialise the full game to extract year and ratings.
+                    .map(|buf| CaissifyGameMeta::read(&mut &buf[..]));
+
+                let needs_write = match &existing_meta {
+                    None => true,          // missing entirely
+                    Some(m) if m.move_count == 0 => true, // v1 or not-yet-populated
+                    _ => false,             // v2 with real move_count — skip
+                };
+
+                if needs_write {
                     let game: MastersGame =
                         serde_json::from_slice(value_bytes).expect("deserialize caissify game");
 
                     let year = u16::from(game.date.year());
+                    let move_count = (game.moves.len() as u64).min(u8::MAX as u64) as u8;
+                    // Preserve any FIDE IDs already linked by the fide-link pass.
+                    let (white_fide_id, black_fide_id) = existing_meta
+                        .as_ref()
+                        .map(|m| (m.white_fide_id, m.black_fide_id))
+                        .unwrap_or((0, 0));
                     let meta = CaissifyGameMeta {
                         year,
                         white_rating: game.players.white.rating,
                         black_rating: game.players.black.rating,
                         result: crate::model::GameResult::from_winner(game.winner),
-                        white_fide_id: 0,
-                        black_fide_id: 0,
+                        white_fide_id,
+                        black_fide_id,
+                        move_count,
                     };
 
+                    let max_rating = meta.white_rating.max(meta.black_rating);
+
                     let mut batch = WriteBatch::default();
+
                     let mut meta_buf = Vec::with_capacity(CaissifyGameMeta::SIZE);
                     meta.write(&mut meta_buf);
                     batch.put_cf(self.cf_caissify_game_meta, id.to_bytes(), meta_buf);
+
                     batch.put_cf(
                         self.cf_caissify_game_by_date,
                         CaissifyByDateKey { year, id }.into_bytes(),
                         [],
                     );
+
+                    batch.put_cf(
+                        self.cf_caissify_game_by_rating,
+                        CaissifyByRatingKey { max_rating, year, id }.into_bytes(),
+                        [],
+                    );
+
                     self.inner.write(batch)?;
                     count += 1;
                 }
@@ -812,6 +871,105 @@ impl CaissifyDatabase<'_> {
         }
 
         iter.status().map(|_| count)
+    }
+
+    /// Cursor-resumable variant of `reindex_meta`.
+    ///
+    /// Processes up to `chunk_size` games starting from `cursor` (exclusive).
+    /// Returns `(processed_count, next_cursor)`.  `next_cursor = None` means
+    /// the table has been exhausted — the caller should stop.
+    ///
+    /// This is intentionally bounded so an HTTP handler can call it within a
+    /// semaphore slot and return promptly, letting the client drive the loop.
+    pub fn reindex_meta_from(
+        &self,
+        cursor: Option<GameId>,
+        chunk_size: usize,
+    ) -> Result<(u64, Option<GameId>), rocksdb::Error> {
+        let mut count = 0u64;
+        let mut last_id: Option<GameId> = None;
+        let mut seen = 0usize;
+
+        let mut iter = self.inner.raw_iterator_cf(self.cf_caissify_game);
+        match cursor {
+            Some(c) => {
+                // seek to the cursor key itself, then step past it.
+                iter.seek(c.to_bytes());
+                if iter.valid() {
+                    iter.next();
+                }
+            }
+            None => iter.seek_to_first(),
+        }
+
+        while let Some((key_bytes, value_bytes)) = iter.item() {
+            if seen >= chunk_size {
+                break;
+            }
+            if key_bytes.len() != GameId::SIZE {
+                iter.next();
+                continue;
+            }
+            let id = GameId::read(&mut &key_bytes[..]);
+            last_id = Some(id);
+            seen += 1;
+
+            let existing_meta = self
+                .inner
+                .get_pinned_cf(self.cf_caissify_game_meta, id.to_bytes())?
+                .map(|buf| CaissifyGameMeta::read(&mut &buf[..]));
+
+            let needs_write = match &existing_meta {
+                None => true,
+                Some(m) if m.move_count == 0 => true,
+                _ => false,
+            };
+
+            if needs_write {
+                let game: MastersGame =
+                    serde_json::from_slice(value_bytes).expect("deserialize caissify game");
+                let year = u16::from(game.date.year());
+                let move_count = (game.moves.len() as u64).min(u8::MAX as u64) as u8;
+                let (white_fide_id, black_fide_id) = existing_meta
+                    .as_ref()
+                    .map(|m| (m.white_fide_id, m.black_fide_id))
+                    .unwrap_or((0, 0));
+                let meta = CaissifyGameMeta {
+                    year,
+                    white_rating: game.players.white.rating,
+                    black_rating: game.players.black.rating,
+                    result: crate::model::GameResult::from_winner(game.winner),
+                    white_fide_id,
+                    black_fide_id,
+                    move_count,
+                };
+                let max_rating = meta.white_rating.max(meta.black_rating);
+                let mut batch = WriteBatch::default();
+                let mut meta_buf = Vec::with_capacity(CaissifyGameMeta::SIZE);
+                meta.write(&mut meta_buf);
+                batch.put_cf(self.cf_caissify_game_meta, id.to_bytes(), meta_buf);
+                batch.put_cf(
+                    self.cf_caissify_game_by_date,
+                    CaissifyByDateKey { year, id }.into_bytes(),
+                    [],
+                );
+                batch.put_cf(
+                    self.cf_caissify_game_by_rating,
+                    CaissifyByRatingKey { max_rating, year, id }.into_bytes(),
+                    [],
+                );
+                self.inner.write(batch)?;
+                count += 1;
+            }
+
+            iter.next();
+        }
+
+        iter.status()?;
+        // If we consumed exactly chunk_size keys there may be more; return the
+        // last id as the cursor.  Otherwise we exhausted the table.
+        let next_cursor = if seen >= chunk_size { last_id } else { None };
+        Ok((count, next_cursor))
     }
 
     /// Iterate games sorted by (year, GameId). Returns up to `limit` entries
@@ -1015,6 +1173,46 @@ impl CaissifyDatabase<'_> {
         iter.status().map(|_| results)
     }
 
+    /// Count games for a specific FIDE player in [since_year, until_year].
+    /// Streams the `caissify_game_by_fide` CF without loading any game data.
+    /// Optional `color_filter` restricts to white (false) or black (true).
+    pub fn count_by_fide(
+        &self,
+        fide_id: u32,
+        since_year: u16,
+        until_year: u16,
+        color_filter: Option<bool>,
+    ) -> Result<u64, rocksdb::Error> {
+        let mut opt = ReadOptions::default();
+        opt.fill_cache(false);
+        let mut iter = self
+            .inner
+            .raw_iterator_cf_opt(self.cf_caissify_game_by_fide, opt);
+        iter.seek_for_prev(CaissifyByFideKey::upper_bound_sentinel(fide_id, until_year));
+        let mut count = 0u64;
+        loop {
+            let Some(key_bytes) = iter.key() else { break };
+            if key_bytes.len() < CaissifyByFideKey::SIZE {
+                break;
+            }
+            let entry = CaissifyByFideKey::read(&mut &key_bytes[..]);
+            if entry.fide_id != fide_id {
+                break;
+            }
+            if entry.year < since_year {
+                break;
+            }
+            if entry.year <= until_year {
+                let is_black = iter.value().is_some_and(|v| v.first() == Some(&1));
+                if color_filter.map_or(true, |b| b == is_black) {
+                    count += 1;
+                }
+            }
+            iter.prev();
+        }
+        iter.status().map(|_| count)
+    }
+
     /// Iterate games for a specific player (by normalised name hash), sorted
     /// by (year, GameId). 100 % coverage — written unconditionally for every
     /// imported game, independent of FIDE data.
@@ -1185,6 +1383,41 @@ impl CaissifyDatabase<'_> {
         iter.status().map(|_| results)
     }
 
+    /// Count all games through a specific position in [since_year, until_year].
+    /// Streams the `caissify_game_by_position` CF; no game data is loaded.
+    pub fn count_by_position(
+        &self,
+        prefix: [u8; 12],
+        since_year: u16,
+        until_year: u16,
+    ) -> Result<u64, rocksdb::Error> {
+        let mut opt = ReadOptions::default();
+        opt.fill_cache(false);
+        let mut iter = self
+            .inner
+            .raw_iterator_cf_opt(self.cf_caissify_game_by_position, opt);
+        iter.seek_for_prev(CaissifyByPositionKey::upper_bound_sentinel(prefix, until_year));
+        let mut count = 0u64;
+        loop {
+            let Some(key_bytes) = iter.key() else { break };
+            if key_bytes.len() < CaissifyByPositionKey::SIZE {
+                break;
+            }
+            let entry = CaissifyByPositionKey::read(&mut &key_bytes[..]);
+            if entry.prefix != prefix {
+                break;
+            }
+            if entry.year < since_year {
+                break;
+            }
+            if entry.year <= until_year {
+                count += 1;
+            }
+            iter.prev();
+        }
+        iter.status().map(|_| count)
+    }
+
     /// Returns `true` when the given game is recorded as having reached the
     /// position identified by `prefix` (O(1) point lookup — no scan).
     pub fn game_at_position(&self, prefix: [u8; 12], year: u16, id: GameId) -> bool {
@@ -1193,6 +1426,105 @@ impl CaissifyDatabase<'_> {
             .get_cf(self.cf_caissify_game_by_position, key)
             .expect("game_at_position lookup")
             .is_some()
+    }
+
+    /// Iterate games sorted by (max_rating, year, GameId).
+    ///
+    /// `rating_floor` / `rating_ceiling` restrict the scan to keys whose
+    /// max_rating is in `[rating_floor, rating_ceiling]` (inclusive). Pass
+    /// `0` / `u16::MAX` for no restriction.
+    ///
+    /// `reverse = true` (default) returns highest-rated games first; the
+    /// starting seek is the first key at or below `rating_ceiling`.
+    ///
+    /// Returns up to `limit + 1` entries; the extra entry lets the caller
+    /// detect whether a next page exists.
+    pub fn iter_by_rating(
+        &self,
+        rating_floor: u16,
+        rating_ceiling: u16,
+        since_year: u16,
+        until_year: u16,
+        cursor: Option<CaissifyByRatingKey>,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<CaissifyByRatingKey>, rocksdb::Error> {
+        let want = limit + 1;
+
+        let mut opt = ReadOptions::default();
+        opt.fill_cache(true);
+        let mut iter = self
+            .inner
+            .raw_iterator_cf_opt(self.cf_caissify_game_by_rating, opt);
+
+        if reverse {
+            match cursor {
+                Some(c) => {
+                    iter.seek_for_prev(c.into_bytes());
+                    if iter.valid() {
+                        iter.prev();
+                    }
+                }
+                None => {
+                    iter.seek_for_prev(CaissifyByRatingKey::upper_bound_sentinel(
+                        rating_ceiling,
+                        until_year,
+                    ));
+                }
+            }
+        } else {
+            match cursor {
+                Some(c) => {
+                    iter.seek(c.into_bytes());
+                    if iter.valid() {
+                        iter.next();
+                    }
+                }
+                None => {
+                    iter.seek(CaissifyByRatingKey::lower_bound(rating_floor, since_year));
+                }
+            }
+        }
+
+        let mut results = Vec::with_capacity(want);
+
+        loop {
+            if results.len() >= want {
+                break;
+            }
+            let Some(key_bytes) = iter.key() else { break };
+            if key_bytes.len() < CaissifyByRatingKey::SIZE {
+                break;
+            }
+            let entry = CaissifyByRatingKey::read(&mut &key_bytes[..]);
+            if reverse {
+                if entry.max_rating < rating_floor {
+                    break;
+                }
+                if entry.year < since_year {
+                    iter.prev();
+                    continue;
+                }
+                if entry.max_rating <= rating_ceiling && entry.year <= until_year {
+                    results.push(entry);
+                }
+                iter.prev();
+            } else {
+                if entry.max_rating > rating_ceiling {
+                    break;
+                }
+                if entry.year > until_year {
+                    iter.next();
+                    continue;
+                }
+                if entry.max_rating >= rating_floor && entry.year >= since_year {
+                    results.push(entry);
+                }
+                iter.next();
+            }
+        }
+
+        iter.status().map(|_| results)
     }
 
     /// Cursor-paginated scan over the raw game store (`caissify_game` CF).
@@ -1372,6 +1704,18 @@ impl CaissifyBatch<'_> {
             self.db.cf_caissify_game_by_moves,
             fingerprint,
             id.to_bytes(),
+        );
+    }
+
+    /// Write a rating → game secondary index entry.
+    ///
+    /// One entry per game. Key encodes `max(white_rating, black_rating)` in
+    /// big-endian so a reverse iterator returns highest-rated games first.
+    pub fn put_by_rating(&mut self, key: CaissifyByRatingKey) {
+        self.batch.put_cf(
+            self.db.cf_caissify_game_by_rating,
+            key.into_bytes(),
+            [], // value is empty
         );
     }
 

@@ -14,6 +14,8 @@ pub enum Error {
     IllegalUciMoveError(#[from] IllegalUciMoveError),
     #[error("bad request: {0}")]
     SanError(#[from] SanError),
+    #[error("bad request: {0}")]
+    BadQuery(String),
     #[error("duplicate game {id}")]
     DuplicateGame { id: GameId },
     #[error("rejected import of {id} due to average rating {rating}")]
@@ -24,10 +26,14 @@ pub enum Error {
     IndexerQueueFull,
     #[error("duplicate opening position")]
     DuplicateOpening,
+    #[error("include_total requires fide_id, player, or fen")]
+    TooManyRequests,
     #[error("bad request: {0}")]
     CsvError(Arc<csv::Error>),
     #[error("internal request failed: {0}")]
     ReqwestError(Arc<reqwest::Error>),
+    #[error("internal server error")]
+    Internal,
 }
 
 impl From<PositionError<VariantPosition>> for Error {
@@ -53,15 +59,17 @@ impl axum::response::IntoResponse for Error {
         (
             match self {
                 Error::IndexerQueueFull => StatusCode::SERVICE_UNAVAILABLE,
+                Error::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
                 Error::PositionError(_)
                 | Error::IllegalUciMoveError(_)
                 | Error::SanError(_)
+                | Error::BadQuery(_)
                 | Error::DuplicateGame { .. }
                 | Error::RejectedRating { .. }
                 | Error::RejectedDate { .. }
                 | Error::CsvError(_)
                 | Error::DuplicateOpening => StatusCode::BAD_REQUEST,
-                Error::ReqwestError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                Error::ReqwestError(_) | Error::Internal => StatusCode::INTERNAL_SERVER_ERROR,
             },
             self.to_string(),
         )

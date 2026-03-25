@@ -59,23 +59,27 @@ pub fn spec() -> Value {
                 "get": {
                     "tags": ["Games"],
                     "summary": "List Caissify games (paginated)",
-                    "description": "Returns a cursor-paginated list of Caissify games sorted by year. Use `next_page_token` from the response to fetch the next page.",
+                    "description": "Returns a cursor-paginated list of Caissify games. Default sort is by date (newest first); use `sort_by=rating` to sort by max(white_rating, black_rating) descending.\n\nAll filter combinations:\n- `fen` alone — all games through that position, date order\n- `fen` + `sort_by=rating` — games through that position, rating order\n- `fen` + `fide_id` — games where that player reached the position (streaming scan with 5000-entry budget; see `scan_exhausted`)\n- `fide_id` alone — all games by FIDE player, date order\n- `player` alone — all games by normalised player name hash\n- No filter — full table scan, date or rating order",
                     "operationId": "listCaissifyGames",
                     "parameters": [
-                        param("fen",         false, "string",  Some("FEN of the position to filter by. When provided, returns all games through that position from the `caissify_game_by_position` index with full cursor-based pagination (no game cap)."), None),
-                        param("play",        false, "string",  Some("Comma-separated UCI moves to play from the FEN before filtering"), None),
-                        param("variant",     false, "string",  Some("Variant (default: chess)"), Some(json!("chess"))),
-                        param("limit",       false, "integer", Some("Results per page (default 50, max 200)"), Some(json!(50))),
-                        param("since",       false, "integer", Some("Earliest year to include (inclusive)"), Some(json!(2020))),
-                        param("until",       false, "integer", Some("Latest year to include (inclusive)"), Some(json!(2026))),
-                        param("page_token",  false, "string",  Some("Opaque cursor from a previous response. Supported for all query paths (date, player, fide, and position)."), None),
-                        param("reverse",     false, "boolean", Some("Return newest games first (default true)"), Some(json!(true))),
-                        param("result",      false, "string",  Some("Filter by game result: white, draw, or black"), Some(json!("white"))),
-                        param("min_rating",  false, "integer", Some("Minimum max(white_rating, black_rating)"), Some(json!(2700))),
-                        param("max_rating",  false, "integer", Some("Maximum max(white_rating, black_rating)"), Some(json!(3000))),
-                        param("player",      false, "string",  Some("Filter by player name. Any formatting variant is accepted — the name is normalised (sorted tokens, lowercase) and hashed before lookup, so \"Carlsen, Magnus\", \"Magnus Carlsen\", and \"CARLSEN Magnus\" all map to the same results. Uses the `caissify_game_by_player` index which has 100 % coverage for every imported game. Cannot be combined with fen/play."), None),
-                        param("fide_id",     false, "integer", Some("Filter by FIDE player ID. When set, games are returned from the caissify_game_by_fide index instead of the date index. Cannot be combined with fen/play or player."), None),
-                        param("color",       false, "string",  Some("Filter by colour the player played (white or black). Used together with player or fide_id."), None),
+                        param("fen",           false, "string",  Some("FEN of the position to filter by. When provided, returns all games through that position with full cursor-based pagination."), None),
+                        param("play",          false, "string",  Some("Comma-separated UCI moves to play from the FEN before filtering"), None),
+                        param("variant",       false, "string",  Some("Variant (default: chess)"), Some(json!("chess"))),
+                        param("limit",         false, "integer", Some("Results per page (default 50, max 200)"), Some(json!(50))),
+                        param("since",         false, "integer", Some("Earliest year to include (inclusive)"), Some(json!(2020))),
+                        param("until",         false, "integer", Some("Latest year to include (inclusive)"), Some(json!(2026))),
+                        param("page_token",    false, "string",  Some("Opaque cursor from a previous response. Each sort dimension has its own token format — passing a token from a different sort will return HTTP 400."), None),
+                        param("reverse",       false, "boolean", Some("Return newest/highest-rated games first (default true)"), Some(json!(true))),
+                        param("result",        false, "string",  Some("Filter by game result: white, draw, or black"), Some(json!("white"))),
+                        param("min_rating",    false, "integer", Some("Minimum max(white_rating, black_rating)"), Some(json!(2700))),
+                        param("max_rating",    false, "integer", Some("Maximum max(white_rating, black_rating)"), Some(json!(3000))),
+                        param("min_moves",     false, "integer", Some("Minimum half-move count. Games with move_count=0 (pre-Phase 8, run /import/caissify/reindex-meta to backfill) always pass through."), None),
+                        param("max_moves",     false, "integer", Some("Maximum half-move count. Same caveat as min_moves."), None),
+                        param("sort_by",       false, "string",  Some("Sort dimension: \"date\" (default) or \"rating\". Rating sort uses max(white_rating, black_rating). Changing sort invalidates any existing page_token."), Some(json!("date"))),
+                        param("player",        false, "string",  Some("Filter by player name (any formatting variant accepted). Cannot be combined with fide_id."), None),
+                        param("fide_id",       false, "integer", Some("Filter by FIDE player ID. Cannot be combined with player."), None),
+                        param("color",         false, "string",  Some("Filter by colour the player played (white or black). Used together with player or fide_id."), None),
+                        param("include_total", false, "boolean", Some("When true, include a total count in the response. Requires fide_id or fen; returns HTTP 429 otherwise."), None),
                     ],
                     "responses": {
                         "200": {
@@ -85,7 +89,9 @@ pub fn spec() -> Value {
                                     "schema": { "$ref": "#/components/schemas/CaissifyGameListResponse" }
                                 }
                             }
-                        }
+                        },
+                        "400": bad_request_response(),
+                        "429": { "description": "include_total requested without a required filter (fide_id or fen)" }
                     }
                 }
             },
@@ -475,6 +481,38 @@ pub fn spec() -> Value {
                 }
             },
 
+            "/import/caissify/reindex-meta": {
+                "post": {
+                    "tags": ["Import"],
+                    "summary": "Cursor-resumable meta + rating index backfill (Phase 8)",
+                    "description": "Upgrades meta records to v2 (adds `move_count`) and populates the `caissify_game_by_rating` column family for any game that is still on v1 (`move_count = 0`).\n\nCall repeatedly, passing `cursor` from each response, until `done: true`. Each call is bounded by `chunk` (default 2000, max 10000) so the HTTP request stays short.",
+                    "operationId": "caissifyReindexMeta",
+                    "parameters": [
+                        param("cursor", false, "string",  Some("Opaque cursor from a previous response. Omit to start from the beginning."), None),
+                        param("chunk",  false, "integer", Some("Games to process per call (default 2000, max 10000)"), Some(json!(2000))),
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Chunk processed",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "updated":     { "type": "integer", "description": "Games whose meta was written or upgraded in this chunk" },
+                                            "next_cursor": { "type": "string",  "nullable": true, "description": "Opaque cursor to pass to the next call. null when the table is exhausted." },
+                                            "done":        { "type": "boolean", "description": "true when all games have been processed" }
+                                        },
+                                        "required": ["updated", "done"]
+                                    }
+                                }
+                            }
+                        },
+                        "400": bad_request_response()
+                    }
+                }
+            },
+
             "/import/caissify/reindex-position": {
                 "post": {
                     "tags": ["Import"],
@@ -805,9 +843,10 @@ pub fn spec() -> Value {
                         "round":         { "type": "string",  "description": "Round number or label", "example": "1" },
                         "result":        { "type": "string",  "enum": ["white", "draw", "black"], "description": "Game result from White's perspective" },
                         "white_fide_id": { "type": "integer", "nullable": true, "description": "White player FIDE ID (absent if unlinked)" },
-                        "black_fide_id": { "type": "integer", "nullable": true, "description": "Black player FIDE ID (absent if unlinked)" }
+                        "black_fide_id": { "type": "integer", "nullable": true, "description": "Black player FIDE ID (absent if unlinked)" },
+                        "move_count":    { "type": "integer", "description": "Half-move (ply) count. 0 means unknown (game imported before Phase 8 — run POST /import/caissify/reindex-meta to backfill).", "example": 82 }
                     },
-                    "required": ["id", "white", "white_rating", "black", "black_rating", "event", "site", "date", "round", "result"]
+                    "required": ["id", "white", "white_rating", "black", "black_rating", "event", "site", "date", "round", "result", "move_count"]
                 },
 
                 "CaissifyGameListResponse": {
@@ -815,7 +854,9 @@ pub fn spec() -> Value {
                     "description": "Cursor-paginated list of Caissify games",
                     "properties": {
                         "games":           { "type": "array", "items": { "$ref": "#/components/schemas/CaissifyGameListEntry" } },
-                        "next_page_token": { "type": "string", "nullable": true, "description": "Opaque hex cursor; absent on the last page", "example": "0007d00000001234" }
+                        "next_page_token": { "type": "string", "nullable": true, "description": "Opaque hex cursor; absent on the last page. Contains a sort-dimension tag — using a token from a different sort returns HTTP 400." },
+                        "scan_exhausted":  { "type": "boolean", "nullable": true, "description": "Only present (and true) on the fen+fide_id path when the server-side 5000-entry scan budget was hit before filling a full page. Treat this response as partial; narrow your filters or accept incomplete results." },
+                        "total":           { "type": "integer", "nullable": true, "description": "Total matching entries for this query. Only present when include_total=true is passed and a scoping filter (fide_id or fen) is provided." }
                     },
                     "required": ["games"]
                 },
