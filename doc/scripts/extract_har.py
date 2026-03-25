@@ -1,6 +1,6 @@
 import json, sys
 
-with open('/Users/ares/Development/rust/caissify-explorer/har.har') as f:
+with open('/Users/ares/Development/rust/caissify-explorer/doc/scripts/har.har') as f:
     har = json.load(f)
 
 for entry in har['log']['entries']:
