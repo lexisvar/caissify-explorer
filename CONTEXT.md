@@ -717,7 +717,7 @@ curl http://localhost:9002/monitor/cf/lichess/rocksdb.stats
 curl http://localhost:9002/monitor/cf/masters/rocksdb.estimate-live-data-size
 ```
 
-Column families: `masters`, `masters_game`, `lichess`, `lichess_game`, `player`, `player_status`, `caissify`, `caissify_game`, `caissify_game_meta`, `caissify_game_by_date`, `caissify_game_by_fide`, `fide_player`, `fide_rating_history`
+Column families: `masters`, `masters_game`, `lichess`, `lichess_game`, `player`, `player_status`, `caissify`, `caissify_game`, `caissify_game_meta`, `caissify_game_by_date`, `caissify_game_by_fide`, `caissify_game_by_player`, `caissify_game_by_position`, `caissify_game_by_rating`, `caissify_game_by_moves`, `fide_player`, `fide_rating_history`
 
 ---
 
@@ -827,9 +827,13 @@ curl -X PUT http://localhost:9002/import/caissify \
 | `player_status` | `UserId(bytes)` | `PlayerStatus` | Indexing progress and cooldown per player |
 | `caissify` | `KeyPrefix(12) + Month(2)` | `MastersEntry` (merged) | Per-position Caissify game stats + top games (no rating floor) |
 | `caissify_game` | `GameId(6)` | `MastersGame` | Full game record for PGN generation |
-| `caissify_game_meta` | `GameId(6)` | `CaissifyGameMeta` (15 bytes) | Compact metadata: year, ratings, result, FIDE IDs |
+| `caissify_game_meta` | `GameId(6)` | `CaissifyGameMeta` (16 bytes v2 / 15 bytes v1) | Compact metadata: year, ratings, result, FIDE IDs, move_count |
 | `caissify_game_by_date` | `Year(2) + GameId(6)` | `[]` (empty) | Secondary date index for paginated game listing |
 | `caissify_game_by_fide` | `FideId(4) + Year(2) + GameId(6)` | `color(1)` | Secondary FIDE-player index; prefix=4 bytes; value 0=White 1=Black |
+| `caissify_game_by_player` | `NameHash(8) + Year(2) + GameId(6)` | `color(1)` | Secondary player-name index (FNV-1a hash); prefix=8 bytes; 100% coverage |
+| `caissify_game_by_position` | `KeyPrefix(12) + Year(2) + GameId(6)` | `[]` (empty) | Secondary position index; prefix=12 bytes; ~40 entries/game |
+| `caissify_game_by_rating` | `MaxRating(2 BE) + Year(2) + GameId(6)` | `[]` (empty) | Secondary rating index (big-endian for natural high-first sort); no prefix |
+| `caissify_game_by_moves` | `SHA-1(UCI moves)(20)` | `GameId(6)` | Content-based dedup; maps move-sequence fingerprint → first-seen game |
 | `fide_player` | `FideId(4)` | `FidePlayer` (variable) | FIDE player profile: name, country, title, birth year |
 | `fide_rating_history` | `FideId(4) + Month(2)` | `FideRatingSnapshot` (9 bytes) | Monthly standard/rapid/blitz rating snapshot per player |
 

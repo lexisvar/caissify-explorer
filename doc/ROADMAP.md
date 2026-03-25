@@ -674,7 +674,7 @@ Downloads `https://database.lichess.org/broadcast/lichess_db_broadcast_YYYY-MM.p
 - [x] Add server-side HTTP endpoint `POST /import/caissify/broadcast` (accepts `{ year, month }`, constructs archive URL, downloads + decompresses + imports in the background via `BroadcastImporter`) ✅ 2026-03-22
 - [x] Add `GET /import/caissify/broadcast/status` endpoint to poll background job status ✅ 2026-03-22
 - [x] Update OpenAPI spec (`/import/caissify/broadcast`, `/import/caissify/broadcast/status`, `BroadcastImportRequest` schema, `/import/caissify/reindex-moves`) ✅ 2026-03-22
-- [ ] Update `CONTEXT.md`
+- [x] Update `CONTEXT.md` ✅ 2026-03-25
 
 ### Phase 8 — Position Game List & Player-in-Position Filter (~3–4 days)
 
@@ -685,20 +685,19 @@ Full analysis in [§10](#10-feature-8--position-game-list--player-in-position-fi
 
 No new sort dimensions beyond `date` and `rating`. No ECO index.
 
-- [ ] Extend `CaissifyGameMeta` to v2: add `move_count: u8` at byte 15 (16 bytes total); v1 15-byte records decode with `move_count = 0`
-- [ ] Add `caissify_game_by_rating` CF: `[2-byte max_rating BE][2-byte year LE][6-byte GameId]` → `[]`; implement `iter_by_rating(since, until, cursor, limit, reverse)`
-- [ ] Update `CaissifyImporter`: write `move_count` in meta v2 (free — moves already counted); write `caissify_game_by_rating` in same batch
-- [ ] Extend Phase 6 FEN handler: add `fide_id` + `color` post-page filter via point-gets on `caissify_game_meta` per GameId
-- [ ] Add `sort_by=date|rating` to `CaissifyGamesQuery`; on FEN path with `sort_by=rating`, intersect `caissify_game_by_position` with `caissify_game_by_rating`; on non-FEN path use `caissify_game_by_rating` directly
-- [ ] Encode 1-byte sort tag in `page_token`; validate on decode → HTTP 400 on mismatch
-- [ ] Add `min_moves` / `max_moves` post-page filters using `move_count` from meta v2
-- [ ] Add `include_total` opt-in with guard: only allowed when `fide_id`, `player_name`, or `fen` present; 429 otherwise
-- [ ] **Decision: Tantivy vs. two-step FIDE UX** — Tantivy for interactive `player_name` search; defer if FIDE coverage is sufficient for the use case
-- [ ] If Tantivy: add `player_name` query param, build `PlayerNameIndex`, integrate at import + backfill
-- [ ] `POST /import/caissify/reindex-meta`: cursor-resumable backfill for `caissify_game_by_rating` + `move_count` on existing records; rebuild Tantivy index
-- [ ] Add `caissify_game_by_rating` to `compact()` in `src/db.rs`
-- [ ] Update OpenAPI spec: `player_name`, `fen`+`fide_id` combination, `sort_by` enum, error table
-- [ ] Update `CONTEXT.md`: new CF, meta v2 layout, player-in-position + player-name query patterns
+- [x] Extend `CaissifyGameMeta` to v2: add `move_count: u8` at byte 15 (16 bytes total); v1 15-byte records decode with `move_count = 0` ✅ 2026-03-25
+- [x] Add `caissify_game_by_rating` CF: `[2-byte max_rating BE][2-byte year LE][6-byte GameId]` → `[]`; implement `iter_by_rating(since, until, cursor, limit, reverse)` ✅ 2026-03-25
+- [x] Update `CaissifyImporter`: write `move_count` in meta v2 (free — moves already counted); write `caissify_game_by_rating` in same batch ✅ 2026-03-25
+- [x] Extend Phase 6 FEN handler: add `fide_id` + `color` post-page filter via point-gets on `caissify_game_meta` per GameId ✅ 2026-03-25
+- [x] Add `sort_by=date|rating` to `CaissifyGamesQuery`; on FEN path with `sort_by=rating`, intersect `caissify_game_by_position` with `caissify_game_by_rating`; on non-FEN path use `caissify_game_by_rating` directly ✅ 2026-03-25
+- [x] Encode 1-byte sort tag in `page_token`; validate on decode → HTTP 400 on mismatch ✅ 2026-03-25
+- [x] Add `min_moves` / `max_moves` post-page filters using `move_count` from meta v2 ✅ 2026-03-25
+- [x] Add `include_total` opt-in with guard: only allowed when `fide_id`, `player_name`, or `fen` present; 429 otherwise ✅ 2026-03-25
+- [ ] **Tantivy fuzzy `player_name` search** — deferred; two-step FIDE search UX (`/fide/search` → `fide_id`) covers the interactive case; Tantivy only needed for players without a FIDE ID
+- [x] `POST /import/caissify/reindex-meta`: cursor-resumable backfill for `caissify_game_by_rating` + `move_count` on existing records ✅ 2026-03-25
+- [x] Add `caissify_game_by_rating` to `compact()` in `src/db.rs` ✅ 2026-03-25
+- [x] Update OpenAPI spec: `sort_by`, `min_moves`, `max_moves`, `include_total`, `scan_exhausted`, `player`, `move_count`, `total`, `/import/caissify/reindex-meta` ✅ 2026-03-25
+- [x] Update `CONTEXT.md`: new CFs, meta v2 layout, all new query params, `scan_exhausted`, reindex endpoints ✅ 2026-03-25
 
 ---
 
