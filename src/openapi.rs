@@ -370,6 +370,35 @@ pub fn spec() -> Value {
                 }
             },
 
+            "/fide/player/{fide_id}/pgn": {
+                "get": {
+                    "tags": ["FIDE"],
+                    "summary": "Export all PGN games for a FIDE player",
+                    "description": "Streams a multi-game PGN file containing every Caissify game linked to the given FIDE player. Games are yielded as they are read from the database so the client starts receiving data immediately.\n\nThe response uses `Content-Disposition: attachment` so browsers will download the file directly.",
+                    "operationId": "getFidePlayerPgn",
+                    "parameters": (
+                        vec![fide_id_param()]
+                            .into_iter()
+                            .chain(vec![
+                                param("since", false, "integer", Some("Earliest year to include (inclusive)"), Some(json!(1900))),
+                                param("until", false, "integer", Some("Latest year to include (inclusive)"),   Some(json!(2100))),
+                                param("color", false, "string",  Some("Restrict to games as `white` or `black`"), None),
+                            ])
+                            .collect::<Vec<_>>()
+                    ),
+                    "responses": {
+                        "200": {
+                            "description": "Streamed PGN file",
+                            "content": {
+                                "application/x-chess-pgn": {
+                                    "schema": { "type": "string", "format": "binary" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+
             "/fide/player/{fide_id}/ratings": {
                 "get": {
                     "tags": ["FIDE"],

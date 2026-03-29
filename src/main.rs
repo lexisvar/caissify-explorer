@@ -167,6 +167,7 @@ async fn serve() {
         .route("/caissify/games/{id}", get(handlers::caissify::caissify_game_meta_endpoint))
         // FIDE
         .route("/fide/player/{fide_id}", get(handlers::fide::fide_player))
+        .route("/fide/player/{fide_id}/pgn", get(handlers::fide::fide_player_pgn))
         .route("/fide/player/{fide_id}/ratings", get(handlers::fide::fide_player_ratings))
         .route("/fide/search", get(handlers::fide::fide_search))
         // Lichess

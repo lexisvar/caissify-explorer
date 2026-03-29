@@ -94,6 +94,14 @@ impl MastersGame {
         }
         writeln!(writer, "{}", self.outcome())
     }
+
+    /// Serialize this game to a PGN byte buffer.
+    /// Reused by the streaming PGN export endpoint.
+    pub fn to_pgn_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.write_pgn(&mut buf).expect("write pgn");
+        buf
+    }
 }
 
 impl IntoResponse for MastersGame {

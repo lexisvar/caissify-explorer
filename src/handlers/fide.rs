@@ -1,12 +1,17 @@
-use std::sync::Arc;
+use std::{convert::Infallible, sync::Arc};
 
 use axum::{
     Json,
+    body::Body,
     extract::{Path, Query, State},
     http::StatusCode,
+    response::Response as AxumResponse,
 };
+use bytes::Bytes;
+use serde::Deserialize;
 use serde_with::{DisplayFromStr, serde_as};
 use tokio::sync::Semaphore;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
     api::Error,
@@ -18,7 +23,81 @@ use crate::{
     tasks::fide_ratings_import_once,
     util::spawn_blocking,
 };
+// ─── GET /fide/player/:fide_id/pgn ───────────────────────────────────────────
 
+#[derive(Deserialize)]
+pub struct FidePlayerPgnQuery {
+    /// Earliest year to include (inclusive, default: all time).
+    pub since: Option<u16>,
+    /// Latest year to include (inclusive, default: all time).
+    pub until: Option<u16>,
+    /// Restrict to games played as this colour (`white` or `black`).
+    pub color: Option<String>,
+}
+
+#[axum::debug_handler(state = crate::state::AppState)]
+pub async fn fide_player_pgn(
+    Path(fide_id): Path<u32>,
+    Query(params): Query<FidePlayerPgnQuery>,
+    State(db): State<Arc<Database>>,
+) -> AxumResponse {
+    let since = params.since.unwrap_or(0);
+    let until = params.until.unwrap_or(u16::MAX);
+    let color_filter: Option<bool> = match params.color.as_deref() {
+        Some("white") => Some(false), // value=0 in the index means White
+        Some("black") => Some(true),  // value=1 means Black
+        _ => None,
+    };
+
+    // Channel capacity: 32 PGN chunks buffered ahead of the network write.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(32);
+
+    tokio::task::spawn_blocking(move || {
+        const PAGE: usize = 200;
+        let mut cursor: Option<CaissifyByFideKey> = None;
+
+        loop {
+            // Fetch one page of index keys.
+            let keys = db
+                .caissify()
+                .iter_by_fide(fide_id, since, until, color_filter, cursor, PAGE, false)
+                .expect("iter_by_fide");
+
+            let has_more = keys.len() > PAGE;
+            let page = &keys[..keys.len().min(PAGE)];
+
+            if page.is_empty() {
+                break;
+            }
+
+            // Batch-fetch the full game records.
+            let games = db
+                .caissify()
+                .games(page.iter().map(|(k, _)| k.id))
+                .expect("batch fetch games");
+
+            for game in games.into_iter().flatten() {
+                let mut pgn = game.to_pgn_bytes();
+                pgn.push(b'\n'); // blank line between games (PGN standard)
+                if tx.blocking_send(Ok(Bytes::from(pgn))).is_err() {
+                    return; // client disconnected — stop early
+                }
+            }
+
+            if !has_more {
+                break;
+            }
+            cursor = page.last().map(|(k, _)| *k);
+        }
+    });
+
+    AxumResponse::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/x-chess-pgn")
+        .header("Content-Disposition", format!("attachment; filename=\"fide_{fide_id}.pgn\""))
+        .header("X-Accel-Buffering", "no")
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .unwrap()
+}
 // ─── GET /fide/player/:fide_id ────────────────────────────────────────────────
 
 #[axum::debug_handler(state = crate::state::AppState)]
