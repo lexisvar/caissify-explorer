@@ -159,6 +159,17 @@ pub(crate) async fn fide_ratings_import_once(db: Arc<Database>) -> Result<usize,
         .parse()
         .map_err(|e: crate::model::InvalidDate| e.to_string())?;
 
+    // Skip the download entirely if this month's data is already in the DB.
+    let already_imported = task::block_in_place(|| {
+        db.fide()
+            .month_already_imported(month)
+            .map_err(|e| e.to_string())
+    })?;
+    if already_imported {
+        log::info!("FIDE: {month} already imported — skipping download");
+        return Ok(0);
+    }
+
     log::info!("FIDE: downloading player list for {month}");
 
     let zip_bytes = client

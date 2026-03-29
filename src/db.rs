@@ -1882,6 +1882,32 @@ impl FideDatabase<'_> {
         iter.status().map(|_| index)
     }
 
+    /// Returns `true` if the given month has already been imported.
+    ///
+    /// Works by finding the first player in the `fide_player` CF and doing a
+    /// single point-get in `fide_rating_history` for that player + month.
+    /// Two cheap RocksDB operations — safe to call on every startup.
+    pub fn month_already_imported(&self, month: Month) -> Result<bool, rocksdb::Error> {
+        // 1. Grab the fide_id of the very first player stored.
+        let mut iter = self.inner.raw_iterator_cf(self.cf_fide_player);
+        iter.seek_to_first();
+        let first_id = match iter.key() {
+            Some(key_bytes) if key_bytes.len() >= 4 => {
+                u32::from_le_bytes([key_bytes[0], key_bytes[1], key_bytes[2], key_bytes[3]])
+            }
+            _ => return Ok(false), // No players imported yet.
+        };
+        iter.status()?;
+
+        // 2. Check if that player has a snapshot for this month.
+        let key = FideRatingKey { fide_id: first_id, month };
+        let exists = self
+            .inner
+            .get_pinned_cf(self.cf_fide_rating_history, key.into_bytes())?
+            .is_some();
+        Ok(exists)
+    }
+
     pub fn batch(&self) -> FideBatch<'_> {
         FideBatch {
             db: self,
