@@ -1475,6 +1475,12 @@ impl CaissifyDatabase<'_> {
 
         let mut opt = ReadOptions::default();
         opt.fill_cache(true);
+        // caissify_game_by_rating uses a noop (full-key) prefix extractor.
+        // With the default total_order_seek=false, seeking to a synthesized
+        // sentinel/lower-bound key that doesn't exist returns an invalid
+        // iterator immediately.  total_order_seek=true forces full sorted-order
+        // iteration and makes seek/seek_for_prev work correctly for all keys.
+        opt.set_total_order_seek(true);
         let mut iter = self
             .inner
             .raw_iterator_cf_opt(self.cf_caissify_game_by_rating, opt);
