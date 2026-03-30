@@ -285,8 +285,9 @@ impl BroadcastImporter {
         let state = Arc::clone(&self.state);
         let path = tmp_path.clone();
 
+        let fallback_ym = url_ym(&url).map(|(y, m)| (y as u16, m));
         let (imported, skipped) = tokio::task::spawn_blocking(move || {
-            parse_and_import_zstd(path, caissify, state)
+            parse_and_import_zstd(path, caissify, state, fallback_ym)
         })
         .await??;
 
@@ -499,8 +500,9 @@ impl BroadcastAllImporter {
                 },
                 None,
             )));
+            let fallback_ym = url_ym(url).map(|(y, m)| (y as u16, m));
             let parse_result = tokio::task::spawn_blocking(move || {
-                parse_and_import_zstd(path, caissify, per_state)
+                parse_and_import_zstd(path, caissify, per_state, fallback_ym)
             })
             .await
             .map_err(|e| (e.to_string(), label.clone()))?;
@@ -602,6 +604,7 @@ fn parse_and_import_zstd(
     path: std::path::PathBuf,
     caissify: CaissifyImporter,
     state: State,
+    fallback_ym: Option<(u16, u8)>,
 ) -> Result<(u64, u64), Box<dyn std::error::Error + Send + Sync>> {
     let file = std::fs::File::open(&path)?;
     let decoder = zstd::Decoder::new(file)?;
@@ -610,6 +613,7 @@ fn parse_and_import_zstd(
         state: Arc::clone(&state),
         imported: 0,
         skipped: 0,
+        fallback_ym,
     };
 
     Reader::new(decoder).visit_all_games(&mut visitor)?;
@@ -651,6 +655,7 @@ fn parse_and_import(
         state: Arc::clone(&state),
         imported: 0,
         skipped: 0,
+        fallback_ym: None,
     };
 
     Reader::new(file).visit_all_games(&mut visitor)?;
@@ -688,6 +693,7 @@ struct RawGame {
     site: Option<String>,
     date: Option<String>,
     round: Option<String>,
+    game_url: Option<String>,
     white_name: String,
     white_rating: u16,
     white_fide_id: u32,
@@ -704,6 +710,10 @@ struct PgnVisitor {
     state: State,
     imported: u64,
     skipped: u64,
+    /// Year and month extracted from the broadcast archive filename
+    /// (e.g. `2025-04` → `(2025, 4)`).  Used as a fallback date when a
+    /// game's PGN contains `[Date "????.??.??"]`.
+    fallback_ym: Option<(u16, u8)>,
 }
 
 impl Visitor for PgnVisitor {
@@ -762,6 +772,9 @@ impl Visitor for PgnVisitor {
                 Ok(outcome) => g.winner = Some(outcome.winner()),
                 Err(_) => return ControlFlow::Break(()),
             },
+            b"GameURL" => {
+                g.game_url = Some(value.decode_utf8().unwrap_or_default().into_owned())
+            }
             b"FEN" => {
                 let s = value.decode_utf8().unwrap_or_default().into_owned();
                 if s != "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1" {
@@ -787,7 +800,7 @@ impl Visitor for PgnVisitor {
     }
 
     fn end_game(&mut self, g: RawGame) -> Self::Output {
-        let game = convert_raw_game(g);
+        let game = convert_raw_game(g, self.fallback_ym);
 
         match game {
             Some(game) => match self.caissify.import(game) {
@@ -816,7 +829,7 @@ impl Visitor for PgnVisitor {
     }
 }
 
-fn convert_raw_game(g: RawGame) -> Option<MastersGameWithId> {
+fn convert_raw_game(g: RawGame, fallback_ym: Option<(u16, u8)>) -> Option<MastersGameWithId> {
     // Replay moves from starting position (or custom FEN)
     let mut pos: Chess = match g.fen.as_deref() {
         Some(s) => match s.parse::<Fen>() {
@@ -846,7 +859,26 @@ fn convert_raw_game(g: RawGame) -> Option<MastersGameWithId> {
 
     let id_str = make_game_id(event, &g.white_name, &g.black_name, date_str, round);
     let id = id_str.parse::<GameId>().ok()?;
-    let date = date_str.parse::<LaxDate>().ok()?;
+    let date = date_str.parse::<LaxDate>().ok().or_else(|| {
+        // 1. Archive filename is the most reliable fallback: gives year + month.
+        if let Some((y, m)) = fallback_ym {
+            return format!("{y}.{m:02}.??").parse::<LaxDate>().ok();
+        }
+        // 2. For non-broadcast imports, try to recover the year from the
+        //    GameURL or Site slug, e.g.
+        //    "https://lichess.org/broadcast/2025-some-event/round-1/..."
+        //    → Year 2025.
+        let url = g.game_url.as_deref()
+            .or(g.site.as_deref())
+            .unwrap_or("");
+        let year = url
+            .split('/')
+            .find_map(|seg| {
+                let y: u16 = seg.get(..4)?.parse().ok()?;
+                if (1900..=2099).contains(&y) { Some(y) } else { None }
+            })?;
+        format!("{year}.??.??").parse::<LaxDate>().ok()
+    })?;
 
     Some(MastersGameWithId {
         id,
