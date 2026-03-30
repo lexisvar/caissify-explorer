@@ -648,6 +648,131 @@ curl -X POST http://localhost:9002/import/caissify/reindex-position
 
 ---
 
+### `POST /import/caissify/broadcast`
+
+Instructs the server to download the monthly Lichess broadcast archive for the given year and month, decompress it and import all games into the Caissify database **in the background**.
+
+The archive is fetched from:
+```
+https://database.lichess.org/broadcast/lichess_db_broadcast_{year}-{month:02}.pgn.zst
+```
+
+`WhiteFideId` / `BlackFideId` PGN tags are forwarded directly so FIDE player links are preserved without a separate name-matching pass.
+
+Returns `202 Accepted` immediately. Poll `GET /import/caissify/broadcast/status` to track progress. Only one broadcast import job can run at a time (a second request while one is running returns `409 Conflict`).
+
+```bash
+curl -X POST http://localhost:9002/import/caissify/broadcast \
+  -H "Content-Type: application/json" \
+  -d '{"year": 2025, "month": 3}'
+```
+
+**Response (`202`):** `{ "message": "Broadcast import for 2025-03 started in the background" }`
+
+---
+
+### `GET /import/caissify/broadcast/status`
+
+Returns the current status of the background Lichess broadcast import job.
+
+```bash
+curl http://localhost:9002/import/caissify/broadcast/status
+```
+
+**Response variants:**
+
+```json
+// Not yet started
+{ "status": "idle" }
+
+// Currently running
+{ "status": "running", "games_imported": 4548806, "games_skipped": 61194, "bytes_downloaded": 9643684724 }
+
+// Finished successfully
+{ "status": "done", "games_imported": 5100000, "games_skipped": 72000, "elapsed_secs": 312.4 }
+
+// Failed
+{ "status": "failed", "error": "Broadcast download failed with HTTP 404" }
+```
+
+---
+
+### `POST /import/caissify/broadcast/all`
+
+Fetches `https://database.lichess.org/broadcast/list.txt`, applies optional `since`/`until` filters, then sequentially downloads and imports **every archive** into the Caissify database in the background.
+
+`WhiteFideId` / `BlackFideId` PGN tags are forwarded so FIDE player links are preserved. Duplicate games are silently skipped (content-hash dedup) so re-running is always safe.
+
+Returns `202 Accepted` immediately. Poll `GET /import/caissify/broadcast/all/status` for live progress. Only one all-archives import can run at a time.
+
+```bash
+# Import everything in the list
+curl -X POST http://localhost:9002/import/caissify/broadcast/all \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# Import only 2024 and 2025 archives
+curl -X POST http://localhost:9002/import/caissify/broadcast/all \
+  -H "Content-Type: application/json" \
+  -d '{"since": "2024-01", "until": "2025-12"}'
+```
+
+**Request body (all fields optional):**
+
+| Field | Type | Description |
+|---|---|---|
+| `since` | `YYYY-MM` | Earliest archive to include (inclusive) |
+| `until` | `YYYY-MM` | Latest archive to include (inclusive) |
+| `list_url` | string | Override list URL (default: `https://database.lichess.org/broadcast/list.txt`) |
+
+---
+
+### `GET /import/caissify/broadcast/all/status`
+
+Returns live progress for the background all-archives import.
+
+```bash
+curl http://localhost:9002/import/caissify/broadcast/all/status
+```
+
+**Response variants:**
+
+```json
+// Not yet started
+{ "status": "idle" }
+
+// Currently running — shows current archive and cumulative totals
+{
+  "status": "running",
+  "current_archive_label": "2024-03",
+  "archive_index": 2,
+  "total_archives": 27,
+  "current_bytes_downloaded": 412058624,
+  "total_games_imported": 9821043,
+  "total_games_skipped": 142310
+}
+
+// Finished
+{
+  "status": "done",
+  "total_archives": 27,
+  "total_games_imported": 48200000,
+  "total_games_skipped": 720000,
+  "elapsed_secs": 14832.1
+}
+
+// Failed mid-run — cumulative counts up to the failure are preserved
+{
+  "status": "failed",
+  "error": "HTTP 404 for …2026-04.pgn.zst",
+  "failed_archive": "2026-04",
+  "total_games_imported": 48200000,
+  "total_games_skipped": 720000
+}
+```
+
+---
+
 ### `PUT /import/caissify`
 
 Import a single game into the Caissify database as PGN (multipart/form-data with field `pgn`).

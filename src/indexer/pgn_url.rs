@@ -295,6 +295,309 @@ impl BroadcastImporter {
     }
 }
 
+// ── BroadcastAllImporter ──────────────────────────────────────────────────────
+
+/// Full-list import: fetches `https://database.lichess.org/broadcast/list.txt`,
+/// applies optional `since`/`until` YYYY-MM filters, then sequentially downloads
+/// and imports every archive into the Caissify database.
+#[derive(Clone, Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum BroadcastAllStatus {
+    Idle,
+    Running {
+        current_archive_label: String,
+        archive_index: usize,
+        total_archives: usize,
+        current_bytes_downloaded: u64,
+        total_games_imported: u64,
+        total_games_skipped: u64,
+    },
+    Done {
+        total_archives: usize,
+        total_games_imported: u64,
+        total_games_skipped: u64,
+        elapsed_secs: f64,
+    },
+    Failed {
+        error: String,
+        failed_archive: String,
+        total_games_imported: u64,
+        total_games_skipped: u64,
+    },
+}
+
+type AllState = Arc<Mutex<(BroadcastAllStatus, Option<Instant>)>>;
+
+pub struct BroadcastAllRequest {
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub list_url: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct BroadcastAllImporter {
+    caissify: CaissifyImporter,
+    state: AllState,
+}
+
+impl BroadcastAllImporter {
+    pub fn new(caissify: CaissifyImporter) -> Self {
+        BroadcastAllImporter {
+            caissify,
+            state: Arc::new(Mutex::new((BroadcastAllStatus::Idle, None))),
+        }
+    }
+
+    pub fn status(&self) -> BroadcastAllStatus {
+        self.state.lock().expect("lock broadcast_all state").0.clone()
+    }
+
+    /// Start the background all-archives import.
+    /// Returns `false` (and does nothing) if an import is already running.
+    pub fn start(&self, req: BroadcastAllRequest) -> bool {
+        {
+            let mut guard = self.state.lock().expect("lock broadcast_all state");
+            if matches!(guard.0, BroadcastAllStatus::Running { .. }) {
+                return false;
+            }
+            guard.0 = BroadcastAllStatus::Running {
+                current_archive_label: "fetching list…".to_string(),
+                archive_index: 0,
+                total_archives: 0,
+                current_bytes_downloaded: 0,
+                total_games_imported: 0,
+                total_games_skipped: 0,
+            };
+            guard.1 = Some(Instant::now());
+        }
+
+        let me = self.clone();
+        tokio::spawn(async move {
+            let result = me.run_all(req).await;
+            let mut guard = me.state.lock().expect("lock broadcast_all state");
+            let elapsed = guard.1.map_or(0.0, |t| t.elapsed().as_secs_f64());
+            let (total_archives, total_games_imported, total_games_skipped) =
+                if let BroadcastAllStatus::Running {
+                    total_archives,
+                    total_games_imported,
+                    total_games_skipped,
+                    ..
+                } = &guard.0
+                {
+                    (*total_archives, *total_games_imported, *total_games_skipped)
+                } else {
+                    (0, 0, 0)
+                };
+            guard.0 = match result {
+                Ok(()) => BroadcastAllStatus::Done {
+                    total_archives,
+                    total_games_imported,
+                    total_games_skipped,
+                    elapsed_secs: elapsed,
+                },
+                Err((error, failed_archive)) => BroadcastAllStatus::Failed {
+                    error,
+                    failed_archive,
+                    total_games_imported,
+                    total_games_skipped,
+                },
+            };
+        });
+
+        true
+    }
+
+    async fn run_all(&self, req: BroadcastAllRequest) -> Result<(), (String, String)> {
+        let list_url = req
+            .list_url
+            .as_deref()
+            .unwrap_or("https://database.lichess.org/broadcast/list.txt");
+
+        let client = reqwest::Client::new();
+        let list_text = client
+            .get(list_url)
+            .header("User-Agent", "caissify-explorer/1.0 (https://caissify.com)")
+            .send()
+            .await
+            .map_err(|e| (e.to_string(), "list.txt".to_string()))?
+            .error_for_status()
+            .map_err(|e| (e.to_string(), "list.txt".to_string()))?
+            .text()
+            .await
+            .map_err(|e| (e.to_string(), "list.txt".to_string()))?;
+
+        let mut urls: Vec<String> = list_text
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty() && l.contains(".pgn"))
+            .collect();
+
+        // Apply YYYY-MM filters (lexicographic comparison works for this format).
+        if req.since.is_some() || req.until.is_some() {
+            urls.retain(|url| {
+                if let Some((y, m)) = url_ym(url) {
+                    let ym = format!("{y}-{m:02}");
+                    if let Some(since) = &req.since {
+                        if ym.as_str() < since.as_str() {
+                            return false;
+                        }
+                    }
+                    if let Some(until) = &req.until {
+                        if ym.as_str() > until.as_str() {
+                            return false;
+                        }
+                    }
+                }
+                true
+            });
+        }
+
+        let total = urls.len();
+        {
+            let mut guard = self.state.lock().expect("lock broadcast_all state");
+            if let BroadcastAllStatus::Running { total_archives, .. } = &mut guard.0 {
+                *total_archives = total;
+            }
+        }
+
+        for (idx, url) in urls.iter().enumerate() {
+            let label = url_label(url);
+            {
+                let mut guard = self.state.lock().expect("lock broadcast_all state");
+                if let BroadcastAllStatus::Running {
+                    current_archive_label,
+                    archive_index,
+                    current_bytes_downloaded,
+                    ..
+                } = &mut guard.0
+                {
+                    *current_archive_label = label.clone();
+                    *archive_index = idx;
+                    *current_bytes_downloaded = 0;
+                }
+            }
+
+            log::info!("[broadcast-all] [{}/{}] downloading {}", idx + 1, total, label);
+
+            // Alternate between two temp files so disk usage stays bounded.
+            let tmp_path = std::env::temp_dir()
+                .join(format!("caissify_broadcast_all_{}.pgn.zst", idx % 2));
+            if let Err(e) = self.download(url, &tmp_path).await {
+                return Err((e.to_string(), label));
+            }
+
+            log::info!("[broadcast-all] [{}/{}] importing {}", idx + 1, total, label);
+
+            // Reuse the existing zstd parse+import helper with a throw-away status state.
+            let caissify = self.caissify.clone();
+            let path = tmp_path.clone();
+            let per_state: State = Arc::new(Mutex::new((
+                ImportStatus::Running {
+                    games_imported: 0,
+                    games_skipped: 0,
+                    bytes_downloaded: 0,
+                },
+                None,
+            )));
+            let parse_result = tokio::task::spawn_blocking(move || {
+                parse_and_import_zstd(path, caissify, per_state)
+            })
+            .await
+            .map_err(|e| (e.to_string(), label.clone()))?;
+
+            let (imported, skipped) =
+                parse_result.map_err(|e| (e.to_string(), label.clone()))?;
+
+            tokio::fs::remove_file(&tmp_path).await.ok();
+
+            {
+                let mut guard = self.state.lock().expect("lock broadcast_all state");
+                if let BroadcastAllStatus::Running {
+                    total_games_imported,
+                    total_games_skipped,
+                    ..
+                } = &mut guard.0
+                {
+                    *total_games_imported += imported;
+                    *total_games_skipped += skipped;
+                }
+            }
+
+            log::info!(
+                "[broadcast-all] [{}/{}] done: {} imported, {} skipped",
+                idx + 1,
+                total,
+                imported,
+                skipped,
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn download(
+        &self,
+        url: &str,
+        dest: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let client = reqwest::Client::new();
+        let response = client
+            .get(url)
+            .header("User-Agent", "caissify-explorer/1.0 (https://caissify.com)")
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let mut file = tokio::fs::File::create(dest).await?;
+        let mut bytes_downloaded: u64 = 0;
+        let mut stream = response.bytes_stream();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            bytes_downloaded += chunk.len() as u64;
+            file.write_all(&chunk).await?;
+            let mut guard = self.state.lock().expect("lock broadcast_all state");
+            if let BroadcastAllStatus::Running {
+                current_bytes_downloaded,
+                ..
+            } = &mut guard.0
+            {
+                *current_bytes_downloaded = bytes_downloaded;
+            }
+        }
+        file.flush().await?;
+        Ok(())
+    }
+}
+
+/// Extract `(year, month)` from a broadcast archive URL.
+fn url_ym(url: &str) -> Option<(i32, u8)> {
+    let stem = url.split('/').next_back()?;
+    let stem = stem
+        .strip_suffix(".pgn.zst")
+        .or_else(|| stem.strip_suffix(".pgn"))?;
+    if stem.len() < 7 {
+        return None;
+    }
+    let ym = &stem[stem.len() - 7..];
+    if ym.as_bytes().get(4) != Some(&b'-') {
+        return None;
+    }
+    let year: i32 = ym[..4].parse().ok()?;
+    let month: u8 = ym[5..7].parse().ok()?;
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    Some((year, month))
+}
+
+/// Human-readable label for a broadcast archive URL (e.g. `"2024-03"`).
+fn url_label(url: &str) -> String {
+    url_ym(url)
+        .map(|(y, m)| format!("{y}-{m:02}"))
+        .unwrap_or_else(|| url.split('/').next_back().unwrap_or(url).to_string())
+}
+
 fn parse_and_import_zstd(
     path: std::path::PathBuf,
     caissify: CaissifyImporter,

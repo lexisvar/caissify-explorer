@@ -32,7 +32,7 @@ use crate::{
     api::{CaissifyQuery, LichessQuery, MastersQuery},
     db::{Database, DbOpt},
     indexer::{
-        BroadcastImporter, CaissifyImporter, FideIndexerStub, LichessImporter, MastersImporter,
+        BroadcastAllImporter, BroadcastImporter, CaissifyImporter, FideIndexerStub, LichessImporter, MastersImporter,
         PlayerIndexerOpt, PlayerIndexerStub, PgnUrlImporter,
     },
     lila::LilaOpt,
@@ -155,6 +155,8 @@ async fn serve() {
         .route("/import/caissify/pgn-url/status", get(handlers::caissify::caissify_pgn_url_status))
         .route("/import/caissify/broadcast", post(handlers::caissify::caissify_broadcast_import))
         .route("/import/caissify/broadcast/status", get(handlers::caissify::caissify_broadcast_status))
+        .route("/import/caissify/broadcast/all", post(handlers::caissify::caissify_broadcast_all_import))
+        .route("/import/caissify/broadcast/all/status", get(handlers::caissify::caissify_broadcast_all_status))
         .route("/import/caissify/reindex", post(handlers::caissify::caissify_reindex))
         .route("/import/caissify/reindex-meta", post(handlers::caissify::caissify_reindex_meta))
         .route("/import/caissify/reindex-position", post(handlers::caissify::caissify_reindex_position))
@@ -204,6 +206,10 @@ async fn serve() {
                 Arc::clone(&fide_index_state),
             )),
             broadcast_importer: BroadcastImporter::new(CaissifyImporter::new(
+                Arc::clone(&db),
+                Arc::clone(&fide_index_state),
+            )),
+            broadcast_all_importer: BroadcastAllImporter::new(CaissifyImporter::new(
                 Arc::clone(&db),
                 Arc::clone(&fide_index_state),
             )),

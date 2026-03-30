@@ -11,6 +11,6 @@ pub use caissify::CaissifyImporter;
 pub use fide_indexer::FideIndexerStub;
 pub use lichess::{LichessGameImport, LichessImporter};
 pub use masters::MastersImporter;
-pub use pgn_url::{BroadcastImporter, ImportStatus, PgnUrlImporter};
+pub use pgn_url::{BroadcastAllImporter, BroadcastAllRequest, BroadcastAllStatus, BroadcastImporter, ImportStatus, PgnUrlImporter};
 pub use player::{PlayerIndexerOpt, PlayerIndexerStub};
 pub use player_queue::{Queue, QueueFull, Ticket};

@@ -1,20 +1,22 @@
-/// Import official Lichess broadcast games from the monthly PGN archives at
-/// https://database.lichess.org/#broadcasts
+/// Import all Lichess broadcast game archives into the Caissify database.
 ///
-/// Archives are zstd-compressed PGN files:
-///   lichess_db_broadcast_YYYY-MM.pgn.zst
+/// Fetches the list of available archives from
+/// `https://database.lichess.org/broadcast/list.txt`, then downloads and
+/// imports every archive that has not yet been recorded in
+/// `<data-dir>/imported.txt`.
 ///
-/// Key advantages over `import-caissify`:
-///   - Uses `GameURL` as the primary hash seed for a stable `GameId` (no
-///     player name in the hash → immune to name normalisation differences).
-///   - Forwards `WhiteFideId`/`BlackFideId` from PGN headers directly,
-///     bypassing the server-side name-matching fallback.
-///   - The server also performs a SHA-1 move-sequence fingerprint check on
-///     every import, so even if the same game arrives from a different source
-///     with different player names it will be rejected as a duplicate.
+/// Games are sent to `/import/caissify` with `WhiteFideId`/`BlackFideId`
+/// forwarded from PGN headers so FIDE player links are preserved.
+///
+/// Re-running is always safe:
+///   - Completed archives listed in `imported.txt` are skipped entirely.
+///   - The server deduplicates by game-id, so partial re-imports produce
+///     harmless 409 responses.
 use std::{
+    collections::HashSet,
     fmt::Write as _,
     fs,
+    io::{self, BufRead, Write as _},
     mem,
     ops::ControlFlow,
     path::{Path, PathBuf},
@@ -64,6 +66,20 @@ struct GameRecord {
 
 fn is_zero(n: &u32) -> bool {
     *n == 0
+}
+
+// --------------------------------------------------------------------------
+// Worker message
+// --------------------------------------------------------------------------
+
+enum WorkerMsg {
+    Batch(Batch),
+    /// After all batches for an archive have been consumed, the main thread
+    /// sends this to synchronise and mark the archive as completed.
+    Sync {
+        url: String,
+        ack: crossbeam::channel::Sender<()>,
+    },
 }
 
 // --------------------------------------------------------------------------
@@ -150,7 +166,7 @@ struct Batch {
 }
 
 struct Importer<'a> {
-    tx: crossbeam::channel::Sender<Batch>,
+    tx: crossbeam::channel::Sender<WorkerMsg>,
     label: String,
     batch_size: usize,
     progress: &'a ProgressBar,
@@ -159,7 +175,7 @@ struct Importer<'a> {
 
 impl<'a> Importer<'a> {
     fn new(
-        tx: crossbeam::channel::Sender<Batch>,
+        tx: crossbeam::channel::Sender<WorkerMsg>,
         label: String,
         batch_size: usize,
         progress: &'a ProgressBar,
@@ -185,7 +201,7 @@ impl<'a> Importer<'a> {
             games: mem::replace(&mut self.batch, Vec::with_capacity(self.batch_size)),
         };
         self.progress.set_message(last_event);
-        self.tx.send(batch).expect("send batch");
+        self.tx.send(WorkerMsg::Batch(batch)).expect("send batch");
     }
 }
 
@@ -321,20 +337,74 @@ impl Visitor for Importer<'_> {
 }
 
 // --------------------------------------------------------------------------
+// Archive list + state helpers
+// --------------------------------------------------------------------------
+
+/// Fetch the broadcast archive list from Lichess; returns one URL per line.
+fn fetch_list(url: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let text = reqwest::blocking::get(url)?
+        .error_for_status()?
+        .text()?;
+    let urls = text
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty() && l.contains(".pgn"))
+        .collect();
+    Ok(urls)
+}
+
+/// Extract `(year, month)` from a broadcast archive URL or filename.
+fn url_year_month(url: &str) -> Option<(i32, u8)> {
+    let stem = url.split('/').next_back()?;
+    let s = stem
+        .strip_suffix(".pgn.zst")
+        .or_else(|| stem.strip_suffix(".pgn"))?;
+    if s.len() < 7 {
+        return None;
+    }
+    parse_ym(&s[s.len() - 7..]).ok()
+}
+
+/// Human-readable label for an archive URL (e.g. `"2024-03"`).
+fn archive_label(url: &str) -> String {
+    url_year_month(url)
+        .map(|(y, m)| format!("{y}-{m:02}"))
+        .unwrap_or_else(|| url.split('/').next_back().unwrap_or(url).to_string())
+}
+
+/// Load the set of fully-imported archive URLs from `<data_dir>/imported.txt`.
+fn load_completed(path: &Path) -> HashSet<String> {
+    if !path.exists() {
+        return HashSet::new();
+    }
+    let file = fs::File::open(path).expect("open imported.txt");
+    io::BufReader::new(file)
+        .lines()
+        .filter_map(|l| l.ok())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// Append one archive URL to the completed-state file (atomic append).
+fn mark_completed(path: &Path, url: &str) {
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("open imported.txt for append");
+    writeln!(f, "{url}").expect("write imported.txt");
+}
+
+// --------------------------------------------------------------------------
 // Archive download helpers
 // --------------------------------------------------------------------------
 
-fn archive_url(year: i32, month: u8) -> String {
-    format!(
-        "https://database.lichess.org/broadcast/lichess_db_broadcast_{year}-{month:02}.pgn.zst"
-    )
+/// Extract the filename component from a URL.
+fn archive_filename(url: &str) -> String {
+    url.split('/').next_back().unwrap_or("archive.pgn.zst").to_string()
 }
 
-fn archive_filename(year: i32, month: u8) -> String {
-    format!("lichess_db_broadcast_{year}-{month:02}.pgn.zst")
-}
-
-/// Download `url` to `dest` (atomic: writes to a temp file, then renames).
+/// Download `url` to `dest` (atomic: writes to a `.tmp` file, then renames).
 /// Skips the download if `dest` already exists.
 fn download_archive(url: &str, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if dest.exists() {
@@ -345,11 +415,7 @@ fn download_archive(url: &str, dest: &Path) -> Result<(), Box<dyn std::error::Er
     eprintln!("  downloading {url} …");
     let tmp = dest.with_extension("zst.tmp");
 
-    let mut resp = reqwest::blocking::get(url)?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {} for {url}", resp.status()).into());
-    }
-
+    let mut resp = reqwest::blocking::get(url)?.error_for_status()?;
     {
         let mut file = fs::File::create(&tmp)?;
         resp.copy_to(&mut file)?;
@@ -364,7 +430,7 @@ fn download_archive(url: &str, dest: &Path) -> Result<(), Box<dyn std::error::Er
 // CLI
 // --------------------------------------------------------------------------
 
-/// Parse "YYYY-MM" into (year, month).
+/// Parse `"YYYY-MM"` into `(year, month)`.
 fn parse_ym(s: &str) -> Result<(i32, u8), String> {
     let parts: Vec<&str> = s.splitn(2, '-').collect();
     if parts.len() != 2 {
@@ -385,30 +451,37 @@ fn parse_ym(s: &str) -> Result<(i32, u8), String> {
 #[derive(Parser)]
 #[command(
     name = "import-lichess-broadcast",
-    about = "Download and import Lichess broadcast PGN archives"
+    about = "Download and import all Lichess broadcast PGN archives into Caissify"
 )]
 struct Args {
-    /// Base URL of the caissify-explorer import API
+    /// Base URL of the caissify-explorer import API.
     #[arg(long, default_value = "http://localhost:9002")]
     endpoint: String,
 
-    /// First month to import, inclusive (e.g. 2024-01)
-    #[arg(long, default_value = "2024-01")]
-    since: String,
+    /// URL of the Lichess broadcast archive list.
+    #[arg(long, default_value = "https://database.lichess.org/broadcast/list.txt")]
+    list_url: String,
 
-    /// Last month to import, inclusive (defaults to current month)
+    /// Only import archives from this month onwards, inclusive (e.g. 2024-01).
+    /// Omit to process all archives found in the list.
+    #[arg(long)]
+    since: Option<String>,
+
+    /// Only import archives up to this month, inclusive (e.g. 2025-12).
+    /// Defaults to the current month.
     #[arg(long)]
     until: Option<String>,
 
-    /// Directory to cache downloaded .pgn.zst archives
+    /// Directory to cache downloaded .pgn.zst archives and track import state
+    /// (`imported.txt` lives here).
     #[arg(long, default_value = "/tmp/lichess-broadcasts")]
     data_dir: PathBuf,
 
-    /// Number of games per HTTP request
+    /// Number of games per HTTP request.
     #[arg(long, default_value = "100")]
     batch_size: usize,
 
-    /// Pause importing during these UTC hours (e.g. peak traffic hours)
+    /// Pause importing during these UTC hours (e.g. peak traffic hours).
     #[arg(long)]
     avoid_utc_hour: Vec<u8>,
 }
@@ -416,89 +489,132 @@ struct Args {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    let (since_year, since_month) = parse_ym(&args.since)?;
+    // ------------------------------------------------------------------
+    // 1.  Fetch the broadcast archive list from Lichess
+    // ------------------------------------------------------------------
+    println!("Fetching archive list from {} …", args.list_url);
+    let available: Vec<String> = fetch_list(&args.list_url)?;
+    println!("  {} archive(s) found", available.len());
+
+    // ------------------------------------------------------------------
+    // 2.  Apply --since / --until filter
+    // ------------------------------------------------------------------
+    let since: Option<(i32, u8)> = args
+        .since
+        .as_deref()
+        .map(parse_ym)
+        .transpose()
+        .map_err(|e| format!("--since: {e}"))?;
 
     let now = OffsetDateTime::now_utc();
-    let (until_year, until_month) = match &args.until {
-        Some(s) => parse_ym(s)?,
+    let until: (i32, u8) = match &args.until {
+        Some(s) => parse_ym(s).map_err(|e| format!("--until: {e}"))?,
         None => (now.year(), now.month() as u8),
     };
 
-    fs::create_dir_all(&args.data_dir)?;
+    let filtered: Vec<String> = available
+        .into_iter()
+        .filter(|url| {
+            if let Some((y, m)) = url_year_month(url) {
+                if let Some((sy, sm)) = since {
+                    if (y, m) < (sy, sm) {
+                        return false;
+                    }
+                }
+                let (uy, um) = until;
+                (y, m) <= (uy, um)
+            } else {
+                true // can't parse month range — include
+            }
+        })
+        .collect();
 
-    // Collect all (year, month) pairs in range.
-    let mut months: Vec<(i32, u8)> = Vec::new();
-    let (mut y, mut m) = (since_year, since_month);
-    loop {
-        months.push((y, m));
-        if (y, m) == (until_year, until_month) {
-            break;
-        }
-        m += 1;
-        if m > 12 {
-            m = 1;
-            y += 1;
-        }
-        if y > until_year || (y == until_year && m > until_month) {
-            break;
-        }
+    // ------------------------------------------------------------------
+    // 3.  Load completed-archive state from <data_dir>/imported.txt
+    // ------------------------------------------------------------------
+    fs::create_dir_all(&args.data_dir)?;
+    let imported_path = args.data_dir.join("imported.txt");
+    let completed: HashSet<String> = load_completed(&imported_path);
+
+    let to_import: Vec<String> = filtered
+        .into_iter()
+        .filter(|url| !completed.contains(url))
+        .collect();
+
+    if to_import.is_empty() {
+        println!("Nothing new to import — all archives up to date.");
+        return Ok(());
     }
 
     println!(
-        "Importing {} month(s): {since_year}-{since_month:02} … {until_year}-{until_month:02}",
-        months.len()
+        "Importing {} archive(s) ({} already completed).",
+        to_import.len(),
+        completed.len()
     );
 
-    let (tx, rx) = crossbeam::channel::bounded::<Batch>(50);
+    // ------------------------------------------------------------------
+    // 4.  Worker thread: receive batches and POST to /import/caissify
+    // ------------------------------------------------------------------
+    let (tx, rx) = crossbeam::channel::bounded::<WorkerMsg>(50);
 
     let endpoint = args.endpoint.clone();
     let avoid_utc_hour = args.avoid_utc_hour.clone();
+    let imported_path_bg = imported_path.clone();
 
-    // Background HTTP poster thread (identical pattern to import-caissify)
     let bg = thread::spawn(move || {
         let client = reqwest::blocking::Client::builder()
             .timeout(None)
             .build()
             .expect("build http client");
 
-        while let Ok(batch) = rx.recv() {
-            while avoid_utc_hour.contains(&OffsetDateTime::now_utc().hour()) {
-                println!("paused during busy hour — sleeping 10 min…");
-                thread::sleep(Duration::from_secs(10 * 60));
-            }
-
-            for game in &batch.games {
-                let res = client
-                    .put(format!("{}/import/caissify", endpoint))
-                    .json(game)
-                    .send()
-                    .expect("send game");
-
-                if !res.status().is_success() {
-                    let status = res.status();
-                    let body = res.text().unwrap_or_default();
-                    // 409 Conflict = duplicate — expected and harmless.
-                    if status.as_u16() != 409 {
-                        eprintln!(
-                            "[{}] {} ({status}) - {body}",
-                            batch.label, game.id
-                        );
+        while let Ok(msg) = rx.recv() {
+            match msg {
+                WorkerMsg::Batch(batch) => {
+                    while avoid_utc_hour.contains(&OffsetDateTime::now_utc().hour()) {
+                        println!("paused during busy hour — sleeping 10 min…");
+                        thread::sleep(Duration::from_secs(10 * 60));
                     }
+
+                    for game in &batch.games {
+                        let res = client
+                            .put(format!("{}/import/caissify", endpoint))
+                            .json(game)
+                            .send()
+                            .expect("send game");
+
+                        if !res.status().is_success() {
+                            let status = res.status();
+                            let body = res.text().unwrap_or_default();
+                            // 409 Conflict = duplicate — expected and harmless.
+                            if status.as_u16() != 409 {
+                                eprintln!(
+                                    "[{}] {} ({status}) — {body}",
+                                    batch.label, game.id
+                                );
+                            }
+                        }
+                    }
+                }
+                WorkerMsg::Sync { url, ack } => {
+                    // All batches for this archive are consumed — record it as
+                    // done and unblock the main thread.
+                    mark_completed(&imported_path_bg, &url);
+                    let _ = ack.send(());
                 }
             }
         }
     });
 
-    for (year, month) in &months {
-        let year = *year;
-        let month = *month;
-        let label = format!("{year}-{month:02}");
-        let filename = archive_filename(year, month);
+    // ------------------------------------------------------------------
+    // 5.  Main loop: download → parse → import each archive
+    // ------------------------------------------------------------------
+    for url in &to_import {
+        let filename = archive_filename(url);
         let archive_path = args.data_dir.join(&filename);
-        let url = archive_url(year, month);
+        let label = archive_label(url);
 
-        println!("\n[{label}] Downloading archive…");
-        match download_archive(&url, &archive_path) {
+        println!("\n[{label}] Downloading…");
+        match download_archive(url, &archive_path) {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("  skipping {label}: {e}");
@@ -531,11 +647,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         importer.flush();
         progress.finish();
 
-        println!("[{label}] done");
+        // Synchronise with the background worker: wait until it has consumed
+        // every batch for this archive, then it writes the URL to imported.txt.
+        let (ack_tx, ack_rx) = crossbeam::channel::bounded(1);
+        tx.send(WorkerMsg::Sync {
+            url: url.clone(),
+            ack: ack_tx,
+        })
+        .expect("send sync");
+        ack_rx.recv().expect("recv ack");
+
+        println!("[{label}] ✓ done");
     }
 
     drop(tx);
     bg.join().expect("bg thread join");
-    println!("\nAll months imported.");
+    println!("\nAll archives imported.");
     Ok(())
 }

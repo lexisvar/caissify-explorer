@@ -19,7 +19,7 @@ use crate::{
         Play, PlayPosition, WithSource,
     },
     db::{CacheHint, Database},
-    indexer::{BroadcastImporter, CaissifyImporter, ImportStatus, PgnUrlImporter},
+    indexer::{BroadcastAllImporter, BroadcastAllRequest, BroadcastAllStatus, BroadcastImporter, CaissifyImporter, ImportStatus, PgnUrlImporter},
     metrics::Metrics,
     model::{
         CaissifyByDateKey, CaissifyByFideKey, CaissifyByPlayerKey, CaissifyByPositionKey,
@@ -222,6 +222,62 @@ pub async fn caissify_broadcast_import(
 pub async fn caissify_broadcast_status(
     State(importer): State<BroadcastImporter>,
 ) -> axum::Json<ImportStatus> {
+    axum::Json(importer.status())
+}
+
+// ─── Broadcast all-archives import ───────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(default)]
+pub struct BroadcastAllImportRequest {
+    /// Earliest archive to include, inclusive (e.g. `"2024-01"`). Omit to include all.
+    since: Option<String>,
+    /// Latest archive to include, inclusive (e.g. `"2026-03"`). Omit to include all.
+    until: Option<String>,
+    /// Override the list URL (default: `https://database.lichess.org/broadcast/list.txt`).
+    list_url: Option<String>,
+}
+
+impl Default for BroadcastAllImportRequest {
+    fn default() -> Self {
+        BroadcastAllImportRequest {
+            since: None,
+            until: None,
+            list_url: None,
+        }
+    }
+}
+
+#[axum::debug_handler(state = crate::state::AppState)]
+pub async fn caissify_broadcast_all_import(
+    State(importer): State<BroadcastAllImporter>,
+    Json(body): Json<BroadcastAllImportRequest>,
+) -> impl axum::response::IntoResponse {
+    if importer.start(BroadcastAllRequest {
+        since: body.since,
+        until: body.until,
+        list_url: body.list_url,
+    }) {
+        (
+            axum::http::StatusCode::ACCEPTED,
+            axum::Json(serde_json::json!({
+                "message": "Broadcast all-archives import started in the background",
+            })),
+        )
+    } else {
+        (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({
+                "message": "An import is already running — check /import/caissify/broadcast/all/status",
+            })),
+        )
+    }
+}
+
+#[axum::debug_handler(state = crate::state::AppState)]
+pub async fn caissify_broadcast_all_status(
+    State(importer): State<BroadcastAllImporter>,
+) -> axum::Json<BroadcastAllStatus> {
     axum::Json(importer.status())
 }
 

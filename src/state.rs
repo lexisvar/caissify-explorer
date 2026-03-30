@@ -11,8 +11,8 @@ use crate::{
     api::{CaissifyQuery, Error, ExplorerResponse, LichessQuery, MastersQuery},
     db::Database,
     indexer::{
-        BroadcastImporter, CaissifyImporter, FideIndexerStub, LichessImporter, MastersImporter,
-        PlayerIndexerStub, PgnUrlImporter,
+        BroadcastAllImporter, BroadcastImporter, CaissifyImporter, FideIndexerStub,
+        LichessImporter, MastersImporter, PlayerIndexerStub, PgnUrlImporter,
     },
     metrics::Metrics,
     model::{FideNameIndex, UserId},
@@ -37,6 +37,7 @@ pub struct AppState {
     pub caissify_importer: CaissifyImporter,
     pub pgn_url_importer: PgnUrlImporter,
     pub broadcast_importer: BroadcastImporter,
+    pub broadcast_all_importer: BroadcastAllImporter,
     pub player_indexer: PlayerIndexerStub,
     pub fide_indexer: FideIndexerStub,
     pub semaphore: &'static Semaphore,

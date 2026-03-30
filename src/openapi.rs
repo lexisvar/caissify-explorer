@@ -294,6 +294,48 @@ pub fn spec() -> Value {
                 }
             },
 
+            // ── /import/caissify/broadcast/all ──────────────────────────
+            "/import/caissify/broadcast/all": {
+                "post": {
+                    "tags": ["Import"],
+                    "summary": "Import all Lichess broadcast archives",
+                    "description": "Fetches `https://database.lichess.org/broadcast/list.txt`, applies optional `since`/`until` filters, then sequentially downloads and imports every archive into the Caissify database.\n\n`WhiteFideId`/`BlackFideId` PGN tags are forwarded so FIDE player links are preserved.\n\nReturns immediately with `202 Accepted`. Poll `/import/caissify/broadcast/all/status` for live progress. Only one all-archives import can run at a time.",
+                    "operationId": "importCaissifyBroadcastAll",
+                    "requestBody": {
+                        "required": false,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/BroadcastAllImportRequest" },
+                                "example": { "since": "2024-01", "until": "2026-03" }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "202": { "description": "All-archives import started in the background" },
+                        "409": { "description": "An import is already running" }
+                    }
+                }
+            },
+
+            "/import/caissify/broadcast/all/status": {
+                "get": {
+                    "tags": ["Import"],
+                    "summary": "Check all-archives broadcast import status",
+                    "description": "Returns live progress for the background all-archives import: current archive, how many archives remain, and cumulative game counts.",
+                    "operationId": "getCaissifyBroadcastAllImportStatus",
+                    "responses": {
+                        "200": {
+                            "description": "All-archives broadcast import status",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/BroadcastAllStatus" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+
             "/import/caissify": {
                 "put": {
                     "tags": ["Import"],
@@ -841,6 +883,65 @@ pub fn spec() -> Value {
                         "month": { "type": "integer", "minimum": 1, "maximum": 12, "description": "Calendar month (1–12)", "example": 1 }
                     },
                     "required": ["year", "month"]
+                },
+
+                "BroadcastAllImportRequest": {
+                    "type": "object",
+                    "description": "Optional filters for the all-archives broadcast import",
+                    "properties": {
+                        "since":    { "type": "string", "description": "Earliest archive to include, inclusive (YYYY-MM). Omit to include all.", "example": "2024-01" },
+                        "until":    { "type": "string", "description": "Latest archive to include, inclusive (YYYY-MM). Omit to include all.", "example": "2026-03" },
+                        "list_url": { "type": "string", "description": "Override the list URL (default: https://database.lichess.org/broadcast/list.txt)" }
+                    }
+                },
+
+                "BroadcastAllStatus": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "title": "Idle",
+                            "properties": { "status": { "type": "string", "enum": ["idle"] } },
+                            "required": ["status"]
+                        },
+                        {
+                            "type": "object",
+                            "title": "Running",
+                            "properties": {
+                                "status":                   { "type": "string", "enum": ["running"] },
+                                "current_archive_label":    { "type": "string", "example": "2025-03", "description": "YYYY-MM label of the archive currently being processed" },
+                                "archive_index":            { "type": "integer", "description": "Zero-based index of the current archive" },
+                                "total_archives":           { "type": "integer", "description": "Total number of archives to process" },
+                                "current_bytes_downloaded": { "type": "integer", "description": "Bytes downloaded for the current archive" },
+                                "total_games_imported":     { "type": "integer", "description": "Cumulative games imported across all completed archives" },
+                                "total_games_skipped":      { "type": "integer", "description": "Cumulative games skipped (duplicates / invalid) across all completed archives" }
+                            },
+                            "required": ["status", "current_archive_label", "archive_index", "total_archives", "current_bytes_downloaded", "total_games_imported", "total_games_skipped"]
+                        },
+                        {
+                            "type": "object",
+                            "title": "Done",
+                            "properties": {
+                                "status":               { "type": "string", "enum": ["done"] },
+                                "total_archives":       { "type": "integer" },
+                                "total_games_imported": { "type": "integer" },
+                                "total_games_skipped":  { "type": "integer" },
+                                "elapsed_secs":         { "type": "number" }
+                            },
+                            "required": ["status", "total_archives", "total_games_imported", "total_games_skipped", "elapsed_secs"]
+                        },
+                        {
+                            "type": "object",
+                            "title": "Failed",
+                            "properties": {
+                                "status":               { "type": "string", "enum": ["failed"] },
+                                "error":                { "type": "string" },
+                                "failed_archive":       { "type": "string", "description": "Label of the archive that caused the failure" },
+                                "total_games_imported": { "type": "integer" },
+                                "total_games_skipped":  { "type": "integer" }
+                            },
+                            "required": ["status", "error", "failed_archive", "total_games_imported", "total_games_skipped"]
+                        }
+                    ]
                 },
 
                 "CaissifyGameMeta": {
