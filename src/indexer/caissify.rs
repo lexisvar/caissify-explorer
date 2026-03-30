@@ -63,45 +63,102 @@ impl CaissifyImporter {
                 .unwrap_or(0)
         };
 
-        // ── Helper: upgrade FIDE IDs on an existing game if we now know them ──
-        // Returns true if an upgrade was performed.
-        let try_upgrade_fide = |existing_id: GameId| -> bool {
-            if white_fide_id == 0 && black_fide_id == 0 {
-                return false;
+        // ── Helper: upgrade an existing duplicate game with better data ─────
+        //
+        // Two kinds of upgrade are attempted:
+        //
+        //  1. FIDE ID upgrade — if the incoming game resolved FIDE IDs (either
+        //     from PGN tags or name lookup) and the stored record has zeros,
+        //     write new `caissify_game_meta` and `caissify_game_by_fide` entries.
+        //
+        //  2. Game-body upgrade — if the incoming game carried explicit
+        //     `[WhiteFideId]` / `[BlackFideId]` PGN tags it came from an
+        //     authoritative source (e.g. a Lichess broadcast) whose player names
+        //     and event strings are likely more complete than those from a
+        //     lower-quality source (chess-results, abbreviated PGN, …).  In that
+        //     case overwrite the stored game body and add new by-player hash
+        //     entries so look-ups by the full name also work.
+
+        // True when the incoming PGN itself carried FIDE ID tags (not just name
+        // lookup).  This is our signal that the source is authoritative.
+        let has_pgn_fide = body.white_fide_id != 0 || body.black_fide_id != 0;
+
+        let try_upgrade_fide = |existing_id: GameId| {
+            // Quick exit: nothing we can possibly improve.
+            if !has_pgn_fide && white_fide_id == 0 && black_fide_id == 0 {
+                return;
             }
             let existing_meta = match caissify_db
                 .game_meta(existing_id)
                 .expect("read meta for fide upgrade")
             {
                 Some(m) => m,
-                None => return false,
+                None => return,
             };
+
+            // — FIDE ID improvement check ————————————————————————
             let new_white = if existing_meta.white_fide_id == 0 { white_fide_id } else { existing_meta.white_fide_id };
             let new_black = if existing_meta.black_fide_id == 0 { black_fide_id } else { existing_meta.black_fide_id };
-            if new_white == existing_meta.white_fide_id && new_black == existing_meta.black_fide_id {
-                return false; // nothing new
+            let fide_changed = new_white != existing_meta.white_fide_id
+                || new_black != existing_meta.black_fide_id;
+
+            if !fide_changed && !has_pgn_fide {
+                return; // nothing to do
             }
-            let updated_meta = CaissifyGameMeta { white_fide_id: new_white, black_fide_id: new_black, ..existing_meta };
+
             let mut batch = caissify_db.batch();
-            batch.update_meta_fide_ids(existing_id, &updated_meta);
-            if new_white != 0 && existing_meta.white_fide_id == 0 {
-                batch.put_by_fide(
-                    CaissifyByFideKey { fide_id: new_white, year: existing_meta.year, id: existing_id },
+
+            if fide_changed {
+                let updated_meta = CaissifyGameMeta {
+                    white_fide_id: new_white,
+                    black_fide_id: new_black,
+                    ..existing_meta
+                };
+                batch.update_meta_fide_ids(existing_id, &updated_meta);
+                if new_white != 0 && existing_meta.white_fide_id == 0 {
+                    batch.put_by_fide(
+                        CaissifyByFideKey { fide_id: new_white, year: existing_meta.year, id: existing_id },
+                        false,
+                    );
+                }
+                if new_black != 0 && existing_meta.black_fide_id == 0 {
+                    batch.put_by_fide(
+                        CaissifyByFideKey { fide_id: new_black, year: existing_meta.year, id: existing_id },
+                        true,
+                    );
+                }
+                log::debug!(
+                    "upgraded FIDE IDs for {existing_id}: white {} → {new_white}, black {} → {new_black}",
+                    existing_meta.white_fide_id, existing_meta.black_fide_id,
+                );
+            }
+
+            // — Game-body upgrade (names, event, site) ———————————
+            if has_pgn_fide {
+                batch.put_game(existing_id, &body.game);
+                batch.put_by_player(
+                    CaissifyByPlayerKey {
+                        hash: player_name_hash(&body.game.players.white.name),
+                        year: existing_meta.year,
+                        id: existing_id,
+                    },
                     false,
                 );
-            }
-            if new_black != 0 && existing_meta.black_fide_id == 0 {
-                batch.put_by_fide(
-                    CaissifyByFideKey { fide_id: new_black, year: existing_meta.year, id: existing_id },
+                batch.put_by_player(
+                    CaissifyByPlayerKey {
+                        hash: player_name_hash(&body.game.players.black.name),
+                        year: existing_meta.year,
+                        id: existing_id,
+                    },
                     true,
                 );
+                log::debug!(
+                    "upgraded game body for {existing_id}: '{}' / '{}'",
+                    body.game.players.white.name, body.game.players.black.name,
+                );
             }
-            batch.commit().expect("commit fide upgrade");
-            log::debug!(
-                "upgraded FIDE IDs for existing game {existing_id}: white {} → {new_white}, black {} → {new_black}",
-                existing_meta.white_fide_id, existing_meta.black_fide_id,
-            );
-            true
+
+            batch.commit().expect("commit fide/body upgrade");
         };
 
         if caissify_db
