@@ -739,6 +739,20 @@ impl CaissifyDatabase<'_> {
             .map(|maybe_entry| maybe_entry.is_some())
     }
 
+    /// Return the `GameId` stored for the given move-sequence fingerprint, if any.
+    pub fn game_id_by_moves(
+        &self,
+        fingerprint: &[u8; 20],
+    ) -> Result<Option<GameId>, rocksdb::Error> {
+        Ok(self
+            .inner
+            .get_pinned_cf(self.cf_caissify_game_by_moves, fingerprint)?
+            .map(|buf| {
+                let mut b = &buf[..];
+                GameId::read(&mut b)
+            }))
+    }
+
     pub fn game(&self, id: GameId) -> Result<Option<MastersGame>, rocksdb::Error> {
         Ok(self
             .inner

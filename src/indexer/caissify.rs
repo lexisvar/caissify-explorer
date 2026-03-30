@@ -13,8 +13,8 @@ use crate::{
     db::Database,
     model::{
         CaissifyByDateKey, CaissifyByFideKey, CaissifyByPlayerKey, CaissifyByPositionKey,
-        CaissifyByRatingKey, CaissifyGameMeta, FideNameIndex, GameResult, KeyBuilder, LaxDate,
-        MastersEntry, MastersGameWithId, player_name_hash,
+        CaissifyByRatingKey, CaissifyGameMeta, FideNameIndex, GameId, GameResult, KeyBuilder,
+        LaxDate, MastersEntry, MastersGameWithId, player_name_hash,
     },
     zobrist::StableZobrist128,
 };
@@ -47,10 +47,68 @@ impl CaissifyImporter {
         let _guard = self.mutex.lock().expect("lock caissify db");
         let caissify_db = self.db.caissify();
 
+        // ── FIDE ID resolution (done early so we can use it on both paths) ───
+        let white_fide_id = if body.white_fide_id != 0 {
+            body.white_fide_id
+        } else {
+            self.fide_index
+                .lookup(&body.game.players.white.name)
+                .unwrap_or(0)
+        };
+        let black_fide_id = if body.black_fide_id != 0 {
+            body.black_fide_id
+        } else {
+            self.fide_index
+                .lookup(&body.game.players.black.name)
+                .unwrap_or(0)
+        };
+
+        // ── Helper: upgrade FIDE IDs on an existing game if we now know them ──
+        // Returns true if an upgrade was performed.
+        let try_upgrade_fide = |existing_id: GameId| -> bool {
+            if white_fide_id == 0 && black_fide_id == 0 {
+                return false;
+            }
+            let existing_meta = match caissify_db
+                .game_meta(existing_id)
+                .expect("read meta for fide upgrade")
+            {
+                Some(m) => m,
+                None => return false,
+            };
+            let new_white = if existing_meta.white_fide_id == 0 { white_fide_id } else { existing_meta.white_fide_id };
+            let new_black = if existing_meta.black_fide_id == 0 { black_fide_id } else { existing_meta.black_fide_id };
+            if new_white == existing_meta.white_fide_id && new_black == existing_meta.black_fide_id {
+                return false; // nothing new
+            }
+            let updated_meta = CaissifyGameMeta { white_fide_id: new_white, black_fide_id: new_black, ..existing_meta };
+            let mut batch = caissify_db.batch();
+            batch.update_meta_fide_ids(existing_id, &updated_meta);
+            if new_white != 0 && existing_meta.white_fide_id == 0 {
+                batch.put_by_fide(
+                    CaissifyByFideKey { fide_id: new_white, year: existing_meta.year, id: existing_id },
+                    false,
+                );
+            }
+            if new_black != 0 && existing_meta.black_fide_id == 0 {
+                batch.put_by_fide(
+                    CaissifyByFideKey { fide_id: new_black, year: existing_meta.year, id: existing_id },
+                    true,
+                );
+            }
+            batch.commit().expect("commit fide upgrade");
+            log::debug!(
+                "upgraded FIDE IDs for existing game {existing_id}: white {} → {new_white}, black {} → {new_black}",
+                existing_meta.white_fide_id, existing_meta.black_fide_id,
+            );
+            true
+        };
+
         if caissify_db
             .has_game(body.id)
             .expect("check for caissify game")
         {
+            try_upgrade_fide(body.id);
             return Err(Error::DuplicateGame { id: body.id });
         }
 
@@ -69,12 +127,14 @@ impl CaissifyImporter {
             Sha1::digest(moves_str.as_bytes()).into()
         };
 
-        if !body.game.moves.is_empty()
-            && caissify_db
-                .has_by_moves(&moves_fingerprint)
+        if !body.game.moves.is_empty() {
+            if let Some(existing_id) = caissify_db
+                .game_id_by_moves(&moves_fingerprint)
                 .expect("check for caissify moves duplicate")
-        {
-            return Err(Error::DuplicateGame { id: body.id });
+            {
+                try_upgrade_fide(existing_id);
+                return Err(Error::DuplicateGame { id: body.id });
+            }
         }
 
         let mut without_loops: IntMap<StableZobrist128, (UciMove, Color)> =
@@ -101,25 +161,6 @@ impl CaissifyImporter {
         {
             return Err(Error::DuplicateGame { id: body.id });
         }
-
-        // ── FIDE ID resolution ───────────────────────────────────────────────
-        // 1. Use the explicit FIDE IDs passed in the request body (from PGN
-        //    header tags like WhiteFideId / BlackFideId) when non-zero.
-        // 2. Fall back to an in-memory name-based lookup against FideNameIndex.
-        let white_fide_id = if body.white_fide_id != 0 {
-            body.white_fide_id
-        } else {
-            self.fide_index
-                .lookup(&body.game.players.white.name)
-                .unwrap_or(0)
-        };
-        let black_fide_id = if body.black_fide_id != 0 {
-            body.black_fide_id
-        } else {
-            self.fide_index
-                .lookup(&body.game.players.black.name)
-                .unwrap_or(0)
-        };
 
         let mut batch = caissify_db.batch();
         batch.put_game(body.id, &body.game);
