@@ -32,8 +32,8 @@ use crate::{
     api::{CaissifyQuery, LichessQuery, MastersQuery},
     db::{Database, DbOpt},
     indexer::{
-        BroadcastImporter, CaissifyImporter, LichessImporter, MastersImporter, PlayerIndexerOpt,
-        PlayerIndexerStub, PgnUrlImporter,
+        BroadcastImporter, CaissifyImporter, FideIndexerStub, LichessImporter, MastersImporter,
+        PlayerIndexerOpt, PlayerIndexerStub, PgnUrlImporter,
     },
     lila::LilaOpt,
     metrics::Metrics,
@@ -114,6 +114,13 @@ async fn serve() {
     }));
     log::info!("fide name index ready: {} entries", fide_index.len());
     let fide_index_state = Arc::clone(&fide_index);
+
+    let fide_indexer = FideIndexerStub::spawn(
+        &mut join_set,
+        Arc::clone(&db),
+        CaissifyImporter::new(Arc::clone(&db), Arc::clone(&fide_index_state)),
+        2, // 2 workers — polite scraping, respect chess-results.com rate limits
+    );
 
     let lichess_cache: ExplorerCache<LichessQuery> = Cache::builder()
         .max_capacity(opt.lichess_cache)
@@ -201,6 +208,7 @@ async fn serve() {
                 Arc::clone(&fide_index_state),
             )),
             player_indexer,
+            fide_indexer,
             db,
             semaphore: Box::leak(Box::new(Semaphore::new(128))),
             fide_index: fide_index_state,

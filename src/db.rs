@@ -328,6 +328,18 @@ impl Database {
                     cache: &cache,
                 }
                 .descriptor(),
+                // Per-FIDE-player chess-results.com indexing status.
+                // Key:   [4-byte FIDE ID LE]
+                // Value: [2-byte Month LE] — calendar month of the last successful
+                //        chess-results scrape. Prevents re-scraping more than once
+                //        per calendar month per player.
+                Column {
+                    name: "caissify_fide_status",
+                    prefix: None,
+                    merge: None,
+                    cache: &cache,
+                }
+                .descriptor(),
                 // FIDE player database
                 Column {
                     name: "fide_player",
@@ -446,6 +458,10 @@ impl Database {
                 .inner
                 .cf_handle("caissify_game_by_rating")
                 .expect("cf caissify_game_by_rating"),
+            cf_caissify_fide_status: self
+                .inner
+                .cf_handle("caissify_fide_status")
+                .expect("cf caissify_fide_status"),
         }
     }
 }
@@ -604,6 +620,7 @@ pub struct CaissifyDatabase<'a> {
     cf_caissify_game_by_position: &'a ColumnFamily,
     cf_caissify_game_by_moves: &'a ColumnFamily,
     cf_caissify_game_by_rating: &'a ColumnFamily,
+    cf_caissify_fide_status: &'a ColumnFamily,
 }
 
 pub struct CaissifyMetrics {
@@ -1638,6 +1655,34 @@ impl CaissifyDatabase<'_> {
         }
 
         iter.status().map(|_| results)
+    }
+
+    /// Return the calendar month when this FIDE player was last scraped from
+    /// chess-results.com, or `None` if never indexed.
+    pub fn get_fide_index_status(&self, fide_id: u32) -> Result<Option<Month>, rocksdb::Error> {
+        Ok(self
+            .inner
+            .get_pinned_cf(self.cf_caissify_fide_status, fide_id.to_le_bytes())?
+            .and_then(|b| {
+                if b.len() >= 2 {
+                    u16::from_le_bytes([b[0], b[1]]).try_into().ok()
+                } else {
+                    None
+                }
+            }))
+    }
+
+    /// Record that this FIDE player was successfully scraped in `month`.
+    pub fn put_fide_index_status(
+        &self,
+        fide_id: u32,
+        month: Month,
+    ) -> Result<(), rocksdb::Error> {
+        self.inner.put_cf(
+            self.cf_caissify_fide_status,
+            fide_id.to_le_bytes(),
+            u16::from(month).to_le_bytes(),
+        )
     }
 
     pub fn batch(&self) -> CaissifyBatch<'_> {

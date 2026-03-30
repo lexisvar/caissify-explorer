@@ -353,7 +353,7 @@ pub fn spec() -> Value {
                 "get": {
                     "tags": ["FIDE"],
                     "summary": "Get FIDE player profile",
-                    "description": "Returns profile information for a FIDE player: name, country, title, sex, birth year, and activity flag.",
+                    "description": "Returns profile information for a FIDE player: name, country, title, sex, birth year, and activity flag.\n\n## Background game import\nEvery call silently enqueues a background job that scrapes [chess-results.com](https://chess-results.com) for all OTB games recorded for this FIDE ID and imports any new ones into the Caissify database. The scrape runs **at most once per calendar month** per player — subsequent calls within the same month are no-ops. The HTTP response is returned immediately without waiting for the scrape to finish.",
                     "operationId": "getFidePlayer",
                     "parameters": [fide_id_param()],
                     "responses": {
@@ -374,7 +374,7 @@ pub fn spec() -> Value {
                 "get": {
                     "tags": ["FIDE"],
                     "summary": "Export all PGN games for a FIDE player",
-                    "description": "Streams a multi-game PGN file containing every Caissify game linked to the given FIDE player. Games are yielded as they are read from the database so the client starts receiving data immediately.\n\nThe response uses `Content-Disposition: attachment` so browsers will download the file directly.",
+                    "description": "Streams a multi-game PGN file containing every Caissify game linked to the given FIDE player. Games are yielded as they are read from the database so the client starts receiving data immediately.\n\nThe response uses `Content-Disposition: attachment` so browsers will download the file directly.\n\n## Background game import\nLike `GET /fide/player/{fide_id}`, every call enqueues a background chess-results.com scrape (at most once per calendar month). Games imported during the current request will not appear in the streamed response — they will be visible on the **next** call.",
                     "operationId": "getFidePlayerPgn",
                     "parameters": (
                         vec![fide_id_param()]

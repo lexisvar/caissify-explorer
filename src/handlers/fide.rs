@@ -16,6 +16,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::{
     api::Error,
     db::Database,
+    indexer::FideIndexerStub,
     model::{
         CaissifyByFideKey, CaissifyGameMeta, FideFlag, FideNameIndex, FidePlayer, FideRatingKey,
         FideRatingSnapshot, GameId, Month,
@@ -40,7 +41,13 @@ pub async fn fide_player_pgn(
     Path(fide_id): Path<u32>,
     Query(params): Query<FidePlayerPgnQuery>,
     State(db): State<Arc<Database>>,
+    State(fide_indexer): State<FideIndexerStub>,
 ) -> AxumResponse {
+    // Kick off a chess-results scrape in the background (at most once per
+    // calendar month). The PGN response is returned immediately from whatever
+    // games are already in the DB; newly scraped games appear on the next call.
+    fide_indexer.queue_fide_id(fide_id);
+
     let since = params.since.unwrap_or(0);
     let until = params.until.unwrap_or(u16::MAX);
     let color_filter: Option<bool> = match params.color.as_deref() {
@@ -104,8 +111,13 @@ pub async fn fide_player_pgn(
 pub async fn fide_player(
     Path(fide_id): Path<u32>,
     State(db): State<Arc<Database>>,
+    State(fide_indexer): State<FideIndexerStub>,
     State(semaphore): State<&'static Semaphore>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Fire-and-forget: scrape chess-results.com for this player's games in
+    // the background, at most once per calendar month.
+    fide_indexer.queue_fide_id(fide_id);
+
     spawn_blocking(semaphore, move || {
         let fide_db = db.fide();
         match fide_db.get_player(fide_id).expect("get fide player") {
