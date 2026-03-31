@@ -197,26 +197,12 @@ impl CaissifyImporter {
         let mut without_loops: IntMap<StableZobrist128, (UciMove, Color)> =
             HashMap::with_capacity_and_hasher(body.game.moves.len(), Default::default());
         let mut pos = Chess::default();
-        let mut final_key = None;
 
         for uci in &body.game.moves {
             let key = pos.zobrist_hash(EnPassantMode::Legal);
-            final_key = Some(key);
             let m = uci.to_move(&pos)?;
             without_loops.insert(key, (UciMove::from_chess960(m), pos.turn()));
             pos.play_unchecked(m);
-        }
-
-        if let Some(final_key) = final_key
-            && caissify_db
-                .has(
-                    KeyBuilder::caissify()
-                        .with_zobrist(Variant::Chess, final_key)
-                        .with_year(body.game.date.year()),
-                )
-                .expect("check for caissify entry")
-        {
-            return Err(Error::DuplicateGame { id: body.id });
         }
 
         let mut batch = caissify_db.batch();
