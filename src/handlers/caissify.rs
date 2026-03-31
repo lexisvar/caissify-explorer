@@ -5,8 +5,10 @@ use std::{
 
 use axum::{
     Json,
+    body::Body,
     extract::{Path, Query, State},
     http::StatusCode,
+    response::Response,
 };
 use serde::Deserialize;
 use sha1::{Digest, Sha1};
@@ -48,11 +50,23 @@ pub async fn caissify_import(
 pub async fn caissify_pgn(
     Path(GameIdPath(id)): Path<GameIdPath>,
     State(db): State<Arc<Database>>,
+    State(openings): State<&'static RwLock<Openings>>,
     State(semaphore): State<&'static Semaphore>,
-) -> Result<MastersGame, StatusCode> {
+) -> Result<Response, StatusCode> {
     spawn_blocking(semaphore, move || {
         match db.caissify().game(id).expect("get caissify game") {
-            Some(game) => Ok(game),
+            Some(game) => {
+                let openings = openings.read().expect("read openings");
+                let opening = openings.classify_game(&game.moves);
+                let pgn = game.to_pgn_bytes(
+                    opening.as_ref().map(|o| o.eco.as_str()),
+                    opening.as_ref().map(|o| o.name.as_str()),
+                );
+                Ok(Response::builder()
+                    .header(axum::http::header::CONTENT_TYPE, "application/x-chess-pgn")
+                    .body(Body::from(pgn))
+                    .unwrap())
+            }
             None => Err(StatusCode::NOT_FOUND),
         }
     })

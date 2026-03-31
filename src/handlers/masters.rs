@@ -5,8 +5,10 @@ use std::{
 
 use axum::{
     Json,
+    body::Body,
     extract::{Path, Query, State},
     http::StatusCode,
+    response::Response,
 };
 use shakmaty::{
     EnPassantMode, Position as _,
@@ -19,7 +21,7 @@ use crate::{
     db::{CacheHint, Database},
     indexer::MastersImporter,
     metrics::Metrics,
-    model::{KeyBuilder, MastersGame, MastersGameWithId},
+    model::{KeyBuilder, MastersGameWithId},
     opening::Openings,
     state::ExplorerCache,
     util::{ply, spawn_blocking},
@@ -40,11 +42,23 @@ pub async fn masters_import(
 pub async fn masters_pgn(
     Path(GameIdPath(id)): Path<GameIdPath>,
     State(db): State<Arc<Database>>,
+    State(openings): State<&'static RwLock<Openings>>,
     State(semaphore): State<&'static Semaphore>,
-) -> Result<MastersGame, StatusCode> {
+) -> Result<Response, StatusCode> {
     spawn_blocking(semaphore, move || {
         match db.masters().game(id).expect("get masters game") {
-            Some(game) => Ok(game),
+            Some(game) => {
+                let openings = openings.read().expect("read openings");
+                let opening = openings.classify_game(&game.moves);
+                let pgn = game.to_pgn_bytes(
+                    opening.as_ref().map(|o| o.eco.as_str()),
+                    opening.as_ref().map(|o| o.name.as_str()),
+                );
+                Ok(Response::builder()
+                    .header(axum::http::header::CONTENT_TYPE, "application/x-chess-pgn")
+                    .body(Body::from(pgn))
+                    .unwrap())
+            }
             None => Err(StatusCode::NOT_FOUND),
         }
     })

@@ -61,7 +61,7 @@ impl MastersGame {
         KnownOutcome::from_winner(self.winner)
     }
 
-    fn write_pgn<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+    fn write_pgn<W: Write>(&self, writer: &mut W, eco: Option<&str>, opening_name: Option<&str>) -> io::Result<()> {
         writeln!(writer, "[Event \"{}\"]", self.event)?;
         writeln!(writer, "[Site \"{}\"]", self.site)?;
         writeln!(writer, "[Date \"{}\"]", self.date)?;
@@ -71,6 +71,12 @@ impl MastersGame {
         writeln!(writer, "[Result \"{}\"]", self.outcome())?;
         writeln!(writer, "[WhiteElo \"{}\"]", self.players.white.rating)?;
         writeln!(writer, "[BlackElo \"{}\"]", self.players.black.rating)?;
+        if let Some(eco) = eco {
+            writeln!(writer, "[ECO \"{eco}\"]")?;
+        }
+        if let Some(name) = opening_name {
+            writeln!(writer, "[Opening \"{name}\"]")?;
+        }
         writeln!(writer)?;
 
         let mut pos = Chess::default();
@@ -97,9 +103,9 @@ impl MastersGame {
 
     /// Serialize this game to a PGN byte buffer.
     /// Reused by the streaming PGN export endpoint.
-    pub fn to_pgn_bytes(&self) -> Vec<u8> {
+    pub fn to_pgn_bytes(&self, eco: Option<&str>, opening_name: Option<&str>) -> Vec<u8> {
         let mut buf = Vec::new();
-        self.write_pgn(&mut buf).expect("write pgn");
+        self.write_pgn(&mut buf, eco, opening_name).expect("write pgn");
         buf
     }
 }
@@ -107,7 +113,7 @@ impl MastersGame {
 impl IntoResponse for MastersGame {
     fn into_response(self) -> Response {
         let mut buf = Cursor::new(Vec::new());
-        self.write_pgn(&mut buf).expect("write pgn");
+        self.write_pgn(&mut buf, None, None).expect("write pgn");
 
         Response::builder()
             .header(axum::http::header::CONTENT_TYPE, "application/x-chess-pgn")

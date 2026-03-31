@@ -1,4 +1,4 @@
-use std::{convert::Infallible, sync::Arc};
+use std::{convert::Infallible, sync::{Arc, RwLock}};
 
 use axum::{
     Json,
@@ -21,6 +21,7 @@ use crate::{
         CaissifyByFideKey, CaissifyGameMeta, FideFlag, FideNameIndex, FidePlayer, FideRatingKey,
         FideRatingSnapshot, GameId, Month,
     },
+    opening::Openings,
     tasks::fide_ratings_import_once,
     util::spawn_blocking,
 };
@@ -42,6 +43,7 @@ pub async fn fide_player_pgn(
     Query(params): Query<FidePlayerPgnQuery>,
     State(db): State<Arc<Database>>,
     State(fide_indexer): State<FideIndexerStub>,
+    State(openings): State<&'static RwLock<Openings>>,
 ) -> AxumResponse {
     // Kick off a chess-results scrape in the background (at most once per
     // calendar month). The PGN response is returned immediately from whatever
@@ -60,6 +62,7 @@ pub async fn fide_player_pgn(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(32);
 
     tokio::task::spawn_blocking(move || {
+        let openings = openings.read().expect("read openings");
         const PAGE: usize = 200;
         let mut cursor: Option<CaissifyByFideKey> = None;
 
@@ -84,7 +87,11 @@ pub async fn fide_player_pgn(
                 .expect("batch fetch games");
 
             for game in games.into_iter().flatten() {
-                let mut pgn = game.to_pgn_bytes();
+                let opening = openings.classify_game(&game.moves);
+                let mut pgn = game.to_pgn_bytes(
+                    opening.as_ref().map(|o| o.eco.as_str()),
+                    opening.as_ref().map(|o| o.name.as_str()),
+                );
                 pgn.push(b'\n'); // blank line between games (PGN standard)
                 if tx.blocking_send(Ok(Bytes::from(pgn))).is_err() {
                     return; // client disconnected — stop early

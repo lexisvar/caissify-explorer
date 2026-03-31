@@ -14,8 +14,8 @@ use crate::api::Error;
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct Opening {
-    eco: String,
-    name: String,
+    pub eco: String,
+    pub name: String,
 }
 
 #[derive(Deserialize)]
@@ -121,6 +121,28 @@ impl Openings {
         } else {
             None
         }
+    }
+
+    /// Replay `moves` from the starting position and return the most specific
+    /// (last) opening name matched.  Used when generating annotated PGN.
+    pub fn classify_game(&self, moves: &[UciMove]) -> Option<Opening> {
+        let mut pos = Chess::default();
+        let mut result: Option<Opening> = None;
+        for uci in moves {
+            match uci.to_move(&pos) {
+                Ok(m) => {
+                    pos.play_unchecked(m);
+                    if let Some(o) = self
+                        .data
+                        .get(&pos.zobrist_hash(EnPassantMode::Legal))
+                    {
+                        result = Some(o.clone());
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        result
     }
 }
 
