@@ -171,6 +171,10 @@ struct Importer<'a> {
     batch_size: usize,
     progress: &'a ProgressBar,
     batch: Vec<GameRecord>,
+    /// Year and month extracted from the archive filename, used as a fallback
+    /// when a game carries `[Date "????.??.??"]`.  Without this the server
+    /// rejects the game because `LaxDate` cannot parse an unknown year.
+    fallback_ym: Option<(i32, u8)>,
 }
 
 impl<'a> Importer<'a> {
@@ -179,6 +183,7 @@ impl<'a> Importer<'a> {
         label: String,
         batch_size: usize,
         progress: &'a ProgressBar,
+        fallback_ym: Option<(i32, u8)>,
     ) -> Self {
         Importer {
             tx,
@@ -186,6 +191,7 @@ impl<'a> Importer<'a> {
             batch_size,
             progress,
             batch: Vec::with_capacity(batch_size),
+            fallback_ym,
         }
     }
 
@@ -305,10 +311,21 @@ impl Visitor for Importer<'_> {
         let event = g.event.as_deref().unwrap_or("");
         let white = &g.white.name;
         let black = &g.black.name;
-        let date = g.date.as_deref().unwrap_or("????.??.??");
+        let raw_date = g.date.as_deref().unwrap_or("????.??.??");
+        // Apply archive year-month fallback when the PGN date has no concrete
+        // year (e.g. `[Date "????.??.??"]`).  Without this the server rejects
+        // the game because `LaxDate` cannot parse an unknown year.
+        let date: String = if raw_date.starts_with('?') {
+            match self.fallback_ym {
+                Some((y, m)) => format!("{y}.{m:02}.??"),
+                None => raw_date.to_string(),
+            }
+        } else {
+            raw_date.to_string()
+        };
         let round = g.round.as_deref().unwrap_or("?");
 
-        let id = make_game_id(g.game_url.as_deref(), event, white, black, date, round);
+        let id = make_game_id(g.game_url.as_deref(), event, white, black, &date, round);
 
         let winner_str = g
             .winner
@@ -319,7 +336,7 @@ impl Visitor for Importer<'_> {
             id,
             event: g.event,
             site: g.site,
-            date: g.date,
+            date: Some(date),
             round: g.round,
             white: g.white,
             black: g.black,
@@ -640,7 +657,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let file = progress.wrap_read(file);
         let decoder = zstd::Decoder::new(file)?;
         let mut reader = Reader::new(decoder);
-        let mut importer = Importer::new(tx.clone(), label.clone(), args.batch_size, &progress);
+        let fallback_ym = url_year_month(url);
+        let mut importer = Importer::new(tx.clone(), label.clone(), args.batch_size, &progress, fallback_ym);
         reader.visit_all_games(&mut importer).map_err(|e| {
             format!("PGN parse error in {label}: {e}")
         })?;
