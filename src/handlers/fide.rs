@@ -22,7 +22,7 @@ use crate::{
         FideRatingSnapshot, GameId, Month,
     },
     opening::Openings,
-    tasks::fide_ratings_import_once,
+    tasks::{FideRefreshImporter, FideRefreshStatus},
     util::spawn_blocking,
 };
 // ─── GET /fide/player/:fide_id/pgn ───────────────────────────────────────────
@@ -337,18 +337,38 @@ pub async fn fide_import(
 
 // ─── POST /import/fide/refresh ────────────────────────────────────────────────
 
-/// Admin endpoint — trigger a FIDE rating list download immediately.
+/// Admin endpoint — trigger a background FIDE rating-list download + import.
+/// Returns 202 Accepted immediately; poll `/import/fide/refresh/status` for progress.
+/// Returns 409 Conflict if a refresh is already running.
 #[axum::debug_handler(state = crate::state::AppState)]
 pub async fn fide_refresh(
-    State(db): State<Arc<Database>>,
-) -> Result<String, StatusCode> {
-    match fide_ratings_import_once(db).await {
-        Ok(n) => Ok(format!("imported {n} FIDE players")),
-        Err(e) => {
-            log::error!("FIDE manual refresh failed: {e}");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
+    State(importer): State<FideRefreshImporter>,
+) -> impl axum::response::IntoResponse {
+    if importer.start() {
+        (
+            StatusCode::ACCEPTED,
+            axum::Json(serde_json::json!({
+                "message": "FIDE refresh started in the background — poll /import/fide/refresh/status for progress"
+            })),
+        )
+    } else {
+        (
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({
+                "message": "A FIDE refresh is already running — check /import/fide/refresh/status"
+            })),
+        )
     }
+}
+
+// ─── GET /import/fide/refresh/status ─────────────────────────────────────────
+
+/// Returns the current status of the background FIDE refresh job.
+#[axum::debug_handler(state = crate::state::AppState)]
+pub async fn fide_refresh_status(
+    State(importer): State<FideRefreshImporter>,
+) -> axum::Json<FideRefreshStatus> {
+    axum::Json(importer.status())
 }
 
 // ─── GET /fide/search ─────────────────────────────────────────────────────────

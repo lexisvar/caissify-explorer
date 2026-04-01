@@ -1933,9 +1933,14 @@ impl FideDatabase<'_> {
         let mut index = FideNameIndex::new();
         let mut iter = self.inner.raw_iterator_cf(self.cf_fide_player);
         iter.seek_to_first();
-        while let Some(value_bytes) = iter.value() {
-            let player = FidePlayer::read(&mut &value_bytes[..]);
-            index.insert(&player);
+        while iter.key().is_some() {
+            // Real fide-id keys are exactly 4 bytes; skip sentinel/meta keys.
+            if iter.key().map_or(false, |k| k.len() == 4) {
+                if let Some(value_bytes) = iter.value() {
+                    let player = FidePlayer::read(&mut &value_bytes[..]);
+                    index.insert(&player);
+                }
+            }
             iter.next();
         }
         iter.status().map(|_| index)
@@ -1947,14 +1952,17 @@ impl FideDatabase<'_> {
     /// single point-get in `fide_rating_history` for that player + month.
     /// Two cheap RocksDB operations — safe to call on every startup.
     pub fn month_already_imported(&self, month: Month) -> Result<bool, rocksdb::Error> {
-        // 1. Grab the fide_id of the very first player stored.
+        // 1. Grab the fide_id of the very first real player entry (skip meta keys).
         let mut iter = self.inner.raw_iterator_cf(self.cf_fide_player);
         iter.seek_to_first();
-        let first_id = match iter.key() {
-            Some(key_bytes) if key_bytes.len() >= 4 => {
-                u32::from_le_bytes([key_bytes[0], key_bytes[1], key_bytes[2], key_bytes[3]])
+        let first_id = loop {
+            match iter.key() {
+                Some(key_bytes) if key_bytes.len() == 4 => {
+                    break u32::from_le_bytes([key_bytes[0], key_bytes[1], key_bytes[2], key_bytes[3]]);
+                }
+                Some(_) => iter.next(), // skip meta/sentinel keys
+                None => return Ok(false), // no players imported yet
             }
-            _ => return Ok(false), // No players imported yet.
         };
         iter.status()?;
 
@@ -1965,6 +1973,24 @@ impl FideDatabase<'_> {
             .get_pinned_cf(self.cf_fide_rating_history, key.into_bytes())?
             .is_some();
         Ok(exists)
+    }
+
+    /// Sentinel key used to store the last imported file version tag.
+    /// 5 bytes — never collides with any real 4-byte fide-id key.
+    const ETAG_KEY: &'static [u8] = b"\x00etag";
+
+    /// Returns the ETag / Last-Modified string stored after the last successful import.
+    pub fn get_last_import_etag(&self) -> Result<Option<String>, rocksdb::Error> {
+        Ok(self
+            .inner
+            .get_pinned_cf(self.cf_fide_player, Self::ETAG_KEY)?
+            .and_then(|b| String::from_utf8(b.to_vec()).ok()))
+    }
+
+    /// Persists a version tag (ETag or Last-Modified string) after a successful import.
+    pub fn put_last_import_etag(&self, tag: &str) -> Result<(), rocksdb::Error> {
+        self.inner
+            .put_cf(self.cf_fide_player, Self::ETAG_KEY, tag.as_bytes())
     }
 
     pub fn batch(&self) -> FideBatch<'_> {

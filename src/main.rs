@@ -40,6 +40,7 @@ use crate::{
     model::{FideNameIndex, UserId},
     opening::Openings,
     state::{AppState, ExplorerCache},
+    tasks::FideRefreshImporter,
 };
 
 #[global_allocator]
@@ -102,7 +103,9 @@ async fn serve() {
     join_set.spawn(tasks::periodic_blacklist_update(blacklist, opt.lila.clone()));
 
     let db = task::block_in_place(|| Arc::new(Database::open(opt.db).expect("db")));
-    join_set.spawn(tasks::periodic_fide_ratings_update(Arc::clone(&db)));
+
+    let fide_refresh_importer = FideRefreshImporter::new(Arc::clone(&db));
+    join_set.spawn(tasks::periodic_fide_ratings_update(fide_refresh_importer.clone()));
 
     let player_indexer =
         PlayerIndexerStub::spawn(&mut join_set, Arc::clone(&db), opt.player_indexer, opt.lila);
@@ -165,6 +168,7 @@ async fn serve() {
         .route("/import/caissify/fide-link", post(handlers::fide::caissify_fide_link))
         .route("/import/fide", put(handlers::fide::fide_import))
         .route("/import/fide/refresh", post(handlers::fide::fide_refresh))
+        .route("/import/fide/refresh/status", get(handlers::fide::fide_refresh_status))
         .route("/import/openings", post(handlers::admin::openings_import))
         // Masters
         .route("/masters/pgn/{id}", get(handlers::masters::masters_pgn))
@@ -215,6 +219,7 @@ async fn serve() {
             )),
             player_indexer,
             fide_indexer,
+            fide_refresh_importer,
             db,
             semaphore: Box::leak(Box::new(Semaphore::new(128))),
             fide_index: fide_index_state,

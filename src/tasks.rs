@@ -1,8 +1,10 @@
 use std::{
     collections::HashSet,
-    sync::{Arc, RwLock},
-    time::{Duration, SystemTime},
+    sync::{Arc, Mutex, RwLock},
+    time::{Duration, Instant, SystemTime},
 };
+
+use serde::Serialize;
 
 use futures_util::StreamExt;
 use tokio::{task, time, time::sleep, time::timeout};
@@ -138,36 +140,62 @@ fn fide_parse_xml(xml: &[u8]) -> Vec<FideXmlRecord> {
 
 /// Download + parse + write the current FIDE player list.
 ///
-/// Uses `players_list_xml.zip` — the combined FOA master list with ALL ~1.8M
-/// registered players including their standard, rapid, and blitz ratings.
-/// Unrated players are stored with zero ratings.
 pub(crate) async fn fide_ratings_import_once(db: Arc<Database>) -> Result<usize, String> {
     use std::io::Read as _;
-    use ::time::OffsetDateTime;
 
     const URL: &str = "https://ratings.fide.com/download/players_list_xml.zip";
 
     let client = reqwest::Client::builder()
         .user_agent("caissify-explorer/fide-updater")
         .timeout(Duration::from_secs(300))
+        // Disable automatic content-encoding decompression: FIDE's server may
+        // send Content-Encoding: gzip on the .zip binary, which would corrupt
+        // the ZIP bytes before the zip crate ever sees them.
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
         .build()
         .map_err(|e| e.to_string())?;
 
-    let now = OffsetDateTime::now_utc();
-    let month_str = format!("{}-{:02}", now.year(), u8::from(now.month()));
-    let month: Month = month_str
-        .parse()
-        .map_err(|e: crate::model::InvalidDate| e.to_string())?;
+    // HEAD first — cheap check to see if the file has changed since last import.
+    let head = client
+        .head(URL)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
 
-    // Skip the download entirely if this month's data is already in the DB.
-    let already_imported = task::block_in_place(|| {
-        db.fide()
-            .month_already_imported(month)
-            .map_err(|e| e.to_string())
+    // Prefer ETag; fall back to Last-Modified as the version fingerprint.
+    let server_tag: Option<String> = head
+        .headers()
+        .get("etag")
+        .or_else(|| head.headers().get("last-modified"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned());
+
+    // Derive the ratings month from Last-Modified rather than `now()` so that
+    // a file published on March 31 is stored as "2026-03", not whatever the
+    // local clock says.
+    let month: Month = head
+        .headers()
+        .get("last-modified")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_http_date_month)
+        .unwrap_or_else(|| {
+            let now = ::time::OffsetDateTime::now_utc();
+            format!("{}-{:02}", now.year(), u8::from(now.month()))
+                .parse()
+                .expect("current month is always valid")
+        });
+
+    // Skip the download if the server's file hasn't changed.
+    let stored_tag = task::block_in_place(|| {
+        db.fide().get_last_import_etag().map_err(|e| e.to_string())
     })?;
-    if already_imported {
-        log::info!("FIDE: {month} already imported — skipping download");
-        return Ok(0);
+    if let (Some(server), Some(stored)) = (&server_tag, &stored_tag) {
+        if server == stored {
+            log::info!("FIDE: file unchanged ({server}) — skipping download");
+            return Ok(0);
+        }
     }
 
     log::info!("FIDE: downloading player list for {month}");
@@ -186,7 +214,8 @@ pub(crate) async fn fide_ratings_import_once(db: Arc<Database>) -> Result<usize,
         zip_bytes.len() / 1_048_576
     );
 
-    task::spawn_blocking(move || -> Result<usize, String> {
+    let db_for_write = Arc::clone(&db);
+    let result = task::spawn_blocking(move || -> Result<usize, String> {
         let cursor = std::io::Cursor::new(zip_bytes);
         let mut archive = zip::ZipArchive::new(cursor).map_err(|e| e.to_string())?;
         let mut xml = Vec::new();
@@ -204,7 +233,7 @@ pub(crate) async fn fide_ratings_import_once(db: Arc<Database>) -> Result<usize,
         // Log progress every 5% (at least every 10k records).
         let log_every = ((total / 20).max(10_000) / BATCH_SIZE).max(1);
 
-        let fide_db = db.fide();
+        let fide_db = db_for_write.fide();
         let mut written = 0usize;
         for (batch_idx, chunk) in records.chunks(BATCH_SIZE).enumerate() {
             let mut batch = fide_db.batch();
@@ -253,20 +282,136 @@ pub(crate) async fn fide_ratings_import_once(db: Arc<Database>) -> Result<usize,
         Ok(total)
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())??;
+
+    // Persist the server's version tag so future runs can skip unchanged files.
+    if let Some(ref tag) = server_tag {
+        task::block_in_place(|| {
+            db.fide()
+                .put_last_import_etag(tag)
+                .map_err(|e| e.to_string())
+        })?;
+    }
+
+    Ok(result)
+}
+
+/// Parse an HTTP `Last-Modified` / `Date` header value (RFC 7231 format,
+/// e.g. `"Tue, 31 Mar 2026 21:08:38 GMT"`) and return the `Month`.
+fn parse_http_date_month(s: &str) -> Option<Month> {
+    // Expected format: "Day, DD Mon YYYY HH:MM:SS GMT"
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    let year: u16 = parts[3].parse().ok()?;
+    let month_num: u16 = match parts[2] {
+        "Jan" => 1, "Feb" => 2,  "Mar" => 3,
+        "Apr" => 4, "May" => 5,  "Jun" => 6,
+        "Jul" => 7, "Aug" => 8,  "Sep" => 9,
+        "Oct" => 10, "Nov" => 11, "Dec" => 12,
+        _ => return None,
+    };
+    format!("{year}-{month_num:02}").parse().ok()
 }
 
 // ─── Periodic background tasks ────────────────────────────────────────────────
 
-pub(crate) async fn periodic_fide_ratings_update(db: Arc<Database>) {
+/// Accepts the shared importer so the periodic run updates the same status that
+/// the `/import/fide/refresh/status` endpoint exposes.
+pub(crate) async fn periodic_fide_ratings_update(importer: FideRefreshImporter) {
     const INTERVAL: Duration = Duration::from_secs(60 * 60 * 24 * 32);
 
     loop {
-        match fide_ratings_import_once(Arc::clone(&db)).await {
-            Ok(n) => log::info!("FIDE updater: imported {n} players"),
-            Err(e) => log::error!("FIDE updater: {e} — retrying in 1h"),
-        }
+        importer.run_now().await;
         time::sleep(INTERVAL).await;
+    }
+}
+
+// ─── FideRefreshImporter ──────────────────────────────────────────────────────
+
+/// Status of a manual FIDE rating-list refresh triggered via `POST /import/fide/refresh`.
+#[derive(Clone, Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum FideRefreshStatus {
+    Idle,
+    Running,
+    Done {
+        players_imported: usize,
+        elapsed_secs: f64,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+type RefreshState = Arc<Mutex<(FideRefreshStatus, Option<Instant>)>>;
+
+/// Cloneable handle that manages a single background FIDE-refresh task.
+/// Cheap to clone — all clones share the same internal state.
+#[derive(Clone)]
+pub struct FideRefreshImporter {
+    db: Arc<Database>,
+    state: RefreshState,
+}
+
+impl FideRefreshImporter {
+    pub fn new(db: Arc<Database>) -> Self {
+        FideRefreshImporter {
+            db,
+            state: Arc::new(Mutex::new((FideRefreshStatus::Idle, None))),
+        }
+    }
+
+    pub fn status(&self) -> FideRefreshStatus {
+        self.state.lock().expect("lock fide_refresh state").0.clone()
+    }
+
+    /// Run the import in the current task, updating shared status throughout.
+    /// If already running (e.g. triggered by the endpoint while the periodic
+    /// task is active, or vice-versa), returns immediately without starting a
+    /// second concurrent download.
+    pub async fn run_now(&self) {
+        {
+            let mut guard = self.state.lock().expect("lock fide_refresh state");
+            if matches!(guard.0, FideRefreshStatus::Running) {
+                log::info!("FIDE refresh already running — skipping duplicate run");
+                return;
+            }
+            guard.0 = FideRefreshStatus::Running;
+            guard.1 = Some(Instant::now());
+        }
+
+        let result = fide_ratings_import_once(Arc::clone(&self.db)).await;
+        let mut guard = self.state.lock().expect("lock fide_refresh state");
+        let elapsed = guard.1.map_or(0.0, |t| t.elapsed().as_secs_f64());
+        guard.0 = match result {
+            Ok(n) => {
+                log::info!("FIDE refresh: imported {n} players in {elapsed:.1}s");
+                FideRefreshStatus::Done {
+                    players_imported: n,
+                    elapsed_secs: elapsed,
+                }
+            }
+            Err(e) => {
+                log::error!("FIDE refresh failed: {e}");
+                FideRefreshStatus::Failed { error: e }
+            }
+        };
+    }
+
+    /// Spawn `run_now()` as a background task.
+    /// Returns `false` (and does nothing) if a run is already in progress.
+    pub fn start(&self) -> bool {
+        if matches!(
+            self.state.lock().expect("lock fide_refresh state").0,
+            FideRefreshStatus::Running
+        ) {
+            return false;
+        }
+        let me = self.clone();
+        tokio::spawn(async move { me.run_now().await });
+        true
     }
 }
 

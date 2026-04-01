@@ -35,7 +35,7 @@ struct Opt {
     batch_size: usize,
 
     /// Timeout for each HTTP request (seconds).
-    #[arg(long, default_value = "120")]
+    #[arg(long, default_value = "600")]
     timeout: u64,
 }
 
@@ -82,6 +82,10 @@ fn download_zipped_xml(client: &Client, url: &str) -> Vec<u8> {
 
     let bytes = response.bytes().expect("read FIDE zip bytes");
     eprintln!("Downloaded {} MB", bytes.len() / 1_048_576);
+
+    if bytes.len() < 22 {
+        panic!("FIDE download too small ({} bytes) — server likely returned an error page", bytes.len());
+    }
 
     // Extract first file from ZIP
     let cursor = std::io::Cursor::new(bytes);

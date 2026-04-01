@@ -17,6 +17,7 @@ use crate::{
     metrics::Metrics,
     model::{FideNameIndex, UserId},
     opening::Openings,
+    tasks::FideRefreshImporter,
 };
 
 /// Shared cache type used for all three explorer endpoints.
@@ -43,4 +44,6 @@ pub struct AppState {
     pub semaphore: &'static Semaphore,
     /// In-memory FIDE name → ID lookup index (built at startup, refreshed periodically).
     pub fide_index: Arc<FideNameIndex>,
+    /// Handle for the manual FIDE refresh background task.
+    pub fide_refresh_importer: FideRefreshImporter,
 }
