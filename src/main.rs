@@ -31,9 +31,10 @@ use tokio::{net::TcpListener, sync::Semaphore, task, task::JoinSet};
 use crate::{
     api::{CaissifyQuery, LichessQuery, MastersQuery},
     db::{Database, DbOpt},
-    indexer::{
+    indexer::
+    {
         BroadcastAllImporter, BroadcastImporter, CaissifyImporter, FideIndexerStub, LichessImporter, MastersImporter,
-        PlayerIndexerOpt, PlayerIndexerStub, PgnUrlImporter,
+        PlayerIndexerOpt, PlayerIndexerStub, PgnUrlImporter, TwicImporter,
     },
     lila::LilaOpt,
     metrics::Metrics,
@@ -160,6 +161,8 @@ async fn serve() {
         .route("/import/caissify/broadcast/status", get(handlers::caissify::caissify_broadcast_status))
         .route("/import/caissify/broadcast/all", post(handlers::caissify::caissify_broadcast_all_import))
         .route("/import/caissify/broadcast/all/status", get(handlers::caissify::caissify_broadcast_all_status))
+        .route("/import/caissify/twic", post(handlers::caissify::caissify_twic_import))
+        .route("/import/caissify/twic/status", get(handlers::caissify::caissify_twic_status))
         .route("/import/caissify/reindex", post(handlers::caissify::caissify_reindex))
         .route("/import/caissify/reindex-meta", post(handlers::caissify::caissify_reindex_meta))
         .route("/import/caissify/reindex-position", post(handlers::caissify::caissify_reindex_position))
@@ -217,6 +220,14 @@ async fn serve() {
                 Arc::clone(&db),
                 Arc::clone(&fide_index_state),
             )),
+            twic_importer: {
+                let twic = TwicImporter::new(
+                    CaissifyImporter::new(Arc::clone(&db), Arc::clone(&fide_index_state)),
+                    Arc::clone(&db),
+                );
+                join_set.spawn(tasks::periodic_twic_import(twic.clone()));
+                twic
+            },
             player_indexer,
             fide_indexer,
             fide_refresh_importer,

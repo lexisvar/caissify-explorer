@@ -10,9 +10,10 @@ use tokio::sync::Semaphore;
 use crate::{
     api::{CaissifyQuery, Error, ExplorerResponse, LichessQuery, MastersQuery},
     db::Database,
-    indexer::{
+    indexer::
+    {
         BroadcastAllImporter, BroadcastImporter, CaissifyImporter, FideIndexerStub,
-        LichessImporter, MastersImporter, PlayerIndexerStub, PgnUrlImporter,
+        LichessImporter, MastersImporter, PlayerIndexerStub, PgnUrlImporter, TwicImporter,
     },
     metrics::Metrics,
     model::{FideNameIndex, UserId},
@@ -39,6 +40,7 @@ pub struct AppState {
     pub pgn_url_importer: PgnUrlImporter,
     pub broadcast_importer: BroadcastImporter,
     pub broadcast_all_importer: BroadcastAllImporter,
+    pub twic_importer: TwicImporter,
     pub player_indexer: PlayerIndexerStub,
     pub fide_indexer: FideIndexerStub,
     pub semaphore: &'static Semaphore,

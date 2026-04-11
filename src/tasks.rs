@@ -9,8 +9,10 @@ use serde::Serialize;
 use futures_util::StreamExt;
 use tokio::{task, time, time::sleep, time::timeout};
 
-use crate::{
+use crate::
+{
     db::Database,
+    indexer::{TwicImporter, TwicRequest},
     lila::{Lila, LilaOpt},
     model::{FideFlag, FidePlayer, FideRatingKey, FideRatingSnapshot, Month, UserId},
     opening::Openings,
@@ -491,5 +493,52 @@ pub(crate) async fn periodic_blacklist_update(
         );
         last_update = begin;
         time::sleep(Duration::from_secs(60 * 173)).await;
+    }
+}
+
+// ─── Periodic TWIC import ─────────────────────────────────────────────────────
+
+/// TWIC issue 1639 was published on April 7, 2026.
+/// Used to compute the approximate current issue number from the current date.
+const TWIC_ANCHOR_WEEK: u32 = 1639;
+/// Days since Unix epoch (1970-01-01) for April 7, 2026.
+const TWIC_ANCHOR_EPOCH_DAYS: u64 = 20_551;
+
+/// Approximate TWIC issue number expected to exist on `now`.
+fn expected_twic_week() -> u32 {
+    let now_days = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / 86_400;
+    let weeks_since_anchor = now_days.saturating_sub(TWIC_ANCHOR_EPOCH_DAYS) / 7;
+    TWIC_ANCHOR_WEEK + weeks_since_anchor as u32
+}
+
+/// Checks once a day whether new TWIC issues are available and imports them.
+/// Uses `importer.last_week` to track progress across runs within a session.
+/// On first run (last_week == 0) it imports only the current expected week to
+/// avoid re-importing months of history automatically.  Use the
+/// `POST /import/caissify/twic` endpoint for ranged historical imports.
+pub(crate) async fn periodic_twic_import(importer: TwicImporter) {
+    const INTERVAL: Duration = Duration::from_secs(60 * 60 * 24);
+
+    loop {
+        let current = expected_twic_week();
+        let last = *importer.last_week.lock().expect("lock last_week");
+
+        // On first run (last == 0) seed from the current expected week so we
+        // don't accidentally re-import the entire TWIC back-catalog.
+        let from = if last == 0 { current } else { last + 1 };
+
+        if from <= current {
+            log::info!("[twic-periodic] importing weeks {from}–{current}");
+            importer.start(TwicRequest {
+                from_week: from,
+                to_week: current,
+            });
+        }
+
+        time::sleep(INTERVAL).await;
     }
 }

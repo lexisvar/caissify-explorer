@@ -336,6 +336,58 @@ pub fn spec() -> Value {
                 }
             },
 
+            // ── /import/caissify/twic ──────────────────────────────────
+            "/import/caissify/twic": {
+                "post": {
+                    "tags": ["Import"],
+                    "summary": "Import TWIC weekly archive(s)",
+                    "description": "Downloads one or more weekly ZIP archives from `https://theweekinchess.com/zips/twic{N}g.zip`, extracts the PGN, corrects player names against the embedded FIDE database, and imports all games into the Caissify database in the background.\n\nPlayer names are replaced with the canonical FIDE name whenever a `WhiteFideId`/`BlackFideId` PGN tag is present, so names like \"Vargas Arte\" are automatically fixed to the correct FIDE-registered name.\n\nReturns `202 Accepted` immediately. Poll `/import/caissify/twic/status` for progress. Only one TWIC import can run at a time.",
+                    "operationId": "importCaissifyTwic",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/TwicImportRequest" },
+                                "examples": {
+                                    "single": {
+                                        "summary": "Import a single week",
+                                        "value": { "week": 1639 }
+                                    },
+                                    "range": {
+                                        "summary": "Import a range of weeks",
+                                        "value": { "fromWeek": 1635, "toWeek": 1639 }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "202": { "description": "TWIC import started in the background" },
+                        "400": { "description": "Missing or invalid week parameters" },
+                        "409": { "description": "A TWIC import is already running" }
+                    }
+                }
+            },
+
+            "/import/caissify/twic/status": {
+                "get": {
+                    "tags": ["Import"],
+                    "summary": "Check TWIC import status",
+                    "description": "Returns the current status of the background TWIC import job.",
+                    "operationId": "getCaissifyTwicImportStatus",
+                    "responses": {
+                        "200": {
+                            "description": "TWIC import status",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/TwicStatus" }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+
             "/import/caissify": {
                 "put": {
                     "tags": ["Import"],
@@ -944,9 +996,65 @@ pub fn spec() -> Value {
                     ]
                 },
 
-                "CaissifyGameMeta": {
+                "TwicImportRequest": {
                     "type": "object",
-                    "description": "Compact per-game metadata stored in caissify_game_meta CF",
+                    "description": "Parameters for a TWIC weekly archive import. Supply either `week` (single issue) or both `fromWeek` and `toWeek` (inclusive range).",
+                    "properties": {
+                        "week":     { "type": "integer", "description": "Single TWIC issue number to import", "example": 1639 },
+                        "fromWeek": { "type": "integer", "description": "First week of a range (inclusive)", "example": 1635 },
+                        "toWeek":   { "type": "integer", "description": "Last week of a range (inclusive)", "example": 1639 }
+                    }
+                },
+
+                "TwicStatus": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "title": "Idle",
+                            "properties": { "status": { "type": "string", "enum": ["idle"] } },
+                            "required": ["status"]
+                        },
+                        {
+                            "type": "object",
+                            "title": "Running",
+                            "properties": {
+                                "status":         { "type": "string", "enum": ["running"] },
+                                "current_week":   { "type": "integer", "description": "TWIC issue currently being downloaded/imported", "example": 1637 },
+                                "week_index":     { "type": "integer", "description": "Zero-based index within the requested range" },
+                                "total_weeks":    { "type": "integer", "description": "Total weeks in this import job" },
+                                "games_imported": { "type": "integer", "description": "Cumulative games successfully imported" },
+                                "games_skipped":  { "type": "integer", "description": "Cumulative games skipped (duplicates / invalid)" }
+                            },
+                            "required": ["status", "current_week", "week_index", "total_weeks", "games_imported", "games_skipped"]
+                        },
+                        {
+                            "type": "object",
+                            "title": "Done",
+                            "properties": {
+                                "status":         { "type": "string", "enum": ["done"] },
+                                "total_weeks":    { "type": "integer" },
+                                "games_imported": { "type": "integer" },
+                                "games_skipped":  { "type": "integer" },
+                                "elapsed_secs":   { "type": "number" }
+                            },
+                            "required": ["status", "total_weeks", "games_imported", "games_skipped", "elapsed_secs"]
+                        },
+                        {
+                            "type": "object",
+                            "title": "Failed",
+                            "properties": {
+                                "status":         { "type": "string", "enum": ["failed"] },
+                                "error":          { "type": "string" },
+                                "failed_week":    { "type": "integer", "description": "TWIC issue number that caused the failure" },
+                                "games_imported": { "type": "integer" },
+                                "games_skipped":  { "type": "integer" }
+                            },
+                            "required": ["status", "error", "failed_week", "games_imported", "games_skipped"]
+                        }
+                    ]
+                },
+
+                "CaissifyGameMeta": {
                     "properties": {
                         "year":           { "type": "integer", "example": 2024 },
                         "white_rating":   { "type": "integer", "example": 2800 },

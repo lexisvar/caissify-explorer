@@ -6,6 +6,7 @@ mod masters;
 mod player;
 mod player_queue;
 mod pgn_url;
+mod twic;
 
 pub use caissify::CaissifyImporter;
 pub use fide_indexer::FideIndexerStub;
@@ -14,3 +15,4 @@ pub use masters::MastersImporter;
 pub use pgn_url::{BroadcastAllImporter, BroadcastAllRequest, BroadcastAllStatus, BroadcastImporter, ImportStatus, PgnUrlImporter};
 pub use player::{PlayerIndexerOpt, PlayerIndexerStub};
 pub use player_queue::{Queue, QueueFull, Ticket};
+pub use twic::{TwicImporter, TwicRequest, TwicStatus};

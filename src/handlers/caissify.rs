@@ -21,7 +21,7 @@ use crate::{
         Play, PlayPosition, WithSource,
     },
     db::{CacheHint, Database},
-    indexer::{BroadcastAllImporter, BroadcastAllRequest, BroadcastAllStatus, BroadcastImporter, CaissifyImporter, ImportStatus, PgnUrlImporter},
+    indexer::{BroadcastAllImporter, BroadcastAllRequest, BroadcastAllStatus, BroadcastImporter, CaissifyImporter, ImportStatus, PgnUrlImporter, TwicImporter, TwicRequest, TwicStatus},
     metrics::Metrics,
     model::{
         CaissifyByDateKey, CaissifyByFideKey, CaissifyByPlayerKey, CaissifyByPositionKey,
@@ -292,6 +292,75 @@ pub async fn caissify_broadcast_all_import(
 pub async fn caissify_broadcast_all_status(
     State(importer): State<BroadcastAllImporter>,
 ) -> axum::Json<BroadcastAllStatus> {
+    axum::Json(importer.status())
+}
+
+// ─── TWIC import endpoints ────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TwicImportBody {
+    /// A single week to import (shorthand for from_week == to_week).
+    week: Option<u32>,
+    /// First week of a range to import (inclusive).
+    from_week: Option<u32>,
+    /// Last week of a range to import (inclusive).
+    to_week: Option<u32>,
+}
+
+/// `POST /import/caissify/twic`  
+/// Triggers a background TWIC import for a single week or a range.  
+/// Body: `{"week": 1639}` or `{"fromWeek": 1635, "toWeek": 1639}`.
+#[axum::debug_handler(state = crate::state::AppState)]
+pub async fn caissify_twic_import(
+    State(importer): State<TwicImporter>,
+    Json(body): Json<TwicImportBody>,
+) -> impl axum::response::IntoResponse {
+    let (from_week, to_week) = if let Some(w) = body.week {
+        (w, w)
+    } else {
+        match (body.from_week, body.to_week) {
+            (Some(f), Some(t)) => (f, t),
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "error": "supply either \"week\" or both \"fromWeek\" and \"toWeek\""
+                    })),
+                );
+            }
+        }
+    };
+
+    if from_week > to_week {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "fromWeek must be ≤ toWeek"})),
+        );
+    }
+
+    if importer.start(TwicRequest { from_week, to_week }) {
+        (
+            StatusCode::ACCEPTED,
+            axum::Json(serde_json::json!({
+                "message": format!("TWIC import for weeks {from_week}–{to_week} started in the background"),
+            })),
+        )
+    } else {
+        (
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({
+                "message": "A TWIC import is already running — check /import/caissify/twic/status",
+            })),
+        )
+    }
+}
+
+/// `GET /import/caissify/twic/status`
+#[axum::debug_handler(state = crate::state::AppState)]
+pub async fn caissify_twic_status(
+    State(importer): State<TwicImporter>,
+) -> axum::Json<TwicStatus> {
     axum::Json(importer.status())
 }
 
